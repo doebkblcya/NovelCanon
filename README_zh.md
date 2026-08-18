@@ -2,7 +2,7 @@
 
 将中文长篇小说转换为可追溯、可按章节查询的结构化知识库。
 
-English: [README.md](README.md)
+英文版： [English README](README.md)
 
 ## 产品介绍
 
@@ -23,4 +23,4 @@ English: [README.md](README.md)
 - 处理：逐章抽取 → 全书消歧 → 事件链接 → 证据验证 → 分层 Reduce
 - 模型：通过版本化 generation/embedding profile 引用，可替换
 
-详见规范： [docs/定版方案.md](docs/定版方案.md)
+详见规范： [定版方案](docs/定版方案.md)
