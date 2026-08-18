@@ -2,7 +2,7 @@
 
 Turn long Chinese novels into a traceable, chapter-queryable structured knowledge base.
 
-中文版： [README_zh.md](README_zh.md)
+**English** | [中文](https://github.com/doebkblcya/NovelCanon/blob/main/README.zh-CN.md)
 
 ## Product
 

@@ -2,7 +2,7 @@
 
 将中文长篇小说转换为可追溯、可按章节查询的结构化知识库。
 
-英文版： [English README](README.md)
+[English](https://github.com/doebkblcya/NovelCanon/blob/main/README.md) | **中文**
 
 ## 产品介绍
 
