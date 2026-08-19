@@ -69,11 +69,19 @@ class EntityTier(StrEnum):
 
 
 class RunStatus(StrEnum):
-    """extraction run 生命周期（阶段 04 完善）。"""
+    """extraction run 状态机（阶段 04，docs/implementation/04）。
 
+    created → running → validating → ready_to_activate → active；
+    running/validating → failed / retrying；同书新 run 激活时旧 active → superseded。
+    """
+
+    CREATED = "created"
     RUNNING = "running"
-    FAILED = "failed"
+    VALIDATING = "validating"
+    READY_TO_ACTIVATE = "ready_to_activate"
     ACTIVE = "active"
+    FAILED = "failed"
+    RETRYING = "retrying"
     SUPERSEDED = "superseded"
 
 
