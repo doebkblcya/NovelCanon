@@ -319,6 +319,59 @@ def _run_extract(
     typer.echo("   run 状态保持 running（阶段 07 证据验证后 activate）")
 
 
+@app.command("link")
+def link(
+    book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],
+    run_id: Annotated[str | None, typer.Option(help="要链接的 run_id；缺省取该书最新 running run")] = None,
+) -> None:
+    """阶段 09：跨章事件链接（causes/enables，可验证因果）。"""
+    _log_command_invoked("link")
+    engine = _open_db()
+    try:
+        _run_link(engine, book_id, run_id=run_id)
+    finally:
+        engine.dispose()
+
+
+def _run_link(engine: Engine, book_id: str, *, run_id: str | None = None) -> None:
+    """读取 run 的 event claims，生成并落库跨章因果链接。"""
+    from novelcanon.events import EventLinkService
+    from novelcanon.pipeline.run import RunManager
+    from novelcanon.storage.repository import Repository
+
+    repo = Repository(engine)
+    if run_id is None:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT run_id FROM extraction_runs WHERE book_id = :b"
+                    " AND status = 'running' ORDER BY started_at DESC LIMIT 1"
+                ),
+                {"b": book_id},
+            ).fetchone()
+        if row is None:
+            typer.echo(f"❌ book={book_id} 没有 running run，请先 novelcanon extract")
+            raise typer.Exit(1)
+        run_id = row[0]
+    run = RunManager(engine).get(run_id)
+    if run is None or run["book_id"] != book_id:
+        typer.echo(f"❌ run={run_id} 不存在或不属于 book={book_id}")
+        raise typer.Exit(1)
+
+    service = EventLinkService(engine)
+    stats = service.link_run(run_id, book_id)
+    typer.echo(
+        f"✅ 事件链接 run={run_id}：events={stats.events}"
+        f" candidates={stats.candidates} links={stats.links}"
+        f" unverified={stats.unverified}"
+    )
+    if stats.statuses:
+        typer.echo(
+            "   状态分布：" + " ".join(f"{k}={v}" for k, v in sorted(stats.statuses.items()))
+        )
+    typer.echo("   run 状态保持 running（阶段 10 查询检索与分层摘要）")
+
+
 @app.command("resolve")
 def resolve(
     book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],

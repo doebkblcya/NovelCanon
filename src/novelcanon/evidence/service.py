@@ -145,12 +145,15 @@ class EvidenceService:
             return f"{draft.chapter_id[:12]}_{mid}"
 
         # 逐 claim 对齐 → (adapted_claim, evidences)
+        local_events = [e.model_dump(mode="json") for e in draft.local_events]
         aligned: list[tuple[_AdaptedClaim, list[AlignedEvidence]]] = []
         for claim in draft.provisional_claims:
             evidences = self._align_claim(
                 draft, claim, refs, mention_surface, run_id, book_id, draft_id, stats
             )
-            aligned.append((_AdaptedClaim(claim, draft, evidences, ns), evidences))
+            aligned.append(
+                (_AdaptedClaim(claim, draft, evidences, ns, local_events), evidences)
+            )
 
         # 只有找到证据的 claim 才 materialize（找不到原文的不落库，
         # 保持 unverified 语义 + 避免无实体引用写库失败，07 退出标准）
@@ -353,6 +356,8 @@ class _AdaptedClaim:
     """把 provisional_claim 适配为 GoldenClaimLike（evidence 由对齐注入）。
 
     ns：mention_id 章级 namespace（全局唯一主键，阶段 07）。
+    local_events：本章 local_events（阶段 09 全局事件标识用——event
+    claim 的 participants 不在 payload，而在 local_events 中）。
     """
 
     def __init__(
@@ -361,11 +366,13 @@ class _AdaptedClaim:
         draft: ExtractionDraftV1,
         evidences: list[AlignedEvidence],
         ns=None,
+        local_events: list[dict] | None = None,
     ) -> None:
         self._claim = claim
         self._draft = draft
         self._evidences = evidences
         self._ns = ns or (lambda mid: mid)
+        self._local_events = local_events or []
 
     def _ns_payload(self, payload: dict) -> dict:
         """把 payload 中的 mention 引用字段替换为章级 namespace。"""
@@ -412,9 +419,12 @@ class _AdaptedClaim:
                 "to_entity_id": payload["to_entity_id"],
             }
         if ctype == "event":
+            # participants 在 local_events（Map 契约：EventPayload 不复制
+            # participants）；按 event_type + sequence 对齐（09 §1 全局事件标识）
+            participants = self._match_event_participants(payload)
             return {
                 "event_type": payload["event_type"],
-                "participants": payload.get("participants") or [],
+                "participants": participants,
                 "location_entity_id": payload.get("location_entity_id"),
                 "chapter_id": self._draft.chapter_id,
                 "sequence_in_chapter": payload.get("sequence_in_chapter", 0),
@@ -433,6 +443,25 @@ class _AdaptedClaim:
         if ctype == "term_definition":
             return {"term_id": payload["term_id"]}
         return dict(payload)
+
+    def _match_event_participants(self, payload: dict) -> list[str]:
+        """按 event_type + 章内顺序从 local_events 匹配 participants。
+
+        local_events 与 event claims 不一定同序（章3：穿越/测试/谈话 vs
+        测试/穿越/修炼/谈话），用「同 type 第 N 个」对齐：对每个 event_type
+        分别计数，claim 的 sequence 语义为该 type 内第几个。
+        participants 引用章内 mention_id，返回前做章级 namespace 化。
+        """
+        etype = payload.get("event_type")
+        seq = payload.get("sequence_in_chapter", 1)
+        same_type = [ev for ev in self._local_events if ev.get("event_type") == etype]
+        if not same_type:
+            return []
+        # seq 是该类型内第几个（章2：测试 seq1/2/3 → 第1/2/3 个）
+        idx = max(0, int(seq or 1) - 1)
+        if idx >= len(same_type):
+            idx = 0
+        return [self._ns(m) for m in same_type[idx].get("participants", [])]
 
     @property
     def payload(self) -> dict:

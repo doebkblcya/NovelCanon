@@ -460,6 +460,10 @@ class Repository:
                 text("SELECT 1 FROM event_links WHERE claim_version_id = :v"), {"v": version_id}
             ).fetchone()
             if existing:
+                # 幂等命中：复用版本，仍把该 run 加入成员关系（09 §4）
+                self._record_event_link_observation(
+                    conn, version_id, record.envelope.created_by_run_id
+                )
                 return WriteResult(claim_version_id=version_id, is_new=False)
             supersedes = record.envelope.supersedes_version_id
             if supersedes is None:
@@ -476,8 +480,10 @@ class Repository:
                     "INSERT INTO event_links (claim_version_id, fact_id, source_event_id,"
                     " target_event_id, relation_type, confidence, claim_status,"
                     " observed_chapter_id,"
-                    " observed_ordinal, supersedes_version_id, primary_evidence_id)"
-                    " VALUES (:v, :fact, :src, :tgt, :rt, :conf, :status, :och, :oord, :sup, :pev)"
+                    " observed_ordinal, supersedes_version_id, primary_evidence_id,"
+                    " created_by_run_id)"
+                    " VALUES (:v, :fact, :src, :tgt, :rt, :conf, :status, :och, :oord,"
+                    " :sup, :pev, :run)"
                 ),
                 {
                     "v": version_id,
@@ -491,9 +497,24 @@ class Repository:
                     "oord": record.envelope.observed_ordinal,
                     "sup": supersedes,
                     "pev": record.envelope.primary_evidence_id,
+                    "run": record.envelope.created_by_run_id,
                 },
             )
+            self._record_event_link_observation(
+                conn, version_id, record.envelope.created_by_run_id
+            )
             return WriteResult(claim_version_id=version_id, is_new=True)
+
+    def _record_event_link_observation(
+        self, conn: Connection, version_id: str, run_id: str
+    ) -> None:
+        conn.execute(
+            text(
+                "INSERT OR IGNORE INTO event_link_observations (claim_version_id,"
+                " extraction_run_id, observed_at) VALUES (:v, :run, :ts)"
+            ),
+            {"v": version_id, "run": run_id, "ts": now_iso()},
+        )
 
     # ── evidence ───────────────────────────────────────────────
 

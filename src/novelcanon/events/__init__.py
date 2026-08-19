@@ -1,1 +1,16 @@
-"""事件链接：event_links 因果链（causes/enables/prevents）（阶段 09 实现）。"""
+"""事件链接（阶段 09，docs/implementation/09）。"""
+
+from novelcanon.events.linker import (
+    EventInfo,
+    EventLinker,
+    LinkCandidate,
+)
+from novelcanon.events.service import EventLinkService, LinkStats
+
+__all__ = [
+    "EventInfo",
+    "EventLinker",
+    "EventLinkService",
+    "LinkCandidate",
+    "LinkStats",
+]

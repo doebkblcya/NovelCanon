@@ -289,3 +289,210 @@ class QueryService:
                 .fetchall()
             )
         return [dict(r) for r in rows]
+
+    # ── 因果递归查询（09 §5）───────────────────────────────────
+
+    def causal_paths(
+        self,
+        event_claim_version_id: str,
+        *,
+        knowledge_cutoff: int | None = None,
+        max_depth: int = 5,
+    ) -> list[dict]:
+        """从某事件沿 event_links 递归展开因果链（causes/enables）。
+
+        - 递归 CTE：visited 集合阻止环；
+        - 默认最大深度 5；
+        - 路径置信度 = 边置信度乘积；
+        - 只走 supported 边；任一端证据在 cutoff 后不可见时截断该分支
+          （09 §4「任一端证据在 cutoff 后不可见时，该边不可用于回答」）；
+        - 多路径按置信度降序（09 §5）。
+        """
+        cutoff_sql = ""
+        params: dict[str, object] = {
+            "start": event_claim_version_id,
+            "book": self._book_id,
+            "depth": max_depth,
+        }
+        if knowledge_cutoff is not None:
+            cutoff_sql = "AND l.observed_ordinal <= :cutoff"
+            params["cutoff"] = knowledge_cutoff
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "WITH RECURSIVE causal(src, tgt, path, depth, conf, visited) AS ("
+                        "  SELECT l.source_event_id, l.target_event_id,"
+                        "         l.source_event_id || '>' || l.target_event_id,"
+                        "         1, l.confidence,"
+                        "         '[' || l.source_event_id || ',' || l.target_event_id || ']'"
+                        "  FROM event_links l"
+                        "  JOIN event_link_observations o"
+                        "    ON o.claim_version_id = l.claim_version_id"
+                        "  JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
+                        "  WHERE l.source_event_id = :start AND r.status = 'active'"
+                        "    AND r.book_id = :book AND l.claim_status = 'supported'"
+                        f"    {cutoff_sql}"
+                        "  UNION ALL"
+                        "  SELECT c.src, l.target_event_id,"
+                        "         c.path || '>' || l.target_event_id,"
+                        "         c.depth + 1, c.conf * l.confidence,"
+                        "         c.visited || ',' || l.target_event_id"
+                        "  FROM causal c"
+                        "  JOIN event_links l ON l.source_event_id = c.tgt"
+                        "  JOIN event_link_observations o"
+                        "    ON o.claim_version_id = l.claim_version_id"
+                        "  JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
+                        "  WHERE r.status = 'active' AND r.book_id = :book"
+                        "    AND l.claim_status = 'supported'"
+                        f"    {cutoff_sql}"
+                        "    AND c.depth < :depth"
+                        "    AND instr(c.visited, l.target_event_id) = 0"
+                        ")"
+                        " SELECT src, tgt, path, depth, conf"
+                        " FROM causal ORDER BY conf DESC"
+                    ),
+                    params,
+                )
+                .mappings()
+                .fetchall()
+            )
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["event"] = self._event_summary(d["tgt"])
+            out.append(d)
+        return out
+
+    def _event_summary(self, event_claim_version_id: str) -> dict | None:
+        with self._engine.connect() as conn:
+            row = (
+                conn.execute(
+                    text(
+                        "SELECT e.claim_version_id, e.event_type, e.summary,"
+                        " e.sequence_in_chapter, c.observed_ordinal"
+                        " FROM event_claims e"
+                        " JOIN claims c ON c.claim_version_id = e.claim_version_id"
+                        " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
+                        " WHERE e.claim_version_id = :v AND ch.book_id = :book"
+                    ),
+                    {"v": event_claim_version_id, "book": self._book_id},
+                )
+                .mappings()
+                .fetchone()
+            )
+            return dict(row) if row else None
+
+    # ── world at chapter（09 §7，与 knowledge cutoff 独立）──────
+
+    def world_state_at(
+        self, canonical_id: str, chapter_ordinal: int
+    ) -> list[dict]:
+        """某世界时间点（章节序）实体的可见状态。
+
+        chapter_proxy 语义（09 §7）：claim 的 observed_ordinal 是状态
+        披露章节，world_valid_from = observed_ordinal（生效起点）；
+        world at chapter 取「在 chapter_ordinal 时已生效且未被后续
+        版本替代」的状态——即 active 中该 fact 的 observed_ordinal
+        <= chapter_ordinal 且为最新（rn=1）版本。
+
+        与 knowledge_cutoff 是两个独立参数：world_at 回答「故事世界
+        此时如何」，cutoff 回答「读者此时知道什么」。
+        """
+        scope_sql, scope_params = self._scope_sql(self.entity_scope(canonical_id))
+        params = dict(scope_params)
+        params["book"] = self._book_id
+        params["chapter"] = chapter_ordinal
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT q.claim_version_id, q.fact_id, q.field, q.value,"
+                        " q.observed_ordinal FROM ("
+                        " SELECT c.claim_version_id, c.fact_id, c.observed_ordinal,"
+                        " c.operation, c.claim_status, s.field, s.value,"
+                        " ROW_NUMBER() OVER (PARTITION BY c.fact_id"
+                        "   ORDER BY c._rowid DESC) rn"
+                        " FROM v_active_claims c"
+                        " JOIN state_claims s ON s.claim_version_id = c.claim_version_id"
+                        " WHERE s.subject_entity_id " + scope_sql
+                        + " AND c.book_id = :book AND c.observed_ordinal <= :chapter"
+                        " ) q"
+                        f" WHERE {_current_filter()}"
+                    ),
+                    params,
+                )
+                .mappings()
+                .fetchall()
+            )
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["evidence"] = self._evidence_for(d["claim_version_id"])
+            out.append(d)
+        return out
+
+    def world_events_at(
+        self, chapter_ordinal: int, *, canonical_id: str | None = None
+    ) -> list[dict]:
+        """某世界时间点（章节序）发生/可见的事件。
+
+        chapter_proxy：事件在 observed_ordinal 章发生
+        （world_valid = [ordinal, ordinal]）；chapter_ordinal 处的事件
+        即 observed_ordinal == chapter_ordinal 的 supported 事件。
+        canonical_id 可选：限定参与者为该实体的事件（经 event_participants
+        匹配实体作用域）。
+        """
+        scope_sql = ""
+        params: dict[str, object] = {"book": self._book_id, "chapter": chapter_ordinal}
+        if canonical_id is not None:
+            in_sql, scope_params = self._scope_sql(
+                self.entity_scope(canonical_id), prefix="p"
+            )
+            scope_sql = f"AND ep.entity_id {in_sql}"
+            params.update(scope_params)
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT DISTINCT c.claim_version_id, e.event_type, e.summary,"
+                        " e.sequence_in_chapter, c.observed_ordinal"
+                        " FROM event_claims e"
+                        " JOIN claims c ON c.claim_version_id = e.claim_version_id"
+                        " JOIN claim_observations o ON o.claim_version_id = c.claim_version_id"
+                        " JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
+                        " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
+                        " LEFT JOIN event_participants ep"
+                        "   ON ep.event_claim_version_id = c.claim_version_id"
+                        " WHERE r.status = 'active' AND r.book_id = :book"
+                        "   AND c.claim_status = 'supported'"
+                        "   AND c.operation != 'retract'"
+                        "   AND c.observed_ordinal = :chapter"
+                        "   AND EXISTS (SELECT 1 FROM event_participants ep2"
+                        "     WHERE ep2.event_claim_version_id = c.claim_version_id)"
+                        f"   {scope_sql}"
+                        " ORDER BY e.sequence_in_chapter"
+                    ),
+                    params,
+                )
+                .mappings()
+                .fetchall()
+            )
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["evidence"] = self._evidence_for(d["claim_version_id"])
+            d["participants"] = self._event_participant_ids(d["claim_version_id"])
+            out.append(d)
+        return out
+
+    def _event_participant_ids(self, event_claim_version_id: str) -> list[str]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT entity_id FROM event_participants"
+                    " WHERE event_claim_version_id = :v"
+                ),
+                {"v": event_claim_version_id},
+            ).fetchall()
+        return [r[0] for r in rows]
