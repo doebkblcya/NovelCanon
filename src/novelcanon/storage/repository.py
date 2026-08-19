@@ -25,7 +25,7 @@ from novelcanon.schemas.memory import (
     EventLinkRecord,
     EvidenceRecord,
 )
-from novelcanon.schemas.types import RunStatus
+from novelcanon.schemas.types import Operation, RunStatus
 
 
 def now_iso() -> str:
@@ -218,6 +218,12 @@ class Repository:
             if supersedes is None:
                 supersedes = self._latest_version_of_fact(conn, envelope.fact_id, version_id)
 
+            if envelope.operation in (Operation.UPDATE, Operation.RETRACT) and supersedes is None:
+                raise ValueError(
+                    f"operation={envelope.operation.value} 必须指向已存在版本，"
+                    f"但 fact {envelope.fact_id} 无旧版本"
+                )
+
             conn.execute(
                 text(
                     "INSERT INTO claims (fact_id, claim_version_id, claim_type, operation,"
@@ -353,6 +359,50 @@ class Repository:
                 " observed_at) VALUES (:v, :run, :ts)"
             ),
             {"v": version_id, "run": run_id, "ts": now_iso()},
+        )
+
+    def _record_alias_observation(self, conn: Connection, version_id: str, run_id: str) -> None:
+        conn.execute(
+            text(
+                "INSERT OR IGNORE INTO alias_observations (claim_version_id, extraction_run_id,"
+                " observed_at) VALUES (:v, :run, :ts)"
+            ),
+            {"v": version_id, "run": run_id, "ts": now_iso()},
+        )
+
+    def associate_chapter_products(
+        self, conn: Connection, run_id: str, chapter_id: str
+    ) -> None:
+        """把一章的全部产物关联到某 run（checkpoint 复用时调用，P0）。
+
+        checkpoint 命中意味着「该章输入不变 → 输出不变」，因此该章既有
+        claim/alias/mention 全部被当前 run 重新确认：
+        - claims → claim_observations（active 视图可见性）；
+        - aliases → alias_observations（display_name 可见性）；
+        - mentions → run_id 更新为当前 run（最近确认来源）。
+        """
+        ts = now_iso()
+        conn.execute(
+            text(
+                "INSERT OR IGNORE INTO claim_observations (claim_version_id, extraction_run_id,"
+                " observed_at)"
+                " SELECT c.claim_version_id, :run, :ts FROM claims c"
+                " WHERE c.observed_chapter_id = :ch"
+            ),
+            {"run": run_id, "ts": ts, "ch": chapter_id},
+        )
+        conn.execute(
+            text(
+                "INSERT OR IGNORE INTO alias_observations (claim_version_id, extraction_run_id,"
+                " observed_at)"
+                " SELECT a.claim_version_id, :run, :ts FROM entity_alias_claims a"
+                " WHERE a.observed_chapter_id = :ch"
+            ),
+            {"run": run_id, "ts": ts, "ch": chapter_id},
+        )
+        conn.execute(
+            text("UPDATE entity_mentions SET run_id = :run WHERE chapter_id = :ch"),
+            {"run": run_id, "ch": chapter_id},
         )
 
     @staticmethod
@@ -500,6 +550,8 @@ class Repository:
                 {"v": version_id},
             ).fetchone()
             if existing:
+                # 幂等命中：复用版本，但仍需把该 run 加入别名成员关系
+                self._record_alias_observation(conn, version_id, alias.created_by_run_id)
                 return WriteResult(claim_version_id=version_id, is_new=False)
             supersedes = alias.supersedes_version_id
             if supersedes is None:
@@ -532,6 +584,7 @@ class Repository:
                     "ts": alias.created_at or now_iso(),
                 },
             )
+            self._record_alias_observation(conn, version_id, alias.created_by_run_id)
             return WriteResult(claim_version_id=version_id, is_new=True)
 
     def write_mention(
@@ -649,15 +702,11 @@ class Repository:
             return [dict(r) for r in rows]
 
     def active_claims_for_book(self, book_id: str) -> list[dict]:
-        """某本书 active run 的 claim（经章节锚点关联 book，多书隔离）。"""
+        """某本书 active run 的 claim（视图带 book_id 列，多书隔离）。"""
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
-                    text(
-                        "SELECT c.* FROM v_active_claims c"
-                        " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
-                        " WHERE ch.book_id = :b"
-                    ),
+                    text("SELECT c.* FROM v_active_claims c WHERE c.book_id = :b"),
                     {"b": book_id},
                 )
                 .mappings()

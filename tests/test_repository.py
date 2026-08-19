@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import pytest
 from alembic import command
 from alembic.config import Config
+from pydantic import ValidationError
 from sqlalchemy import Engine, text
 
 from novelcanon.schemas.envelope import ClaimEnvelope
@@ -98,14 +100,25 @@ def _write_state(
     field: str,
     value: str,
     *,
+    subject_entity_id: str,
     chapter_id: str | None = None,
     ordinal: int | None = None,
     op: Operation = Operation.ASSERT,
 ):
+    # 状态主体必须是已消歧实体（0005 触发器等价 FK 约束）
+    _ensure_entity(repo, run_id, subject_entity_id)
     env = _envelope(
         run_id, fact_id, op=op, chapter_id=chapter_id, ordinal=ordinal, claim_type="state"
     )
-    return repo.write_claim(env, StatePayload(field=field, value=value, raw_value=value))
+    return repo.write_claim(
+        env,
+        StatePayload(
+            field=field,
+            value=value,
+            raw_value=value,
+            subject_entity_id=subject_entity_id,
+        ),
+    )
 
 
 # ── 黄金场景 1：同一事实重复观察 ────────────────────────────────
@@ -141,8 +154,14 @@ def test_value_update_new_version_same_fact(repo: Repository) -> None:
     repo.finish_run(run, RunStatus.ACTIVE)
 
     fact = state_fact_id("e1", "cultivation_realm")
-    v1 = _write_state(repo, run, fact, "cultivation_realm", "金丹", chapter_id=ch, ordinal=1)
-    v2 = _write_state(repo, run, fact, "cultivation_realm", "元婴", chapter_id=ch, ordinal=2)
+    v1 = _write_state(
+        repo, run, fact, "cultivation_realm", "金丹",
+        subject_entity_id="e1", chapter_id=ch, ordinal=1,
+    )
+    v2 = _write_state(
+        repo, run, fact, "cultivation_realm", "元婴",
+        subject_entity_id="e1", chapter_id=ch, ordinal=2,
+    )
 
     assert v1.is_new and v2.is_new
     assert v1.claim_version_id != v2.claim_version_id
@@ -297,8 +316,14 @@ def test_multi_book_isolation(repo: Repository) -> None:
     # 两本书各有同名人物「林风」的 alive 状态
     f1 = state_fact_id("ent_b1", "alive")
     f2 = state_fact_id("ent_b2", "alive")
-    _write_state(repo, run1, f1, "alive", "true", chapter_id=ch1, ordinal=1)
-    _write_state(repo, run2, f2, "alive", "true", chapter_id=ch2, ordinal=1)
+    _write_state(
+        repo, run1, f1, "alive", "true",
+        subject_entity_id="ent_b1", chapter_id=ch1, ordinal=1,
+    )
+    _write_state(
+        repo, run2, f2, "alive", "true",
+        subject_entity_id="ent_b2", chapter_id=ch2, ordinal=1,
+    )
 
     claims1 = repo.active_claims_for_book(book1)
     claims2 = repo.active_claims_for_book(book2)
@@ -382,4 +407,45 @@ def test_explain_plan_uses_ordinal_index(repo: Repository) -> None:
 
 
 def test_foreign_key_check_empty(repo: Repository) -> None:
+    assert repo.foreign_key_check() == []
+
+
+# ── 验收 P1：状态主体契约（update 语义 / 主体必填 / 实体引用）──
+
+
+def test_state_update_without_prior_version_rejected(repo: Repository) -> None:
+    """update 必须指向已存在版本：无旧版本直接拒绝，不得静默写成新事实。"""
+    book, ch = _seed_book_chapter(repo)
+    run = new_uuid_id("run")
+    repo.start_run(run, book)
+    _ensure_entity(repo, run, "e1")
+    with pytest.raises(ValueError, match="必须指向已存在版本"):
+        _write_state(
+            repo, run, state_fact_id("e1", "realm"), "realm", "x",
+            subject_entity_id="e1", chapter_id=ch, ordinal=1, op=Operation.UPDATE,
+        )
+
+
+def test_state_payload_requires_subject() -> None:
+    """状态没有主体即非法（§5.4：subject_entity_id 必填）。"""
+    with pytest.raises(ValidationError):
+        StatePayload(field="cultivation_realm", value="金丹", raw_value="金丹")
+
+
+def test_state_subject_must_exist_entity(repo: Repository) -> None:
+    """状态主体必须引用已存在的实体（0005 触发器等价 FK）。"""
+    book, ch = _seed_book_chapter(repo)
+    run = new_uuid_id("run")
+    repo.start_run(run, book)
+    env = _envelope(
+        run, state_fact_id("e_ghost", "realm"), chapter_id=ch, ordinal=1, claim_type="state"
+    )
+    with pytest.raises(Exception, match="引用不存在的实体"):  # noqa: B017
+        repo.write_claim(
+            env,
+            StatePayload(
+                field="realm", value="x", raw_value="x", subject_entity_id="e_ghost"
+            ),
+        )
+    # PRAGMA foreign_key_check 依然无错（触发器约束不在 FK 检查范围）
     assert repo.foreign_key_check() == []

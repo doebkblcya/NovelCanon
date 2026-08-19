@@ -27,7 +27,6 @@ from novelcanon.schemas.ids import (
     event_link_fact_id,
     evidence_id,
     foreshadow_fact_id,
-    new_uuid_id,
     org_fact_id,
     relation_fact_id,
     state_fact_id,
@@ -73,6 +72,7 @@ class MaterializeStats:
     verified_evidence: int = 0
 
 
+@dataclass(frozen=True)
 class GoldenEvidenceLike(Protocol):
     chapter_id: str
     char_start: int
@@ -82,6 +82,7 @@ class GoldenEvidenceLike(Protocol):
 
 class GoldenClaimLike(Protocol):
     claim_type: str
+    operation: Operation
     fact_fields: Mapping[str, object]
     payload: dict
     observed_chapter_id: str
@@ -91,12 +92,18 @@ class GoldenClaimLike(Protocol):
 
 @dataclass(frozen=True)
 class GoldenDraftLike:
-    """materialize 输入的最小契约（黄金 draft / 未来 Map Draft 的适配面）。"""
+    """materialize 输入的最小契约（黄金 draft / 未来 Map Draft 的适配面）。
+
+    - mentions: (mention_id, surface_name)，mention_id 必须稳定（幂等主键，
+      禁止调用方每次生成随机 ID）；
+    - entity_tiers: canonical_id → tier（默认 MINOR，不硬编码测试实体）。
+    """
 
     chapter_id: str
     ordinal: int
     mentions: list[tuple[str, str]] = field(default_factory=list)
     claims: list[GoldenClaimLike] = field(default_factory=list)
+    entity_tiers: Mapping[str, EntityTier] = field(default_factory=dict)
 
 
 def _fact_id_for(claim_type: str, fact_fields: Mapping[str, object]) -> str:
@@ -169,13 +176,14 @@ def materialize_draft(
                 EntityRecord(
                     canonical_id=canonical_id,
                     canonical_name=surface,  # 首次披露 surface 为初始名
-                    tier=EntityTier.CORE if canonical_id == "ent_xiaoshi" else EntityTier.MINOR,
+                    tier=draft.entity_tiers.get(canonical_id, EntityTier.MINOR),
                     created_by_run_id=run_id,
                 )
             )
             stats.entities += 1
+        # mention_id 必须来自输入（稳定幂等主键）；随机 ID 会破坏幂等
         repo.write_mention(
-            new_uuid_id("m"), draft.chapter_id, surface, run_id, canonical_id=canonical_id
+            mention_id, draft.chapter_id, surface, run_id, canonical_id=canonical_id
         )
         stats.mentions += 1
         res = repo.write_alias(
@@ -204,7 +212,7 @@ def materialize_draft(
         # version 键必须与 write_claim 内部一致（模型序列化含默认字段）
         canonical_payload = payload_model.model_dump(mode="json")
         version_key = stable_config_hash(
-            {"operation": Operation.ASSERT.value, "payload": canonical_payload}
+            {"operation": claim.operation.value, "payload": canonical_payload}
         )
         version_id = claim_version_id(fact_id, version_key)
 
@@ -212,7 +220,7 @@ def materialize_draft(
             fact_id=fact_id,
             claim_version_id=version_id,
             claim_type=ClaimType(ctype),
-            operation=Operation.ASSERT,
+            operation=claim.operation,
             observed_chapter_id=claim.observed_chapter_id,
             observed_ordinal=claim.observed_ordinal,
             created_by_run_id=run_id,
@@ -233,6 +241,14 @@ def materialize_draft(
 
         # ── 直接证据：原文切片 → span hash 校验（100% 复现）──
         ev = claim.evidence
+        if ev.chapter_id != claim.observed_chapter_id:
+            raise AssertionError(
+                f"证据章节 {ev.chapter_id} 与 claim 章节 {claim.observed_chapter_id} 不一致"
+            )
+        if not 0 <= ev.char_start < ev.char_end <= len(chapter_text):
+            raise AssertionError(
+                f"证据 span [{ev.char_start},{ev.char_end}) 越界（章长 {len(chapter_text)}）"
+            )
         span = chapter_text[ev.char_start : ev.char_end]
         if sha256(span) != sha256(ev.span_text):
             raise AssertionError(

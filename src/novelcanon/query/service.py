@@ -2,6 +2,12 @@
 
 只读 active run 的数据；knowledge_cutoff_chapter 过滤 observed 时间；
 所有回答返回 evidence 与章节定位（chapter_id/ordinal/source span）。
+
+定版契约（验收 P1）：
+- 每次检索必须先限定 book_id：QueryService 构造时绑定，所有公开方法生效；
+- 默认查询只返回「当前 supported、非 retract」的事实：
+  每个 fact 取最新版本（窗口 rn=1），再过滤 operation != 'retract' 且
+  claim_status = 'supported'（最新版本是 retract 时该 fact 无当前值，不回溯）。
 """
 
 from __future__ import annotations
@@ -15,11 +21,17 @@ def _cutoff_sql(cutoff: int | None) -> tuple[str, dict[str, object]]:
     return "AND c.observed_ordinal <= :cutoff", {"cutoff": cutoff}
 
 
-class QueryService:
-    """基于 active 视图的结构化查询。"""
+def _current_filter() -> str:
+    """每 fact 最新版本（rn=1）后过滤 retract / 非 supported。"""
+    return "q.rn = 1 AND q.operation != 'retract' AND q.claim_status = 'supported'"
 
-    def __init__(self, engine: Engine) -> None:
+
+class QueryService:
+    """基于 active 视图的结构化查询（book_id 绑定，多书隔离）。"""
+
+    def __init__(self, engine: Engine, book_id: str) -> None:
         self._engine = engine
+        self._book_id = book_id
 
     def display_name(self, canonical_id: str, *, knowledge_cutoff: int | None = None) -> str | None:
         """某章截止前已披露的展示名（§9.1：只能来自截止前的 alias claim）。"""
@@ -29,12 +41,14 @@ class QueryService:
             cutoff_sql = "AND a.observed_ordinal <= :cutoff"
             params["cutoff"] = knowledge_cutoff
         params["cid"] = canonical_id
+        params["book"] = self._book_id
         with self._engine.connect() as conn:
             row = conn.execute(
                 text(
                     "SELECT a.surface_name FROM entity_alias_claims a"
-                    " JOIN extraction_runs r ON a.created_by_run_id = r.run_id"
-                    " WHERE a.canonical_id = :cid AND r.status = 'active'"
+                    " JOIN alias_observations o ON o.claim_version_id = a.claim_version_id"
+                    " JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
+                    " WHERE a.canonical_id = :cid AND r.status = 'active' AND r.book_id = :book"
                     f" {cutoff_sql}"
                     " ORDER BY a.observed_ordinal DESC, a.rowid DESC LIMIT 1"
                 ),
@@ -56,9 +70,10 @@ class QueryService:
         return None
 
     def entity_state(self, canonical_id: str, *, knowledge_cutoff: int | None = None) -> list[dict]:
-        """实体全部状态字段的当前版本（每 fact 最新）+ 证据。"""
+        """实体全部状态字段的当前版本（每 fact 最新 + supported + 非 retract）。"""
         cutoff_sql, params = _cutoff_sql(knowledge_cutoff)
         params["cid"] = canonical_id
+        params["book"] = self._book_id
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
@@ -66,16 +81,17 @@ class QueryService:
                         "SELECT q.claim_version_id, q.fact_id, q.field, q.value, q.raw_value,"
                         " q.observed_ordinal"
                         " FROM ("
-                        "  SELECT c.claim_version_id, c.fact_id, c.observed_ordinal, s.field,"
-                        "         s.value, s.raw_value,"
+                        "  SELECT c.claim_version_id, c.fact_id, c.observed_ordinal,"
+                        "         c.operation, c.claim_status,"
+                        "         s.field, s.value, s.raw_value,"
                         "         ROW_NUMBER() OVER (PARTITION BY c.fact_id"
                         "           ORDER BY c._rowid DESC) rn"
                         "  FROM v_active_claims c"
                         "  JOIN state_claims s ON s.claim_version_id = c.claim_version_id"
-                        "  WHERE s.subject_entity_id = :cid"
+                        "  WHERE s.subject_entity_id = :cid AND c.book_id = :book"
                         f"  {cutoff_sql}"
                         ") q"
-                        " WHERE q.rn = 1"
+                        f" WHERE {_current_filter()}"
                     ),
                     params,
                 )
@@ -92,20 +108,31 @@ class QueryService:
     def one_hop_relations(
         self, canonical_id: str, *, knowledge_cutoff: int | None = None
     ) -> list[dict]:
-        """一跳关系（from/to 任一为该实体）+ 证据（active）。"""
+        """一跳关系（from/to 任一为该实体）+ 证据（active，每 fact 当前版本）。"""
         cutoff_sql, params = _cutoff_sql(knowledge_cutoff)
         params["cid"] = canonical_id
+        params["book"] = self._book_id
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     text(
-                        "SELECT c.claim_version_id, c.fact_id, c.observed_ordinal,"
-                        " r.from_entity_id, r.to_entity_id, r.relation_type, r.relation_raw"
-                        " FROM v_active_claims c"
-                        " JOIN relation_claims r ON r.claim_version_id = c.claim_version_id"
-                        " WHERE (r.from_entity_id = :cid OR r.to_entity_id = :cid)"
-                        f" {cutoff_sql}"
-                        " ORDER BY c.observed_ordinal"
+                        "SELECT q.claim_version_id, q.fact_id, q.observed_ordinal,"
+                        " q.from_entity_id, q.to_entity_id, q.relation_type, q.relation_raw"
+                        " FROM ("
+                        "  SELECT c.claim_version_id, c.fact_id, c.observed_ordinal,"
+                        "         c.operation, c.claim_status,"
+                        "         r.from_entity_id, r.to_entity_id, r.relation_type,"
+                        "         r.relation_raw,"
+                        "         ROW_NUMBER() OVER (PARTITION BY c.fact_id"
+                        "           ORDER BY c._rowid DESC) rn"
+                        "  FROM v_active_claims c"
+                        "  JOIN relation_claims r ON r.claim_version_id = c.claim_version_id"
+                        "  WHERE (r.from_entity_id = :cid OR r.to_entity_id = :cid)"
+                        "    AND c.book_id = :book"
+                        f"  {cutoff_sql}"
+                        ") q"
+                        f" WHERE {_current_filter()}"
+                        " ORDER BY q.observed_ordinal"
                     ),
                     params,
                 )
@@ -119,14 +146,42 @@ class QueryService:
             out.append(d)
         return out
 
-    def event_participants(self, event_claim_version_id: str) -> list[dict]:
-        """事件参与者（event_participants 关联表，§5.2）。"""
+    def event_participants(self, event_claim_version_id: str) -> dict | None:
+        """事件参与者（§5.2）+ 事件证据与章节定位。
+
+        仅当事件属于当前书 active run 时返回：
+        {"event": {claim_version_id, event_type, summary, observed_chapter_id,
+                   observed_ordinal, evidence}, "participants": [...]}。
+        否则返回 None（事件不存在 / 非 active / 其他书）。
+        """
         with self._engine.connect() as conn:
-            rows = (
+            row = (
                 conn.execute(
                     text(
-                        "SELECT p.entity_id, p.role, e.canonical_name FROM event_participants p"
-                        " JOIN entities e ON e.canonical_id = p.entity_id"
+                        "SELECT c.claim_version_id, c.observed_chapter_id, c.observed_ordinal,"
+                        " e.event_type, e.summary, e.location_entity_id"
+                        " FROM event_claims e"
+                        " JOIN claims c ON c.claim_version_id = e.claim_version_id"
+                        " JOIN claim_observations o ON o.claim_version_id = c.claim_version_id"
+                        " JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
+                        " WHERE e.claim_version_id = :e AND r.status = 'active'"
+                        "   AND r.book_id = :book"
+                    ),
+                    {"e": event_claim_version_id, "book": self._book_id},
+                )
+                .mappings()
+                .fetchone()
+            )
+            if row is None:
+                return None
+            event = dict(row)
+            event["evidence"] = self._evidence_for(event["claim_version_id"])
+            participants = (
+                conn.execute(
+                    text(
+                        "SELECT p.entity_id, p.role, ent.canonical_name"
+                        " FROM event_participants p"
+                        " JOIN entities ent ON ent.canonical_id = p.entity_id"
                         " WHERE p.event_claim_version_id = :e"
                     ),
                     {"e": event_claim_version_id},
@@ -134,19 +189,21 @@ class QueryService:
                 .mappings()
                 .fetchall()
             )
-        return [dict(r) for r in rows]
+            return {"event": event, "participants": [dict(p) for p in participants]}
 
     def claim_history(self, fact_id: str) -> list[dict]:
-        """某 fact 的完整版本历史（append-only，按写入序）。"""
+        """某 fact 的完整版本历史（append-only，按写入序；限定本书）。"""
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     text(
-                        "SELECT claim_version_id, operation, supersedes_version_id, claim_status,"
-                        " observed_ordinal, created_by_run_id FROM claims"
-                        " WHERE fact_id = :f ORDER BY rowid"
+                        "SELECT c.claim_version_id, c.operation, c.supersedes_version_id,"
+                        " c.claim_status, c.observed_ordinal, c.created_by_run_id"
+                        " FROM claims c"
+                        " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
+                        " WHERE c.fact_id = :f AND ch.book_id = :book ORDER BY c.rowid"
                     ),
-                    {"f": fact_id},
+                    {"f": fact_id, "book": self._book_id},
                 )
                 .mappings()
                 .fetchall()
@@ -162,10 +219,11 @@ class QueryService:
                         "SELECT c.observed_chapter_id, c.observed_ordinal,"
                         " e.chapter_id AS evidence_chapter, e.char_start, e.char_end, e.span_hash"
                         " FROM claims c"
+                        " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
                         " LEFT JOIN claim_evidence e ON e.claim_version_id = c.claim_version_id"
-                        " WHERE c.claim_version_id = :v LIMIT 1"
+                        " WHERE c.claim_version_id = :v AND ch.book_id = :book LIMIT 1"
                     ),
-                    {"v": claim_version_id_value},
+                    {"v": claim_version_id_value, "book": self._book_id},
                 )
                 .mappings()
                 .fetchone()

@@ -23,6 +23,7 @@ from novelcanon.pipeline.ratelimit import (
     TokenBucket,
 )
 from novelcanon.schemas.types import RunStatus
+from novelcanon.storage.repository import Repository
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,7 @@ class PipelineRunner:
         self._limiter = limiter
         self._checkpoint = checkpoint or CheckpointService(engine)
         self._ledger = ledger or TokenLedger(engine)
+        self._repo = Repository(engine)
 
     async def run(
         self,
@@ -226,6 +228,13 @@ class PipelineRunner:
                             task.checkpoint_fields,
                             result["payload"],
                             source_run_id=result.get("source_run_id"),
+                        )
+                        # 复用章节：把该章产物关联到当前 run（成员关系，
+                        # 使激活后 active 视图仍能看到复用 claim/alias，P0）
+                        self._repo.associate_chapter_products(
+                            conn,
+                            self._run_id,
+                            str(task.checkpoint_fields["chapter_id"]),
                         )
                     elif isinstance(result, ProcessResult) and result.failed:
                         self._checkpoint.save_with(

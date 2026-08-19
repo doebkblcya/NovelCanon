@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from novelcanon.schemas.types import EntityTier, Operation
+
 # ── 黄金原文（章标题 + 正文）──────────────────────────────────
 
 GOLDEN_CHAPTERS: list[tuple[str, str]] = [
@@ -96,6 +98,8 @@ class GoldenClaim:
     evidence: GoldenEvidence
     # fact 语义字段（进入 fact_id，§4.3）
     fact_fields: dict = field(default_factory=dict)
+    # 版本操作：状态更新必须显式携带 update（不得静默写成 assert）
+    operation: Operation = Operation.ASSERT
 
 
 @dataclass(frozen=True)
@@ -106,6 +110,7 @@ class GoldenDraft:
     ordinal: int
     mentions: list[tuple[str, str]]  # (mention_id, surface_name)
     claims: list[GoldenClaim] = field(default_factory=list)
+    entity_tiers: dict[str, EntityTier] = field(default_factory=dict)
 
 
 def _span(text: str, needle: str) -> tuple[int, int]:
@@ -271,6 +276,7 @@ def make_golden_drafts(
                     observed_chapter_id=chapter_id,
                     observed_ordinal=ordinal,
                     evidence=GoldenEvidence(chapter_id, s, e, text[s:e]),
+                    operation=Operation.UPDATE,  # 金丹→元婴：同 fact 更新，非新断言
                 )
             )
 
@@ -299,6 +305,12 @@ def make_golden_drafts(
             ]
 
         drafts.append(
-            GoldenDraft(chapter_id=chapter_id, ordinal=ordinal, mentions=mentions, claims=claims)
+            GoldenDraft(
+                chapter_id=chapter_id,
+                ordinal=ordinal,
+                mentions=mentions,
+                claims=claims,
+                entity_tiers={"ent_xiaoshi": EntityTier.CORE},
+            )
         )
     return drafts
