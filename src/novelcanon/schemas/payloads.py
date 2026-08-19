@@ -39,11 +39,13 @@ class EventParticipant(BaseModel):
 
 
 class StatePayload(BaseModel):
-    """§5.4 状态。field 由 state catalog 约束；自由文本只进 raw_value。"""
+    """§5.4 状态。field 由 state catalog 约束；自由文本只进 raw_value。
+    subject_entity_id 为状态主体（查询必需），target 可空。"""
 
     field: str
     value: str | None = None
     raw_value: str | None = None
+    subject_entity_id: str | None = None
     target_entity_id: str | None = None
 
 

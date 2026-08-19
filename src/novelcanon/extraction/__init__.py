@@ -1,4 +1,5 @@
-"""逐章 Map 抽取：ExtractionDraftV1 与受约束模型调用（阶段 06 实现）。
+"""逐章 Map 抽取（阶段 06 实现）与固定 Draft 落库（阶段 05）。"""
 
-GenerationClient 基于 httpx + tenacity，走 generation_profile（版本化引用）。
-"""
+from novelcanon.extraction.materialize import MaterializeStats, materialize_draft
+
+__all__ = ["MaterializeStats", "materialize_draft"]

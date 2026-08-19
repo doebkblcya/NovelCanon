@@ -292,13 +292,15 @@ class Repository:
             conn.execute(
                 text(
                     "INSERT INTO state_claims (claim_version_id, field, value, raw_value,"
-                    " target_entity_id) VALUES (:v, :f, :val, :raw, :t)"
+                    " subject_entity_id, target_entity_id)"
+                    " VALUES (:v, :f, :val, :raw, :subj, :t)"
                 ),
                 {
                     "v": version_id,
                     "f": payload["field"],
                     "val": payload.get("value"),
                     "raw": payload.get("raw_value"),
+                    "subj": payload.get("subject_entity_id"),
                     "t": payload.get("target_entity_id"),
                 },
             )
@@ -441,6 +443,28 @@ class Repository:
                 },
             )
             return result.rowcount == 1
+
+    def add_event_participant(
+        self, event_claim_version_id: str, entity_id: str, role: str = ""
+    ) -> None:
+        """写入 event_participants（事件参与者只存关联表，§5.2）。"""
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT OR IGNORE INTO event_participants"
+                    " (event_claim_version_id, entity_id, role)"
+                    " VALUES (:e, :ent, :role)"
+                ),
+                {"e": event_claim_version_id, "ent": entity_id, "role": role},
+            )
+
+    def set_claim_status(self, claim_version_id_value: str, status: str) -> None:
+        """聚合后回写 claim 状态（§6：supports/refutes 聚合结果）。"""
+        with self._engine.begin() as conn:
+            conn.execute(
+                text("UPDATE claims SET claim_status = :s WHERE claim_version_id = :v"),
+                {"s": status, "v": claim_version_id_value},
+            )
 
     # ── entities / aliases / mentions / merge ──────────────────
 
@@ -649,6 +673,18 @@ class Repository:
                 .fetchall()
             )
             return [dict(r) for r in rows]
+
+    def get_entity(self, canonical_id: str) -> dict | None:
+        with self._engine.connect() as conn:
+            row = (
+                conn.execute(
+                    text("SELECT * FROM entities WHERE canonical_id = :id"),
+                    {"id": canonical_id},
+                )
+                .mappings()
+                .fetchone()
+            )
+            return dict(row) if row else None
 
     def list_chapters(self, book_id: str) -> list[dict]:
         with self._engine.connect() as conn:
