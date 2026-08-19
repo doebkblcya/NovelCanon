@@ -1,8 +1,9 @@
-"""pytest 共享 fixture：迁移到最新版本的临时 SQLite 库。"""
+"""pytest 共享 fixture：迁移到最新版本的临时 SQLite 库 + fixture EPUB。"""
 
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from alembic import command
@@ -34,3 +35,22 @@ def migrated_db(tmp_path) -> Iterator[Engine]:
 @pytest.fixture()
 def repo(migrated_db: Engine) -> Repository:
     return Repository(migrated_db)
+
+
+@pytest.fixture()
+def epub_file(tmp_path) -> Path:
+    """确定性 fixture EPUB（3 章，含黄金专名/原句）。"""
+    from tests.helpers import FIXTURE_CHAPTERS, make_fixture_epub
+
+    path = tmp_path / "fixture.epub"
+    make_fixture_epub(path, FIXTURE_CHAPTERS)
+    return path
+
+
+@pytest.fixture()
+def imported_book(migrated_db: Engine, epub_file: Path) -> tuple[Engine, str]:
+    """已导入 fixture EPUB 的 (engine, book_id)。"""
+    from novelcanon.ingestion.service import import_book
+
+    result = import_book(migrated_db, epub_file)
+    return migrated_db, result.book_id

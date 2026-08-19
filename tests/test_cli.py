@@ -21,9 +21,8 @@ def test_help_lists_all_commands() -> None:
 
 
 def test_unimplemented_commands_are_explicit() -> None:
+    """阶段 03 后 import/index 已实现；其余命令仍显式返回「尚未实现」。"""
     cases: dict[str, list[str]] = {
-        "import": ["import", "book.epub"],
-        "index": ["index"],
         "extract": ["extract"],
         "activate": ["activate"],
         "query": ["query"],

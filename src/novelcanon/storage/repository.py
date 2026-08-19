@@ -57,13 +57,14 @@ class Repository:
         source_path: str | None = None,
         raw_content_hash: str | None = None,
         normalized_content_hash: str | None = None,
+        normalized_text: str | None = None,
     ) -> None:
         with self._engine.begin() as conn:
             conn.execute(
                 text(
                     "INSERT OR IGNORE INTO books (book_id, title, source_format, source_path,"
-                    " raw_content_hash, normalized_content_hash, created_at)"
-                    " VALUES (:id, :title, :fmt, :path, :raw, :norm, :ts)"
+                    " raw_content_hash, normalized_content_hash, normalized_text, created_at)"
+                    " VALUES (:id, :title, :fmt, :path, :raw, :norm, :ntext, :ts)"
                 ),
                 {
                     "id": book_id,
@@ -72,9 +73,20 @@ class Repository:
                     "path": source_path,
                     "raw": raw_content_hash,
                     "norm": normalized_content_hash,
+                    "ntext": normalized_text,
                     "ts": now_iso(),
                 },
             )
+
+    def get_book_text(self, book_id: str) -> str:
+        """全书规范化文本（索引/证据的基础，SQLite 唯一权威数据源）。"""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT normalized_text FROM books WHERE book_id = :b"), {"b": book_id}
+            ).fetchone()
+        if row is None or row[0] is None:
+            raise ValueError(f"book {book_id} 没有规范化文本，请先执行 import")
+        return row[0]
 
     def create_chapter(
         self,
@@ -104,6 +116,39 @@ class Repository:
                     "ce": char_end,
                     "hash": content_hash,
                     "vol": volume_id,
+                    "ts": now_iso(),
+                },
+            )
+
+    def create_volume(
+        self,
+        volume_id: str,
+        book_id: str,
+        title: str,
+        ordinal: int,
+        *,
+        grouping_version: str = "v1",
+        start_chapter_id: str | None = None,
+        end_chapter_id: str | None = None,
+        content_hash: str | None = None,
+    ) -> None:
+        """创建卷记录（§10：volume_id 持久化 UUID，不由卷序生成）。"""
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT OR IGNORE INTO volumes (volume_id, book_id, title, ordinal,"
+                    " start_chapter_id, end_chapter_id, grouping_version, content_hash, created_at)"
+                    " VALUES (:id, :book, :title, :ord, :sc, :ec, :gv, :hash, :ts)"
+                ),
+                {
+                    "id": volume_id,
+                    "book": book_id,
+                    "title": title,
+                    "ord": ordinal,
+                    "sc": start_chapter_id,
+                    "ec": end_chapter_id,
+                    "gv": grouping_version,
+                    "hash": content_hash,
                     "ts": now_iso(),
                 },
             )
