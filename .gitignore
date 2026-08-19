@@ -1,0 +1,26 @@
+# 版权语料：原始书本文件（EPUB/TXT 等）不入库
+data/books/*
+!data/books/.gitkeep
+
+# 本地生成数据（SQLite 是唯一权威数据源，数据库为生成物，不提交）
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.sqlite
+data/*.sqlite3
+
+# Python 工程
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# 操作系统
+.DS_Store

@@ -24,3 +24,18 @@
 - 模型：通过版本化 generation/embedding profile 引用，可替换
 
 详见规范： [docs/定版方案.md](docs/定版方案.md)
+
+## 开发
+
+前置：安装 [uv](https://docs.astral.sh/uv/)。
+
+```bash
+uv sync --extra vec --extra tokenizer --dev   # 安装依赖（含 sqlite-vec 与 tiktoken）
+uv run pytest                                # 测试
+uv run ruff check .                          # lint
+uv run ruff format .                         # 格式化
+uv run mypy src/novelcanon                   # 类型检查
+uv run novelcanon --help                     # CLI
+```
+
+技术选型与工程约束见 [docs/adr/](docs/adr/)（6 个 ADR）。
