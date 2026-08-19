@@ -137,8 +137,19 @@ def extract(
 
 
 def _cli_generation_profile(concurrency: int) -> GenerationProfile:
-    """从安全环境构造 CLI generation profile（密钥只读环境，不落库）。"""
+    """从安全环境构造 CLI generation profile（密钥只读环境，不落库）。
+
+    支持 .env 文件（gitignore 已忽略）：NOVELCANON_LLM_* 变量与
+    环境变量同源，优先级为「真实环境变量 > .env」。
+    """
     import os
+
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()  # 幂等；环境变量优先，不覆盖已设置值
+    except ImportError:
+        pass
 
     model = os.environ.get("NOVELCANON_LLM_MODEL", "")
     base_url = os.environ.get("NOVELCANON_LLM_BASE_URL", "")
