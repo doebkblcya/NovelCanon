@@ -198,17 +198,23 @@ def build_map_process_fn(
     return process
 
 
-def _combine_hashes(parts: list[_SegmentPart]) -> str:
-    """多段请求的聚合 hash：全部段的 hash 稳定拼接（06 修复：
-    不再只保存最后一组，全部请求/响应可审计）。"""
+def _combine_request_hashes(parts: list[_SegmentPart]) -> str:
+    """多段请求的聚合 hash：全部段的 request hash 稳定聚合（06 修复：
+    不再只保存最后一组；请求与响应分开聚合，语义可区分审计）。"""
     from novelcanon.config.hash import stable_config_hash
 
-    return stable_config_hash(
-        {
-            "requests": [p.request_hash for p in parts],
-            "responses": [p.response_hash for p in parts],
-        }
-    )
+    return stable_config_hash({"requests": [p.request_hash for p in parts]})
+
+
+def _combine_response_hashes(parts: list[_SegmentPart]) -> str:
+    """多段响应的聚合 hash：全部段的 response hash 稳定聚合。
+
+    与 _combine_request_hashes 分离（验收 P1）：request_hash 与
+    response_hash 各自聚合自己的内容，不再复用同一个聚合函数。
+    """
+    from novelcanon.config.hash import stable_config_hash
+
+    return stable_config_hash({"responses": [p.response_hash for p in parts]})
 
 
 def _combine_raw(parts: list[_SegmentPart]) -> str:
@@ -222,8 +228,8 @@ def _combine_raw(parts: list[_SegmentPart]) -> str:
 def _valid_payload(draft: ExtractionDraftV1, parts: list[_SegmentPart]) -> dict:
     return {
         "draft": draft.model_dump(mode="json"),
-        "request_hash": _combine_hashes(parts),
-        "response_hash": _combine_hashes(parts),
+        "request_hash": _combine_request_hashes(parts),
+        "response_hash": _combine_response_hashes(parts),
         "validation_issues": [],
         "status": "valid",
         "raw_response": _combine_raw(parts),
@@ -233,8 +239,8 @@ def _valid_payload(draft: ExtractionDraftV1, parts: list[_SegmentPart]) -> dict:
 def _invalid_payload(issues: list[Issue], parts: list[_SegmentPart]) -> dict:
     return {
         "draft": None,
-        "request_hash": _combine_hashes(parts),
-        "response_hash": _combine_hashes(parts),
+        "request_hash": _combine_request_hashes(parts),
+        "response_hash": _combine_response_hashes(parts),
         "validation_issues": [{"code": i.code, "message": i.message} for i in issues],
         "status": "invalid",
         "error_summary": issues[0].message if issues else None,

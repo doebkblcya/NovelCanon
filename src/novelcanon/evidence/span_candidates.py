@@ -34,14 +34,30 @@ class AnchorTerm:
     """一条锚文本：surface 与来源（mention surface 或 payload 原文字段）。
 
     hard=True 为「硬锚」：claim 内容词（实体 surface / relation_raw /
-    value / raw_value / clue_anchor），必须全部在原文命中才能支持 claim；
-    hard=False 为「软锚」：模型概括句（summary / definition），
+    value / clue_anchor / event summary / org action / definition），
+    必须全部命中才能支持 claim；
+    hard=False 为「软锚」：模型概括句（raw_value），
     原文不逐字出现，只影响候选排序，不决定支持性。
+
+    group：同一 group 的硬锚构成「至少一个命中」的单一硬要求
+    （如 org action 的动词组：「加入/拜入/成为」任一出现即满足谓词验证）。
     """
 
     text: str
     source: str  # "mention:xxx" / "relation_raw" / "summary" / "value" / ...
     hard: bool = True
+    group: str | None = None
+
+
+# org 势力事件的谓词动词组（P0：成员共现不能证明「加入/离开」）：
+# action 是归一化标签，原文用具体动词表达；任一命中即证明谓词动作。
+_ORG_ACTION_VERBS: dict[str, list[str]] = {
+    "join": ["加入", "拜入", "成为", "入门", "入伙", "投奔", "归入"],
+    "leave": ["离开", "退出", "脱离", "叛出", "出走"],
+    "found": ["创立", "创建", "建立", "成立", "组建"],
+    "recruit": ["收徒", "招收", "收入门下", "招入"],
+    "expel": ["逐出", "赶出", "开除", "除名"],
+}
 
 
 def _normalize(text: str) -> str:
@@ -67,11 +83,13 @@ def extract_anchors(
     anchors: list[AnchorTerm] = []
     seen: set[str] = set()
 
-    def add(text: str, source: str, hard: bool = True) -> None:
+    def add(
+        text: str, source: str, hard: bool = True, group: str | None = None
+    ) -> None:
         text = (text or "").strip()
         if text and text not in seen:
             seen.add(text)
-            anchors.append(AnchorTerm(text=text, source=source, hard=hard))
+            anchors.append(AnchorTerm(text=text, source=source, hard=hard, group=group))
 
     payload = claim.get("payload") or {}
     ctype = claim.get("claim_type", "")
@@ -108,13 +126,28 @@ def extract_anchors(
                     add(mentions[mid], f"event_participant:{mid}")
             break
 
+    # P0 收紧：谓词/动作必须被原文证明（participants 共现 ≠ 事件成立）。
+    # event：summary 是唯一承载谓词/动作的原文表达 → 硬锚，必须逐字出现在
+    # 原文（model 引用了原文才支持；转述/猜测 → unverified）。event_type 是
+    # 归一化标签（「拜师」vs 原文「拜入」），逐字要求会过度拒绝，不参与。
+    # org：成员共现不能证明「加入/离开」——action 动词组任一命中才算。
+    # term_definition：定义句是谓词表达 → 硬锚（此前无任何硬锚，
+    # hard_total=0 时 hard_rate 恒为 1.0，属空洞支持）。
+    if ctype == "org":
+        action = str(payload.get("action") or "join").strip().lower()
+        verbs = _ORG_ACTION_VERBS.get(action) or (
+            [action] if len(action) >= 2 else []
+        )
+        for verb in verbs:
+            add(verb, f"org_action:{action}", hard=True, group="org_action")
+
     # payload 原文字段（硬/软按字段区分）
     for field, hard in (
         ("relation_raw", True),
         ("value", True),
         ("clue_anchor", True),
-        ("summary", False),
-        ("definition", False),
+        ("summary", True),  # P0：event 谓词表达，硬锚
+        ("definition", True),  # P0：term_definition 谓词表达，硬锚
         ("raw_value", False),
     ):
         raw = payload.get(field)
@@ -206,11 +239,20 @@ class SpanCandidateGenerator:
         ) -> SpanCandidate | None:
             if not covered:
                 return None
-            hard_total = sum(1 for a in anchors if a.hard)
-            hard_covered = sum(
-                1 for i in covered if i < len(anchors) and anchors[i].hard
-            )
+            # 硬要求 = 未分组硬锚（每条一项）+ 分组（每组一项，组内任一命中
+            # 即覆盖；如 org action 动词组）。软锚不参与支持性判定。
+            hard_reqs: dict[str, str] = {}
+            for i, a in enumerate(anchors):
+                if a.hard:
+                    hard_reqs.setdefault(a.group or f"anchor:{i}", a.text)
+            covered_reqs = {
+                anchors[i].group or f"anchor:{i}"
+                for i in covered
+                if i < len(anchors) and anchors[i].hard
+            }
             rate = len(covered) / len(anchors)
+            hard_total = len(hard_reqs)
+            hard_covered = len(covered_reqs)
             hard_rate = hard_covered / hard_total if hard_total else 1.0
             span_text = segment_text[lo:hi]
             return SpanCandidate(

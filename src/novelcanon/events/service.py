@@ -6,7 +6,8 @@
 3. 高置信候选落 event_links（幂等：claim_version_id 主键）：
    - observed_ordinal = 全部支持证据的最大披露章节（09 §4）；
    - 原因端+结果端证据默认保留（事件自身 evidence 已关联）；
-   - claim_status 聚合：有证据 → supported，无 → unverified（09 §3）；
+   - claim_status：规则候选一律 unverified（P0：端点证据 ≠ 边因果
+     证据；未经关系证据验证不得 supported，09 §3/§4）；
 4. 结果端/原因端可见性由查询层（cutoff）执行，不在此过滤。
 """
 
@@ -189,16 +190,16 @@ class EventLinkService:
         observed_ordinal = max(ordinals) if ordinals else max(
             source.observed_ordinal, target.observed_ordinal
         )
-        # 边状态判定（P0 修复）：因果边 supported 要求
-        # 1) 两端事件 supported（is_supported 已检查 claim_status/operation/
-        #    evidence stance）；
-        # 2) 边本身有验证依据（rule reason 记录 verification_method）。
-        # 两端事件带 supports 证据 → 边 supported；否则 unverified。
-        has_evidence = bool(source.evidence_ordinals and target.evidence_ordinals)
-        status = ClaimStatus.SUPPORTED if has_evidence else ClaimStatus.UNVERIFIED
+        # 边状态（P0 收紧）：规则层只生成 candidate——端点各自有证据
+        # 不等于边有因果证据（「甲吃早饭」→「甲中彩票」同参与者同先后
+        # 不能证明因果）。未经关系证据验证的边一律 unverified；
+        # 因果查询只走 supported 边（关系证据验证是后续语义步骤，
+        # 09 不自动把规则候选标成 supported）。
+        status = ClaimStatus.UNVERIFIED
         # primary_evidence_id（09 §4「默认保存原因端和结果端 evidence」）：
         # 因果边不新建 claim_evidence 行（event_links 不是 claims 表事实，
-        # FK 约束），而是复用原因端事件的第一个 supports 证据做锚定。
+        # FK 约束），而是复用原因端事件的第一个 supports 证据做锚定——
+        # 仅作定位参考，不构成边的支持性判定。
         primary_evidence = self._source_evidence(source.claim_version_id)
 
         fact_id = event_link_fact_id(

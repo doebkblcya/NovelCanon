@@ -395,9 +395,12 @@ class QueryService:
         """从某事件沿 event_links **反向**找 causes 来源（results 查询）。
 
         results 通过 causes 的反向查询得到（09 §3，不单独存储）：
-        沿「target_event_id = 当前事件」的边反向展开（被什么原因导致）。
-        与 causal_paths 同构：visited 防环、深度上限、置信度乘积、
-        supported 边、cutoff 截断。
+        沿「target_event_id = 当前事件」且 relation_type = 'causes' 的边
+        反向展开（被什么原因导致）。与 causal_paths 同构：visited 防环、
+        深度上限、置信度乘积、supported 边、cutoff 截断。
+
+        P1 修复：递归 CTE 初始分支与递归分支都必须限定 relation_type =
+        'causes'——enables/prevents 不是 causes 的反向结果，不得混入。
         """
         cutoff_sql = ""
         params: dict[str, object] = {
@@ -423,6 +426,7 @@ class QueryService:
                         "  JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
                         "  WHERE l.target_event_id = :start AND r.status = 'active'"
                         "    AND r.book_id = :book AND l.claim_status = 'supported'"
+                        "    AND l.relation_type = 'causes'"
                         f"    {cutoff_sql}"
                         "  UNION ALL"
                         "  SELECT l.source_event_id, c.tgt,"
@@ -436,6 +440,7 @@ class QueryService:
                         "  JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
                         "  WHERE r.status = 'active' AND r.book_id = :book"
                         "    AND l.claim_status = 'supported'"
+                        "    AND l.relation_type = 'causes'"
                         f"    {cutoff_sql}"
                         "    AND c.depth < :depth"
                         "    AND instr(c.visited, l.source_event_id) = 0"
@@ -458,9 +463,13 @@ class QueryService:
     # ── world at chapter（09 §7，与 knowledge cutoff 独立）──────
 
     def world_state_at(
-        self, canonical_id: str, chapter_ordinal: int
+        self,
+        canonical_id: str,
+        chapter_ordinal: int,
+        *,
+        knowledge_cutoff: int | None = None,
     ) -> list[dict]:
-        """某世界时间点（章节序）实体的可见状态。
+        """某世界时间点（章节序）实体的可见状态（双时间组合查询）。
 
         world at chapter（09 §7，P0 修复：不再用 observed_ordinal 冒充
         世界时间）：
@@ -470,11 +479,15 @@ class QueryService:
           明确标注为近似）；
         - unknown：不返回（world time 未知，不能表达为精确状态）。
 
-        与 knowledge_cutoff 是两个独立参数：world_at 回答「故事世界
-        此时如何」，cutoff 回答「读者此时知道什么」。
+        双时间组合（验收 P0）：knowledge_cutoff 与 world_at 两个独立参数
+        同时进入过滤——「世界时间从第 1 章成立、但第 10 章才通过回忆披露」
+        的事实，读者 cutoff=5 时不得看到（observed_ordinal <= cutoff 必须
+        成立），world_at 与 cutoff 互不替代、组合生效。
         """
+        cutoff_sql, cutoff_params = _cutoff_sql(knowledge_cutoff)
         scope_sql, scope_params = self._scope_sql(self.entity_scope(canonical_id))
         params = dict(scope_params)
+        params.update(cutoff_params)
         params["book"] = self._book_id
         params["chapter"] = chapter_ordinal
         with self._engine.connect() as conn:
@@ -492,6 +505,7 @@ class QueryService:
                         " JOIN state_claims s ON s.claim_version_id = c.claim_version_id"
                         " WHERE s.subject_entity_id " + scope_sql
                         + " AND c.book_id = :book"
+                        f"  {cutoff_sql}"
                         " AND ("
                         "   (c.world_valid_kind = 'story_time'"
                         "    AND c.world_valid_from <= :chapter"

@@ -12,8 +12,9 @@ usage 优先取响应 usage 字段，缺失时用 tokenizer 计量（token 账�
 
 from __future__ import annotations
 
+import dataclasses
 import os
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 import httpx
@@ -83,71 +84,52 @@ class GenerationClient:
         self._client = http_client or httpx.AsyncClient(
             timeout=httpx.Timeout(profile.timeout_seconds)
         )
-        self._call = self._make_retrying_call()
-        # 重试审计（P1 修复）：失败尝试计数 + 锁（并发段请求共享 client）
-        import threading
-
-        self._ledger_lock = threading.Lock()
-        self._retry_attempts = 0
-
-    def _make_retrying_call(self) -> Callable[[str], Awaitable[httpx.Response]]:
-        profile = self._profile
-
-        async def call(prompt: str) -> httpx.Response:
-            headers = {"Content-Type": "application/json"}
-            if self._api_key:
-                headers["Authorization"] = f"Bearer {self._api_key}"
-            body: dict[str, object] = {
-                "model": profile.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0,
-                "max_tokens": profile.max_output_tokens,
-            }
-            if profile.structured_output_mode in ("json", "json_object"):
-                body["response_format"] = {"type": "json_object"}
-            retrying = AsyncRetrying(
-                reraise=True,
-                stop=stop_after_attempt(max(1, profile.max_retries)),
-                wait=wait_random_exponential(multiplier=0.5, max=8.0),
-                retry=retry_if_exception(_is_retryable),
-            )
-            attempt = 0
-            async for attempt_state in retrying:
-                attempt = attempt_state.retry_state.attempt_number
-                with attempt_state:
-                    try:
-                        response = await self._client.post(
-                            f"{profile.base_url.rstrip('/')}/chat/completions",
-                            headers=headers,
-                            json=body,
-                        )
-                        response.raise_for_status()
-                        return response
-                    except Exception:  # noqa: BLE001
-                        # 每次失败尝试都计入账本（P1 修复：provider 内部
-                        # 重试不再对 runner 不可见）
-                        self._record_retry_attempt(attempt)
-                        raise
-            raise RuntimeError("unreachable: retrying loop exhausted")
-
-        return call
-
-    def _record_retry_attempt(self, attempt: int) -> None:
-        """记录一次失败尝试（供账本统计）。
-
-        每次失败的 HTTP 尝试都计数；最终 usage.retry_count = 成功前的
-        失败尝试数（重试次数 = 总尝试 - 成功的那次）。
-        """
-        with self._ledger_lock:
-            self._retry_attempts += 1
 
     async def complete(self, prompt: str) -> GenerationResult:
         """调用 provider 并解析原始输出 + usage。
 
-        传输/限流/服务端错误在 client 内部重试（指数退避），每次失败
-        尝试与最终成功调用都可通过 Usage.retry_count 审计（P1 修复）。
+        传输/限流/服务端错误在本次调用内重试（指数退避），每次失败尝试
+        计数并并入 Usage.retry_count。
+
+        P1 修复：失败计数是**每次 complete 调用的局部变量**——多段 Map
+        并发请求共享同一个 GenerationClient 时，A 请求的重试不会被先成功
+        的 B 请求消费（此前挂在实例上的共享计数器会串账）。
         """
-        response = await self._call(prompt)
+        profile = self._profile
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        body: dict[str, object] = {
+            "model": profile.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": profile.max_output_tokens,
+        }
+        if profile.structured_output_mode in ("json", "json_object"):
+            body["response_format"] = {"type": "json_object"}
+        retrying = AsyncRetrying(
+            reraise=True,
+            stop=stop_after_attempt(max(1, profile.max_retries)),
+            wait=wait_random_exponential(multiplier=0.5, max=8.0),
+            retry=retry_if_exception(_is_retryable),
+        )
+        failures = 0  # 本次调用内失败的尝试数（成功前的重试次数）
+        async for attempt_state in retrying:
+            with attempt_state:
+                try:
+                    response = await self._client.post(
+                        f"{profile.base_url.rstrip('/')}/chat/completions",
+                        headers=headers,
+                        json=body,
+                    )
+                    response.raise_for_status()
+                    break
+                except Exception:  # noqa: BLE001
+                    failures += 1
+                    raise
+        else:  # pragma: no cover - tenacity reraise 后不可达
+            raise RuntimeError("unreachable: retrying loop exhausted")
+
         data = response.json()
         content = ""
         choices = data.get("choices") or []
@@ -155,20 +137,10 @@ class GenerationClient:
             message = choices[0].get("message") or {}
             content = message.get("content") or ""
         usage = self._usage_from(data, prompt, content)
-        # 把本次调用经历的失败尝试并入 usage（runner 记账时可见）
-        with self._ledger_lock:
-            retries = self._retry_attempts
-            self._retry_attempts = 0
-        if retries:
-            usage = Usage(
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens,
-                reasoning_tokens=usage.reasoning_tokens,
-                cached_input_tokens=usage.cached_input_tokens,
-                retry_count=usage.retry_count + retries,
-                discarded_tokens=usage.discarded_tokens,
-                provider=usage.provider,
-                model=usage.model,
+        if failures:
+            # dataclasses.replace 保留 provider/model/profile_id 等全部字段
+            usage = dataclasses.replace(
+                usage, retry_count=usage.retry_count + failures
             )
         return GenerationResult(raw_text=content, usage=usage)
 

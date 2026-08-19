@@ -319,8 +319,16 @@ def test_map_repair_retries_structure_errors(tmp_path, migrated_db: Engine) -> N
 
 
 def test_map_multi_segment_combines_hashes() -> None:
-    """06 修复：多段请求保存全部段的聚合 hash（不只最后一组）。"""
-    from novelcanon.extraction.map_pipeline import _combine_hashes, _combine_raw
+    """06 修复：多段请求保存全部段的聚合 hash（不只最后一组）。
+
+    验收 P1：request_hash 与 response_hash 各自聚合自己的内容，
+    不再复用同一聚合函数（两个字段必须语义可区分、可分别审计）。
+    """
+    from novelcanon.extraction.map_pipeline import (
+        _combine_raw,
+        _combine_request_hashes,
+        _combine_response_hashes,
+    )
     from novelcanon.generation.client import request_hash, response_hash
 
     class Part:
@@ -335,13 +343,28 @@ def test_map_multi_segment_combines_hashes() -> None:
         Part(request_hash("seg1", model="m", profile_id="p"),
              response_hash('{"claims": []}'), '{"claims": []}'),
     ]
-    combined = _combine_hashes(parts)
-    assert combined, "聚合 hash 非空"
+    req_combined = _combine_request_hashes(parts)
+    resp_combined = _combine_response_hashes(parts)
+    assert req_combined, "聚合 request hash 非空"
+    assert resp_combined, "聚合 response hash 非空"
     # 聚合 hash 与任一单段 hash 不同（证明是全部段的组合）
-    assert combined != parts[0].request_hash
-    assert combined != parts[1].request_hash
-    # 段顺序影响聚合（稳定但敏感）
-    assert _combine_hashes(parts) == combined, "同段序列聚合稳定"
+    assert req_combined != parts[0].request_hash
+    assert req_combined != parts[1].request_hash
+    # 请求/响应各自聚合 → 两个字段语义不同（不是同一个值）
+    assert req_combined != resp_combined, (
+        "request/response 聚合必须可区分（此前共用同一聚合函数导致恒等）"
+    )
+    # 段顺序影响聚合（稳定但敏感）；同段序列聚合稳定
+    assert _combine_request_hashes(parts) == req_combined
+    assert _combine_response_hashes(parts) == resp_combined
+    # 单段请求 hash 变化必须反映到聚合（请求审计有效）
+    parts2 = [
+        Part(request_hash("seg0-changed", model="m", profile_id="p"),
+             response_hash('{"mentions": []}'), '{"mentions": []}'),
+        Part(request_hash("seg1", model="m", profile_id="p"),
+             response_hash('{"claims": []}'), '{"claims": []}'),
+    ]
+    assert _combine_request_hashes(parts2) != req_combined
     # raw 摘要包含每段的响应 hash 前缀
     raw = _combine_raw(parts)
     assert parts[0].response_hash[:12] in raw

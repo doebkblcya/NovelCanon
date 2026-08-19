@@ -397,7 +397,10 @@ class _AdaptedClaim:
         for fld in ("related_entity_ids", "participants"):
             ids = out.get(fld)
             if isinstance(ids, list):
-                out[field] = [self._ns(m) if isinstance(m, str) else m for m in ids]
+                # P0 修复：循环变量是 fld，不能用 dataclasses.field（函数对象）
+                # 做字典 key——否则 dict 含非字符串 key，**kwargs 解包时抛
+                # TypeError: keywords must be strings（foreshadowing 崩溃）。
+                out[fld] = [self._ns(m) if isinstance(m, str) else m for m in ids]
         return out
 
     @property

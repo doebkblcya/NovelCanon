@@ -192,13 +192,21 @@ def test_resolver_seed_alias_identity_reveal() -> None:
 
 
 def test_resolver_idempotent_stable() -> None:
-    """相同输入 → 相同 canonical 分配（P0：干净重建同输入同 ID）。"""
-    r1 = EntityResolver()
-    r2 = EntityResolver()
+    """相同输入 → 相同 canonical 分配（P0：干净重建同输入同 ID）。
+
+    v3：canonical_id 由 book + 首提及锚点派生，不依赖 surface——
+    相同输入与 book_id 的独立 resolver 得到完全一致的 ID。
+    跨章合并：章节序连续（ordinal 无缺口）→ 同一人物。
+    """
+    r1 = EntityResolver(book_id="book1")
+    r2 = EntityResolver(book_id="book1")
     mentions = [
-        {"mention_id": "a", "surface_name": "萧炎", "chapter_id": "ch1"},
-        {"mention_id": "b", "surface_name": "萧薰儿", "chapter_id": "ch1"},
-        {"mention_id": "c", "surface_name": "萧炎", "chapter_id": "ch2"},
+        {"mention_id": "a", "surface_name": "萧炎", "chapter_id": "ch1",
+         "ordinal": 0, "char_start": 10},
+        {"mention_id": "b", "surface_name": "萧薰儿", "chapter_id": "ch1",
+         "ordinal": 0, "char_start": 20},
+        {"mention_id": "c", "surface_name": "萧炎", "chapter_id": "ch2",
+         "ordinal": 1, "char_start": 5},
     ]
     p1 = r1.resolve(mentions)
     p2 = r2.resolve(mentions)
@@ -206,29 +214,102 @@ def test_resolver_idempotent_stable() -> None:
     m2 = {m.mention_id: m.canonical_id for m in p2.resolved}
     # 独立 resolver 相同输入必须得到相同 canonical_id（确定性 hash）
     assert m1 == m2, f"确定性 canonical_id 必须一致：{m1} vs {m2}"
-    assert m1["a"] == m1["c"], "跨章同 surface 必须同 canonical"
+    assert m1["a"] == m1["c"], "连续章节同 surface 必须同 canonical（延续）"
+    assert m1["b"] != m1["a"], "不同 surface 不得共享 canonical"
 
 
-def test_resolver_same_chapter_same_name_not_merged() -> None:
-    """P0 回归：同一章内两个同 surface mention（同名不同人物）不合并。"""
-    r = EntityResolver()
+def test_resolver_canonical_id_book_scoped() -> None:
+    """P0：不同书中的同名人物不得共享 canonical_id（book 进入身份）。"""
+    mentions = [
+        {"mention_id": "a", "surface_name": "林风", "chapter_id": "ch1",
+         "ordinal": 0, "char_start": 0},
+    ]
+    r1 = EntityResolver(book_id="book_a")
+    r2 = EntityResolver(book_id="book_b")
+    c1 = r1.resolve(mentions).resolved[0].canonical_id
+    c2 = r2.resolve(mentions).resolved[0].canonical_id
+    assert c1 != c2, "不同书的同名人物必须不同 canonical_id"
+
+
+def test_resolver_canonical_id_name_independent() -> None:
+    """P0：canonical_id 不依赖名称——同一锚点（首提及）改名不换 ID。"""
+    # 同一书同一位置的 mention：即使 surface 不同写法（别名化），
+    # canonical_id 由「book + 首提及锚点」决定，不含 surface。
+    r1 = EntityResolver(book_id="book1")
+    r2 = EntityResolver(book_id="book1")
+    p1 = r1.resolve(
+        [
+            {"mention_id": "a", "surface_name": "小石", "chapter_id": "ch1",
+             "ordinal": 0, "char_start": 3},
+        ]
+    )
+    p2 = r2.resolve(
+        [
+            # 身份揭示后改用正式名，但锚点（位置）相同 → 同一 canonical
+            {"mention_id": "a", "surface_name": "林风", "chapter_id": "ch1",
+             "ordinal": 0, "char_start": 3},
+        ]
+    )
+    assert p1.resolved[0].canonical_id == p2.resolved[0].canonical_id, (
+        "canonical_id 不得依赖 surface（改名不换 ID）"
+    )
+
+
+def test_resolver_same_chapter_repeated_mentions_merge() -> None:
+    """P0 回归：同一人物同章被提及两次 → 合并（不再强制拆成两个实体）。"""
+    r = EntityResolver(book_id="book1")
     plan = r.resolve(
         [
-            {"mention_id": "a", "surface_name": "王明", "chapter_id": "ch1"},
-            {"mention_id": "b", "surface_name": "王明", "chapter_id": "ch1"},
-            {"mention_id": "c", "surface_name": "王明", "chapter_id": "ch2"},
+            {"mention_id": "a", "surface_name": "王明", "chapter_id": "ch1",
+             "ordinal": 0, "char_start": 10},
+            {"mention_id": "b", "surface_name": "王明", "chapter_id": "ch1",
+             "ordinal": 0, "char_start": 40},
         ]
     )
     canonicals = {m.canonical_id for m in plan.resolved}
-    assert len(canonicals) == 3, (
-        f"同章同名不同人物不得误合并（a/b 同章应独立）：{canonicals}"
+    assert len(canonicals) == 1, (
+        f"同章两次提及 = 同一人物，必须合并：{canonicals}"
     )
-    reasons = {m.mention_id: m.reason for m in plan.resolved}
-    assert reasons["a"] == "same-chapter-name-conflict"
-    # 跨章 c 与 a 的 surface 相同但 a 已冲突 → 独立（保守：不猜测）
-    assert canonicals == {
-        m.canonical_id for m in plan.resolved
-    }  # 三个独立 ID
+    assert len(plan.resolved) == 2 and plan.unresolved == []
+
+
+def test_resolver_cross_chapter_isolated_same_name_unresolved() -> None:
+    """P0 回归：不同章节孤立出现的同名人物（每章一次、章节序不连续）
+    无法判断是否同一人 → unresolved，不盲目合并。"""
+    r = EntityResolver(book_id="book1")
+    plan = r.resolve(
+        [
+            {"mention_id": "a", "surface_name": "林风", "chapter_id": "ch3",
+             "ordinal": 2, "char_start": 5},
+            {"mention_id": "b", "surface_name": "林风", "chapter_id": "ch5",
+             "ordinal": 4, "char_start": 8},
+        ]
+    )
+    assert plan.resolved == [], (
+        f"跨章孤立同名不得合并：{plan.resolved}"
+    )
+    assert len(plan.unresolved) == 2
+    assert all(u.reason == "ambiguous-name-no-continuity" for u in plan.unresolved)
+    assert all(u.canonical_id is None for u in plan.unresolved)
+
+
+def test_resolver_cross_chapter_continuity_merges() -> None:
+    """对照：跨章连续（ordinal 无缺口）或章内复现 → 合并（主角延续）。"""
+    r = EntityResolver(book_id="book1")
+    # 章节序连续（ch1→ch2）且 ch1 内出现两次 → 合并
+    plan = r.resolve(
+        [
+            {"mention_id": "a", "surface_name": "萧炎", "chapter_id": "ch1",
+             "ordinal": 0, "char_start": 10},
+            {"mention_id": "b", "surface_name": "萧炎", "chapter_id": "ch1",
+             "ordinal": 0, "char_start": 60},
+            {"mention_id": "c", "surface_name": "萧炎", "chapter_id": "ch2",
+             "ordinal": 1, "char_start": 5},
+        ]
+    )
+    canonicals = {m.canonical_id for m in plan.resolved}
+    assert len(canonicals) == 1, f"连续性信号 → 合并：{canonicals}"
+    assert plan.unresolved == []
 
 
 # ── service 落库 + 投影 ────────────────────────────────────────

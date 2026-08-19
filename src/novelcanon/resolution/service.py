@@ -56,7 +56,7 @@ class ResolutionService:
         stats.mentions = len(mentions)
         # 预置已知 alias（跨 run 稳定）：库里已有 surface → canonical
         self._resolver.seed(self._known_aliases(book_id))
-        plan = self._resolver.resolve(mentions)
+        plan = self._resolver.resolve(mentions, book_id=book_id)
         self._apply_plan(run_id, book_id, plan, stats)
         return stats
 

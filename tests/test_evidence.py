@@ -533,3 +533,188 @@ def test_literal_full_hard_anchor_supports(tmp_path, migrated_db: Engine) -> Non
     assert verified, "硬锚全命中必须产生 supports"
     assert verified[0].stance == EvidenceStance.SUPPORTS
     assert verified[0].evidence_type == EvidenceType.DIRECT
+
+
+# ── P0 收紧：谓词/动作必须被原文证明（event / org / term_definition）──
+
+
+def test_event_predicate_summary_must_be_in_text() -> None:
+    """验收 P0：事件硬锚必须包含证明谓词/动作的原文表达。
+
+    「甲与乙并肩而立」不得支持「甲杀死乙」事件——participants 共现
+    不等于事件成立；summary（谓词表达）逐字出现在原文才支持。
+    """
+    from novelcanon.evidence.span_candidates import (
+        SpanCandidateGenerator,
+        extract_anchors,
+    )
+    from novelcanon.evidence.verifiers import LiteralVerifier
+
+    mentions = {"m1": "甲", "m2": "乙"}
+    local_events = [
+        {"event_type": "杀死", "sequence_in_chapter": 1, "participants": ["m1", "m2"]}
+    ]
+    claim = {
+        "claim_type": "event",
+        "payload": {
+            "event_type": "杀死",
+            "summary": "甲杀死乙",
+            "location_entity_id": None,
+            "sequence_in_chapter": 1,
+        },
+    }
+    anchors = extract_anchors(claim, mentions, local_events=local_events)
+    assert any(a.hard and a.source == "summary" for a in anchors), (
+        "event summary 必须为硬锚（谓词表达）"
+    )
+    text = "甲与乙并肩而立，众人围观。"
+    candidates = SpanCandidateGenerator().generate("ch_1", 0, text, anchors)
+    verified = [
+        v for c in candidates if (v := LiteralVerifier().verify(c)) is not None
+    ]
+    assert verified == [], f"共现不得支持事件（谓词未被原文证明）：{verified}"
+
+    # 对照：summary 逐字引用原文（模型引用原文写法）→ 支持
+    claim2 = {
+        "claim_type": "event",
+        "payload": {
+            "event_type": "杀死",
+            "summary": "甲杀死了乙",
+            "location_entity_id": None,
+            "sequence_in_chapter": 1,
+        },
+    }
+    anchors2 = extract_anchors(claim2, mentions, local_events=local_events)
+    text2 = "甲杀死了乙，血溅当场。"
+    candidates2 = SpanCandidateGenerator().generate("ch_1", 0, text2, anchors2)
+    verified2 = [
+        v for c in candidates2 if (v := LiteralVerifier().verify(c)) is not None
+    ]
+    assert verified2, "summary 逐字出现在原文必须支持"
+    assert verified2[0].stance == EvidenceStance.SUPPORTS
+
+
+def test_org_action_verb_required() -> None:
+    """验收 P0：org 成员共现不能证明「加入/离开」——action 动词组
+    任一命中才算谓词被证明，否则 unverified。"""
+    from novelcanon.evidence.span_candidates import (
+        SpanCandidateGenerator,
+        extract_anchors,
+    )
+    from novelcanon.evidence.verifiers import LiteralVerifier
+
+    mentions = {"m1": "甲", "m2": "乙"}
+    claim = {
+        "claim_type": "org",
+        "payload": {
+            "org_entity_id": "m1",
+            "member_entity_id": "m2",
+            "role": "弟子",
+            "action": "join",
+        },
+    }
+    # 共现但无加入动词 → 硬锚（org + member + action 组）未全命中
+    anchors = extract_anchors(claim, mentions)
+    assert any(a.group == "org_action" for a in anchors), "org action 动词组必须生成"
+    text = "甲与乙并肩而立，众人围观。"
+    candidates = SpanCandidateGenerator().generate("ch_1", 0, text, anchors)
+    verified = [
+        v for c in candidates if (v := LiteralVerifier().verify(c)) is not None
+    ]
+    assert verified == [], f"成员共现不得支持 org claim：{verified}"
+    # 对照：加入动词出现 → 支持
+    text2 = "乙加入甲的门派，成为外门弟子。"
+    candidates2 = SpanCandidateGenerator().generate("ch_1", 0, text2, anchors)
+    verified2 = [
+        v for c in candidates2 if (v := LiteralVerifier().verify(c)) is not None
+    ]
+    assert verified2, "action 动词命中必须支持 org claim"
+    assert verified2[0].stance == EvidenceStance.SUPPORTS
+
+
+def test_term_definition_requires_definition_in_text() -> None:
+    """验收 P0：term_definition 不得靠术语出现即空洞支持——
+    definition（谓词表达）为硬锚，须出现在原文。"""
+    from novelcanon.evidence.span_candidates import (
+        SpanCandidateGenerator,
+        extract_anchors,
+    )
+    from novelcanon.evidence.verifiers import LiteralVerifier
+
+    claim = {
+        "claim_type": "term_definition",
+        "payload": {"term_id": "t1", "definition": "斗之气是一种修炼境界"},
+    }
+    anchors = extract_anchors(claim, {})
+    assert all(a.hard for a in anchors), "definition 必须为硬锚（此前无硬锚=空洞支持）"
+    # 术语出现但定义句未出现 → 无候选 → unverified
+    text = "萧炎修炼斗之气已有三年。"
+    candidates = SpanCandidateGenerator().generate("ch_1", 0, text, anchors)
+    verified = [
+        v for c in candidates if (v := LiteralVerifier().verify(c)) is not None
+    ]
+    assert verified == [], "术语出现不得支持定义（定义未在原文）"
+    # 对照：定义句逐字出现 → 支持
+    text2 = "斗之气是一种修炼境界，分为十段。"
+    candidates2 = SpanCandidateGenerator().generate("ch_1", 0, text2, anchors)
+    verified2 = [
+        v for c in candidates2 if (v := LiteralVerifier().verify(c)) is not None
+    ]
+    assert verified2, "definition 出现在原文必须支持"
+    assert verified2[0].stance == EvidenceStance.SUPPORTS
+
+
+# ── P0 回归：foreshadowing 含 related_entity_ids 不得崩溃 ──────
+
+
+def test_align_foreshadowing_with_related_entities(
+    tmp_path, migrated_db: Engine
+) -> None:
+    """验收 P0：含 related_entity_ids 且证据有效的 foreshadowing claim
+    必须能完成 align + materialize（此前 _ns_payload 用 dataclasses.field
+    函数对象做字典 key → **kwargs 解包抛 TypeError: keywords must be
+    strings，导致 align 崩溃）。"""
+    from novelcanon.schemas.payloads import ForeshadowPayload
+
+    book_id, chapter_id, chapter_text = _book_and_chapter(migrated_db, tmp_path)
+    run_id = RunManager(migrated_db).create(book_id, input_hash="foreshadow-align")
+    ref = RefSourceSegment(
+        segment_id="seg_0",
+        char_offset=0,
+        segment_content_hash=sha256(chapter_text),
+    )
+    draft = ExtractionDraftV1(
+        book_id=BOOK_ID,
+        chapter_id=chapter_id,
+        chapter_ordinal=1,
+        mentions=[
+            _mention("m1", "萧炎"),
+            _mention("m2", "萧战"),
+        ],
+        provisional_claims=[
+            ProvisionalClaim(
+                provisional_claim_id="c1",
+                claim_type="foreshadowing",
+                payload=ForeshadowPayload(
+                    clue_anchor="斗之气只有三段",
+                    related_entity_ids=["m1", "m2"],
+                ),
+                ref_source_segment_id="seg_0",
+            ),
+        ],
+        ref_source_segments=[ref],
+    )
+    service = EvidenceService(migrated_db)
+    stats = service.align_chapter(run_id, book_id, draft, chapter_text, "draft_1")
+    assert stats.errors == [], f"foreshadowing align 不得报错：{stats.errors}"
+    assert stats.evidence >= 1, "clue_anchor + related 实体全命中应有证据"
+    assert stats.statuses.get("supported", 0) == 1
+    # materialize 落库成功（claims 含 foreshadowing 行）
+    with migrated_db.connect() as conn:
+        n = conn.execute(
+            text(
+                "SELECT count(*) FROM claims c"
+                " JOIN foreshadow_claims f ON f.claim_version_id = c.claim_version_id"
+            )
+        ).scalar()
+    assert n == 1, "foreshadowing claim 必须 materialize 落库"

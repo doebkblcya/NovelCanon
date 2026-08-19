@@ -343,6 +343,58 @@ def test_generation_client_gives_up_after_retries() -> None:
     asyncio.run(main())
 
 
+def test_generation_client_concurrent_retry_counts_isolated() -> None:
+    """验收 P1：并发请求共享同一 client 时 retry_count 不得串账。
+
+    此前失败计数挂在实例上：A 请求重试一次却记录 0、未重试的 B 记录 1。
+    现在每次 complete 调用使用局部计数——A 重试 2 次只记在自己的 usage 上。
+    """
+    calls = {"a": 0, "b": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prompt = body["messages"][0]["content"]
+        if prompt == "A":
+            calls["a"] += 1
+            if calls["a"] < 3:
+                return httpx.Response(429, json={"error": "rate limited"})
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": "a-ok"}}],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 2},
+                },
+            )
+        calls["b"] += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "b-ok"}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 1},
+            },
+        )
+
+    async def main() -> None:
+        client = GenerationClient(
+            _profile(max_retries=5),
+            api_key="secret-key",
+            tokenizer=TOK,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        ra, rb = await asyncio.gather(client.complete("A"), client.complete("B"))
+        assert calls["a"] == 3 and calls["b"] == 1
+        assert ra.usage.retry_count == 2, (
+            f"A 重试 2 次必须记在自己的 usage：{ra.usage.retry_count}"
+        )
+        assert rb.usage.retry_count == 0, (
+            f"B 未重试不得消费 A 的重试计数：{rb.usage.retry_count}"
+        )
+        # 重建 Usage 时 profile_id 不丢失（此前重建丢失）
+        assert ra.usage.profile_id == "g1" and rb.usage.profile_id == "g1"
+
+    asyncio.run(main())
+
+
 def test_fake_generation_client_returns_mapping() -> None:
     fake = FakeGenerationClient({"阿远": '{"ok": 1}'})
     result = asyncio.run(fake.complete("章内有阿远二字"))
