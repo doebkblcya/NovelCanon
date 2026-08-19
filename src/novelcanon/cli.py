@@ -137,38 +137,29 @@ def extract(
 
 
 def _cli_generation_profile(concurrency: int) -> GenerationProfile:
-    """从安全环境构造 CLI generation profile（密钥只读环境，不落库）。
+    """从 AppSettings 构造 CLI generation profile（密钥只读环境，不落库）。
 
-    支持 .env 文件（gitignore 已忽略）：NOVELCANON_LLM_* 变量与
-    环境变量同源，优先级为「真实环境变量 > .env」。
+    LLM_* / NOVELCANON_LLM_* 环境变量与 .env（gitignore 已忽略）由
+    pydantic-settings 统一加载；llm_api_key 字段 exclude=True，
+    不进 config_hash / 日志 / 数据库。
     """
-    import os
-
-    try:
-        from dotenv import load_dotenv
-
-        load_dotenv()  # 幂等；环境变量优先，不覆盖已设置值
-    except ImportError:
-        pass
-
-    model = os.environ.get("NOVELCANON_LLM_MODEL", "")
-    base_url = os.environ.get("NOVELCANON_LLM_BASE_URL", "")
+    settings = AppSettings()
     profile = GenerationProfile(
-        profile_id=os.environ.get("NOVELCANON_LLM_PROFILE", "cli"),
-        context_window=int(os.environ.get("NOVELCANON_LLM_CONTEXT_WINDOW", "8192")),
-        max_output_tokens=int(os.environ.get("NOVELCANON_LLM_MAX_OUTPUT", "2048")),
-        structured_output_mode=os.environ.get("NOVELCANON_LLM_MODE", "json_object"),
-        tokenizer_id=os.environ.get("NOVELCANON_LLM_TOKENIZER", "fake-v1"),
-        provider=os.environ.get("NOVELCANON_LLM_PROVIDER", "openai-compatible"),
-        model=model,
-        base_url=base_url,
-        api_key_env="NOVELCANON_LLM_API_KEY",
+        profile_id="cli",
+        context_window=settings.llm_context_window,
+        max_output_tokens=settings.llm_max_output,
+        structured_output_mode=settings.llm_mode,
+        tokenizer_id=settings.llm_tokenizer,
+        provider=settings.llm_provider,
+        model=settings.llm_model,
+        base_url=settings.llm_base_url,
+        api_key_env="LLM_API_KEY",
         concurrency_limit=max(1, concurrency),
     )
-    if not model or not base_url:
+    if not settings.llm_model or not settings.llm_base_url:
         raise typer.BadParameter(
-            "缺少模型配置：请设置 NOVELCANON_LLM_MODEL 与 NOVELCANON_LLM_BASE_URL"
-            "（API key 用 NOVELCANON_LLM_API_KEY，本地 provider 可省略）"
+            "缺少模型配置：请设置 LLM_MODEL 与 LLM_BASE_URL"
+            "（API key 用 LLM_API_KEY，本地 provider 可省略；均可写入 .env）"
         )
     return profile
 
@@ -199,7 +190,7 @@ def _run_extract(
     from novelcanon.extraction.map_pipeline import build_map_process_fn
     from novelcanon.extraction.staging import MapStaging
     from novelcanon.generation import default_map_prompts
-    from novelcanon.generation.client import GenerationClient, resolve_api_key
+    from novelcanon.generation.client import GenerationClient
     from novelcanon.pipeline import (
         ChapterTask,
         PipelineRunner,
@@ -229,7 +220,8 @@ def _run_extract(
         typer.echo("✅ dry-run：配置与章节校验通过，未调用模型")
         return
 
-    api_key = resolve_api_key(profile)
+    settings = AppSettings()
+    api_key = settings.llm_api_key or None
     if api_key is None and profile.api_key_env:
         typer.echo(f"⚠️  未设置 {profile.api_key_env}；若 provider 需要鉴权将失败")
     client = GenerationClient(profile, tokenizer=tokenizer, api_key=api_key)

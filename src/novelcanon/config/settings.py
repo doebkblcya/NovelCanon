@@ -81,6 +81,18 @@ class AppSettings(BaseSettings):
     log_level: str = Field(default="INFO", pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
     log_json: bool = False
 
+    # ── generation provider（阶段 06）─────────────────────────
+    # 环境变量 LLM_* 与 NOVELCANON_LLM_* 均可；密钥字段 exclude=True，
+    # 绝不进入 config_hash / 日志 / 数据库（只存内存供 GenerationClient）。
+    llm_provider: str = "openai-compatible"
+    llm_model: str = ""
+    llm_base_url: str = ""
+    llm_api_key: str = Field(default="", exclude=True)
+    llm_context_window: int = 8192
+    llm_max_output: int = 2048
+    llm_mode: str = "json_object"
+    llm_tokenizer: str = "fake-v1"
+
     def config_hash(self) -> str:
-        """整个应用配置的稳定 hash，供 run 幂等与 checkpoint 键使用。"""
+        """整个应用配置的稳定 hash（密钥字段已 exclude，不进入 hash）。"""
         return stable_config_hash(self.model_dump(mode="json"))

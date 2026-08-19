@@ -66,11 +66,15 @@ def test_extract_dry_run_validates_config_and_book(tmp_path) -> None:
     assert "dry-run" in result.stdout
     assert "章节=3" in result.stdout
 
-    # 缺少模型配置 → 明确报错
-    bad_env = {"NOVELCANON_DB_PATH": str(db)}
+    # 缺少模型配置（显式置空，覆盖 .env）→ 明确报错
+    bad_env = {
+        "NOVELCANON_DB_PATH": str(db),
+        "NOVELCANON_LLM_MODEL": "",
+        "NOVELCANON_LLM_BASE_URL": "",
+    }
     result = runner.invoke(app, ["extract", book_id, "--dry-run"], env=bad_env)
     assert result.exit_code != 0
-    assert "NOVELCANON_LLM_MODEL" in result.stderr or "NOVELCANON_LLM_MODEL" in result.stdout
+    assert "LLM_MODEL" in result.stderr or "LLM_MODEL" in result.stdout
 
 
 def test_invalid_env_config_fails_at_startup() -> None:
