@@ -37,13 +37,15 @@ from tests.helpers import make_fixture_epub
 
 BOOK_ID = "book_events"
 
-# 5 章：主角历练线（拜师→突破→遇险→获救→复仇）
+# 5 章：主角历练线（拜师→突破→遇险→获救→复仇）。
+# 第 2/4/5 章含因果连接词（「入门之后…因此…」「于是…」「伤愈之后…」），
+# 供 LinkVerifier 做关系证据验证；第 3 章无因果表述（突破→遇险保持 unverified）。
 EVENT_CHAPTERS: list[tuple[str, str]] = [
     ("第一章", "陆尘拜入青云宗，成为药老的关门弟子。"),
-    ("第二章", "陆尘闭关苦修三月，境界突破至筑基期。"),
+    ("第二章", "入门之后，陆尘闭关苦修三月，因此境界突破至筑基期。"),
     ("第三章", "陆尘下山历练，在荒山遭妖兽围攻。"),
-    ("第四章", "药老闻讯赶到，出手救下重伤的陆尘。"),
-    ("第五章", "伤愈后陆尘立誓，必报此仇。"),
+    ("第四章", "药老闻讯赶到，于是出手救下重伤的陆尘。"),
+    ("第五章", "伤愈之后，陆尘立誓，必报此仇。"),
 ]
 
 
@@ -165,11 +167,11 @@ def _seed_events(
 def _link_events(
     migrated_db: Engine, book_id: str, run_id: str
 ) -> object:
-    """生成并落库跨章链接（需先激活 run 使可见）。
+    """生成候选 → LinkVerifier 关系证据验证 → 落库跨章链接（先激活 run）。
 
-    规则层只产生 candidate（unverified）；为覆盖因果递归查询，
-    先补一条「关系证据已验证」的 supported causes 边（拜师→突破，
-    09 §4 的语义验证步骤留后续阶段，这里直接模拟验证结果）。
+    LinkVerifier 检查目标章原文「原因引用 + 因果连接词」：验证通过的边
+    （如 拜师→突破，第 2 章含「入门之后…因此…」）自动 supported；
+    无关系证据的边（如 突破→遇险，第 3 章无因果表述）保持 unverified。
     """
     mgr = RunManager(migrated_db)
     for f, t in (
@@ -179,52 +181,7 @@ def _link_events(
     ):
         assert mgr.transition(run_id, f, t)
     assert Activator(migrated_db).activate(run_id) is None
-
-    # 模拟验证：写一条 supported 的 拜师→突破 causes 边（先于规则层落库，
-    # 规则层的同一条边写入命中幂等，保持 supported）
-    repo = Repository(migrated_db)
-    ids = {c["ordinal"]: c["chapter_id"] for c in repo.list_chapters(book_id)}
-    from novelcanon.schemas.ids import event_link_fact_id
-    from novelcanon.schemas.memory import EventLinkRecord
-
-    src, tgt = _seed_events_versions(migrated_db, run_id)
-    payload = EventLinkPayload(
-        source_event_id=src, target_event_id=tgt, relation_type=EventLinkType.CAUSES
-    )
-    repo.write_event_link(
-        EventLinkRecord(
-            envelope=ClaimEnvelope(
-                fact_id=event_link_fact_id(src, EventLinkType.CAUSES, tgt),
-                claim_version_id="",  # write_event_link 按 payload 确定性生成
-                claim_type="event_link",
-                operation=Operation.ASSERT,
-                claim_status=ClaimStatus.SUPPORTED,
-                observed_chapter_id=ids[1],
-                observed_ordinal=1,
-                created_by_run_id=run_id,
-                created_at="2026-01-01T00:00:00+00:00",
-            ),
-            payload=payload,
-        )
-    )
     return EventLinkService(migrated_db).link_run(run_id, book_id)
-
-
-def _seed_events_versions(migrated_db: Engine, run_id: str) -> tuple[str, str]:
-    """从库里读取该 run 的 拜师/突破 事件版本 id（_link_events 辅助）。"""
-    with migrated_db.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT e.claim_version_id, e.event_type, e.sequence_in_chapter"
-                " FROM event_claims e"
-                " JOIN claim_observations o ON o.claim_version_id = e.claim_version_id"
-                " WHERE o.extraction_run_id = :r AND e.event_type IN ('拜师','突破')"
-                " ORDER BY e.sequence_in_chapter"
-            ),
-            {"r": run_id},
-        ).fetchall()
-    by_type = {r[1]: r[0] for r in rows}
-    return by_type["拜师"], by_type["突破"]
 
 
 # ── 链接生成 ───────────────────────────────────────────────────
@@ -569,6 +526,99 @@ def test_world_state_at_combines_cutoff(tmp_path, migrated_db: Engine) -> None:
     assert "f_secret" not in before, "world_valid_from=1 在 world_at=0 不得返回"
 
 
+def test_relations_and_org_world_valid(tmp_path, migrated_db: Engine) -> None:
+    """验收 P1：world_valid 过滤扩展到关系与组织查询（此前只有 state）。
+
+    one_hop_relations 组合 world_at + knowledge_cutoff；org_state_at
+    提供势力/成员世界状态查询（story_time 区间 / chapter_proxy /
+    unknown 排除 / cutoff 组合）。
+    """
+    from novelcanon.config.hash import stable_config_hash
+    from novelcanon.schemas.ids import org_fact_id, relation_fact_id
+    from novelcanon.schemas.memory import EntityRecord
+    from novelcanon.schemas.payloads import OrgPayload, RelationPayload
+    from novelcanon.schemas.types import EntityTier, WorldValidKind
+
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    run_id = RunManager(migrated_db).create(book_id, input_hash="world-rel-org")
+    repo = Repository(migrated_db)
+    for cid, name in (("ent_x", "X"), ("ent_y", "Y"), ("ent_org", "青云门")):
+        repo.upsert_entity(
+            EntityRecord(
+                canonical_id=cid, canonical_name=name,
+                tier=EntityTier.MINOR, created_by_run_id=run_id,
+            )
+        )
+
+    def write(payload, fact_id, kind, wfrom, ordinal):
+        vid = claim_version_id(fact_id, stable_config_hash({"v": kind.value}))
+        repo.write_claim(
+            ClaimEnvelope(
+                fact_id=fact_id,
+                claim_version_id=vid,
+                claim_type="relation" if isinstance(payload, RelationPayload) else "org",
+                operation=Operation.ASSERT,
+                claim_status=ClaimStatus.SUPPORTED,
+                observed_chapter_id=ids[min(ordinal, 4)],
+                observed_ordinal=ordinal,
+                world_valid_kind=kind,
+                world_valid_from=wfrom,
+                world_valid_to=None,
+                world_valid_confidence=1.0,
+                created_by_run_id=run_id,
+                created_at="2026-01-01T00:00:00+00:00",
+            ),
+            payload,
+        )
+
+    # 关系：X 是 Y 的师父——世界时间从第 4 章起（story_time from=3），
+    # 但第 1 章即披露（ordinal=0）
+    write(
+        RelationPayload(from_entity_id="ent_x", to_entity_id="ent_y",
+                        relation_type="师徒", relation_raw="X是Y的师父"),
+        relation_fact_id("ent_x", "师徒", "ent_y"),
+        WorldValidKind.STORY_TIME, 3, 0,
+    )
+    # org：X 加入 青云门——chapter_proxy from=2（第 3 章起），披露 ordinal=0
+    write(
+        OrgPayload(org_entity_id="ent_org", member_entity_id="ent_x", role="弟子", action="join"),
+        org_fact_id("ent_org", "ent_x", "弟子"),
+        WorldValidKind.CHAPTER_PROXY, 2, 0,
+    )
+
+    mgr = RunManager(migrated_db)
+    for f, t in (
+        (RunStatus.CREATED, RunStatus.RUNNING),
+        (RunStatus.RUNNING, RunStatus.VALIDATING),
+        (RunStatus.VALIDATING, RunStatus.READY_TO_ACTIVATE),
+    ):
+        assert mgr.transition(run_id, f, t)
+    assert Activator(migrated_db).activate(run_id) is None
+
+    q = QueryService(migrated_db, book_id)
+    # 关系：world_at=0（第 1 章）故事时间未开始 → 不可见；world_at=3 可见
+    rel0 = q.one_hop_relations("ent_x", world_at=0)
+    assert all(r["relation_type"] != "师徒" for r in rel0), (
+        f"story_time from=3 在 world_at=0 不得返回关系：{rel0}"
+    )
+    rel3 = q.one_hop_relations("ent_x", world_at=3)
+    assert any(r["relation_type"] == "师徒" for r in rel3), "world_at=3 关系可见"
+    # 关系 + cutoff 组合：披露 ordinal=0 → cutoff=0 可见（world 窗口仍生效）
+    rel0c = q.one_hop_relations("ent_x", world_at=0, knowledge_cutoff=0)
+    assert all(r["relation_type"] != "师徒" for r in rel0c), "world 窗口优先于 cutoff"
+    rel3c = q.one_hop_relations("ent_x", world_at=3, knowledge_cutoff=0)
+    assert any(r["relation_type"] == "师徒" for r in rel3c), "cutoff=0 已披露可见"
+
+    # org：chapter_proxy from=2 → world_at=1 不可见、world_at=2 可见
+    org0 = q.org_state_at("ent_x", 1)
+    assert org0 == [], f"org chapter_proxy from=2 在 world_at=1 不可见：{org0}"
+    org1 = q.org_state_at("ent_x", 2)
+    assert len(org1) == 1 and org1[0]["action"] == "join", f"world_at=2 org 可见：{org1}"
+    # org + cutoff 组合：披露 ordinal=0 → cutoff=0 可见
+    org1c = q.org_state_at("ent_x", 2, knowledge_cutoff=0)
+    assert len(org1c) == 1, "cutoff=0 已披露的 org 状态可见"
+
+
 def test_causal_results_excludes_enables(tmp_path, migrated_db: Engine) -> None:
     """验收 P1：causal_results 只反向查 causes——初始分支与递归分支都
     必须限定 relation_type='causes'，enables 边不得混入 results。"""
@@ -777,29 +827,24 @@ def test_rejected_events_produce_no_supported_link(tmp_path, migrated_db: Engine
 # ── P0 回归：规则层只生成 candidate，未经关系证据验证不得 supported ──
 
 
-def test_rule_links_stay_unverified(tmp_path, migrated_db: Engine) -> None:
-    """验收 P0：时间先后 + 共同参与者只生成 candidate，服务层不得
-    直接标 supported——端点各自有证据 ≠ 边有因果证据。
+def test_rule_links_without_evidence_stay_unverified(
+    tmp_path, migrated_db: Engine
+) -> None:
+    """验收 P0：规则候选必须经关系证据验证才 supported。
 
-    「甲吃早饭」→「甲中彩票」同参与者同先后，规则会产生 enables 候选，
-    但边必须保持 unverified，且不进入默认因果回答。
+    - 突破→遇险（目标章第 3 章无因果表述）→ 保持 unverified，不进默认
+      因果回答（「甲吃早饭」→「甲中彩票」同参与者同先后同理）；
+    - 拜师→突破（第 2 章「入门之后…因此…」）→ LinkVerifier 验证通过
+      supported（自动因果链非空，不再依赖手工写入）。
     """
     book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
     run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
-
-    # 激活但不补验证边：只跑规则层
-    mgr = RunManager(migrated_db)
-    for f, t in (
-        (RunStatus.CREATED, RunStatus.RUNNING),
-        (RunStatus.RUNNING, RunStatus.VALIDATING),
-        (RunStatus.VALIDATING, RunStatus.READY_TO_ACTIVATE),
-    ):
-        assert mgr.transition(run_id, f, t)
-    assert Activator(migrated_db).activate(run_id) is None
-    stats = EventLinkService(migrated_db).link_run(run_id, book_id)
+    stats = _link_events(migrated_db, book_id, run_id)
 
     assert stats.candidates > 0, "规则候选必须被生成"
-    assert stats.links > 0, "候选必须落库（unverified）"
+    assert stats.links > 0
+    assert stats.verified > 0, "LinkVerifier 必须实际产出 supported 边"
+    assert stats.unverified > 0, "无关系证据的候选必须保持 unverified"
     with migrated_db.connect() as conn:
         rows = conn.execute(
             text(
@@ -807,15 +852,50 @@ def test_rule_links_stay_unverified(tmp_path, migrated_db: Engine) -> None:
             )
         ).fetchall()
     statuses = dict(rows)
-    assert statuses.get("unverified", 0) == stats.links, (
-        f"规则层产生的边必须全部 unverified：{statuses}"
-    )
-    assert "supported" not in statuses, "服务层不得自动标 supported 边"
+    assert "supported" in statuses and "unverified" in statuses
 
+    # 突破→遇险：无关系证据 → unverified
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT claim_status FROM event_links"
+                " WHERE source_event_id = :s AND target_event_id = :t"
+            ),
+            {"s": version_ids[1], "t": version_ids[2]},
+        ).fetchone()
+    assert row is not None and row[0] == "unverified", (
+        f"突破→遇险 必须 unverified：{row}"
+    )
     q = QueryService(migrated_db, book_id)
-    assert q.causal_paths(version_ids[0]) == [], (
+    paths = q.causal_paths(version_ids[1])
+    assert version_ids[2] not in {p["event"]["claim_version_id"] for p in paths}, (
         "unverified 边不得进入默认因果回答"
     )
-    assert q.causal_results(version_ids[-1]) == [], (
-        "unverified 边不得进入 results 反向回答"
+    # 对照：拜师→突破 验证通过 → 在因果回答中
+    assert version_ids[1] in {
+        p["event"]["claim_version_id"] for p in q.causal_paths(version_ids[0])
+    }, "验证通过的边必须进入因果回答"
+
+
+def test_link_verifier_promotes_evidence_edges(
+    tmp_path, migrated_db: Engine
+) -> None:
+    """验收 P0：LinkVerifier 把「证据充分」的边提升为 supported，并落库
+    验证方法（causal-connective）与原文证据 span（可审计）。"""
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
+    _link_events(migrated_db, book_id, run_id)
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT claim_status, verification_method, verification_evidence"
+                " FROM event_links WHERE source_event_id = :s AND target_event_id = :t"
+            ),
+            {"s": version_ids[0], "t": version_ids[1]},
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "supported", "拜师→突破 必须有关系证据 → supported"
+    assert row[1] == "causal-connective", f"验证方法应记录：{row[1]}"
+    assert row[2] is not None and "入门之后" in row[2], (
+        f"验证证据 span 必须落库：{row[2]}"
     )

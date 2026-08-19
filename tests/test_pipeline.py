@@ -359,6 +359,38 @@ def test_old_run_remains_queryable(migrated_db: Engine) -> None:
     asyncio.run(main())
 
 
+def test_ledger_folds_provider_retry_meta_on_exhaustion(
+    migrated_db: Engine,
+) -> None:
+    """验收 P1：provider 内部重试耗尽时（Usage 尚未构造），失败尝试数与
+    消耗的 prompt token 由 client 附加到异常、runner 读入账本——失败调用
+    也必须可审计。"""
+    _ensure_book(migrated_db)
+    tasks = [_task("ch1")]
+
+    def provider_with_exhaustion():
+        async def process(task: ChapterTask) -> ProcessResult:
+            exc = RuntimeError("provider retries exhausted")
+            exc.provider_retry_count = 3  # 模拟 GenerationClient 附加
+            exc.provider_input_tokens = 150
+            raise exc
+
+        return process
+
+    async def main() -> None:
+        run_id, summary, issues = await _full_run(
+            migrated_db, tasks, provider_with_exhaustion(), timeout_seconds=1.0
+        )
+        assert issues is not None
+        assert summary.failed == 1
+        led = TokenLedger(migrated_db).summary(run_id)
+        # provider 内部 3 次失败尝试必须进入账本（runner 层重试另计）
+        assert led["retry_count"] >= 3, f"provider 失败尝试必须入账：{led}"
+        assert led["input_tokens"] >= 150, f"失败调用消耗的 token 必须入账：{led}"
+
+    asyncio.run(main())
+
+
 # ── Token 账本汇总 ─────────────────────────────────────────────
 
 

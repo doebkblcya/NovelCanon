@@ -194,6 +194,7 @@ class PipelineRunner:
         last_error = "unknown"
         retry_usage = Usage()
         for attempt in range(self._policy.max_attempts):
+            caught: BaseException | None = None
             try:
                 if self._limiter is not None:
                     await self._limiter.acquire()
@@ -221,9 +222,22 @@ class PipelineRunner:
                 last_error = f"timeout after {timeout_seconds}s"
             except RetryableError as exc:
                 last_error = str(exc)
+                caught = exc
             except Exception as exc:  # noqa: BLE001 —— 其余异常按可重试处理
                 last_error = f"{type(exc).__name__}: {exc}"
+                caught = exc
             retry_usage = retry_usage + Usage(retry_count=1)
+            # P1：provider 内部重试耗尽时，失败尝试数/消耗的 prompt token
+            # 由 client 附加到异常（provider_retry_count / provider_input_tokens），
+            # 一并计入账本（「所有模型调用均可审计」含失败调用）。
+            if caught is not None:
+                provider_retries = getattr(caught, "provider_retry_count", 0)
+                provider_tokens = getattr(caught, "provider_input_tokens", 0)
+                if provider_retries:
+                    retry_usage = retry_usage + Usage(
+                        retry_count=int(provider_retries),
+                        input_tokens=int(provider_tokens or 0),
+                    )
             if attempt + 1 >= self._policy.max_attempts:
                 break
             await asyncio.sleep(self._policy.delay_for(attempt))

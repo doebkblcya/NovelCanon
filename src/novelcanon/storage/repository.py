@@ -455,12 +455,29 @@ class Repository:
             {"operation": record.envelope.operation.value, "payload": payload}
         )
         version_id = claim_version_id(record.envelope.fact_id, version_key)
+        verification_evidence = record.verification_evidence
+        verification_method = record.verification_method
         with self._engine.begin() as conn:
             existing = conn.execute(
                 text("SELECT 1 FROM event_links WHERE claim_version_id = :v"), {"v": version_id}
             ).fetchone()
             if existing:
-                # 幂等命中：复用版本，仍把该 run 加入成员关系（09 §4）
+                # 幂等命中：复用版本，仍把该 run 加入成员关系（09 §4）；
+                # 若本轮关系证据验证通过，把边提升为 supported 并记录验证
+                # 信息（P0：验证是后续语义步骤，重跑可补验/覆盖）。
+                if verification_method is not None:
+                    conn.execute(
+                        text(
+                            "UPDATE event_links SET claim_status = 'supported',"
+                            " verification_method = :vm, verification_evidence = :ve"
+                            " WHERE claim_version_id = :v"
+                        ),
+                        {
+                            "vm": verification_method,
+                            "ve": verification_evidence,
+                            "v": version_id,
+                        },
+                    )
                 self._record_event_link_observation(
                     conn, version_id, record.envelope.created_by_run_id
                 )
@@ -481,9 +498,9 @@ class Repository:
                     " target_event_id, relation_type, confidence, claim_status,"
                     " observed_chapter_id,"
                     " observed_ordinal, supersedes_version_id, primary_evidence_id,"
-                    " created_by_run_id)"
+                    " created_by_run_id, verification_method, verification_evidence)"
                     " VALUES (:v, :fact, :src, :tgt, :rt, :conf, :status, :och, :oord,"
-                    " :sup, :pev, :run)"
+                    " :sup, :pev, :run, :vm, :ve)"
                 ),
                 {
                     "v": version_id,
@@ -498,6 +515,8 @@ class Repository:
                     "sup": supersedes,
                     "pev": record.envelope.primary_evidence_id,
                     "run": record.envelope.created_by_run_id,
+                    "vm": verification_method,
+                    "ve": verification_evidence,
                 },
             )
             self._record_event_link_observation(
@@ -679,9 +698,11 @@ class Repository:
         with self._engine.begin() as conn:
             conn.execute(
                 text(
-                    "INSERT OR IGNORE INTO entity_mentions (mention_id, chapter_id, surface_name,"
+                    "INSERT INTO entity_mentions (mention_id, chapter_id, surface_name,"
                     " char_start, char_end, canonical_id, run_id, created_at)"
                     " VALUES (:m, :ch, :name, :cs, :ce, :canon, :run, :ts)"
+                    " ON CONFLICT(mention_id) DO UPDATE SET"
+                    "   char_start = excluded.char_start, char_end = excluded.char_end"
                 ),
                 {
                     "m": mention_id,

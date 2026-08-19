@@ -3,22 +3,25 @@
 流程：
 1. 读取 run 的 event claims（含 participants/evidence/location/ordinal）；
 2. EventLinker 生成跨章候选；
-3. 高置信候选落 event_links（幂等：claim_version_id 主键）：
+3. 候选落 event_links（幂等：claim_version_id 主键）：
    - observed_ordinal = 全部支持证据的最大披露章节（09 §4）；
    - 原因端+结果端证据默认保留（事件自身 evidence 已关联）；
-   - claim_status：规则候选一律 unverified（P0：端点证据 ≠ 边因果
-     证据；未经关系证据验证不得 supported，09 §3/§4）；
+   - claim_status：规则候选默认 unverified（P0：端点证据 ≠ 边因果
+     证据）；LinkVerifier 验证通过（目标章原文出现原因引用 + 因果
+     连接词）→ supported + 记录 verification_method/evidence（09 §4）；
 4. 结果端/原因端可见性由查询层（cutoff）执行，不在此过滤。
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 from sqlalchemy import Engine, text
 
 from novelcanon.config.hash import stable_config_hash
 from novelcanon.events.linker import EventInfo, EventLinker, LinkCandidate
+from novelcanon.events.verifier import LinkVerification, LinkVerifier
 from novelcanon.schemas.envelope import ClaimEnvelope
 from novelcanon.schemas.ids import claim_version_id, event_link_fact_id
 from novelcanon.schemas.memory import EventLinkRecord
@@ -33,21 +36,29 @@ class LinkStats:
     candidates: int = 0
     links: int = 0
     unverified: int = 0
+    verified: int = 0
     statuses: dict[str, int] = field(default_factory=dict)
 
 
 class EventLinkService:
-    """跨章事件链接：生成候选 + 落库（幂等）。"""
+    """跨章事件链接：生成候选 + 关系证据验证 + 落库（幂等）。"""
 
-    def __init__(self, engine: Engine, *, linker: EventLinker | None = None) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        linker: EventLinker | None = None,
+        verifier: LinkVerifier | None = None,
+    ) -> None:
         self._engine = engine
         self._repo = Repository(engine)
         self._linker = linker or EventLinker()
+        self._verifier = verifier or LinkVerifier()
 
     # ── 对外 ────────────────────────────────────────────────────
 
     def link_run(self, run_id: str, book_id: str) -> LinkStats:
-        """对某 run 的 event claims 生成并落库跨章链接。"""
+        """对某 run 的 event claims 生成候选、验证并落库跨章链接。"""
         stats = LinkStats()
         events = self._load_events(run_id)
         stats.events = len(events)
@@ -61,6 +72,8 @@ class EventLinkService:
             stats.statuses[written.value] = stats.statuses.get(written.value, 0) + 1
             if written == ClaimStatus.UNVERIFIED:
                 stats.unverified += 1
+            elif written == ClaimStatus.SUPPORTED:
+                stats.verified += 1
         return stats
 
     # ── 数据读取：event claims → EventInfo ──────────────────────
@@ -191,11 +204,28 @@ class EventLinkService:
             source.observed_ordinal, target.observed_ordinal
         )
         # 边状态（P0 收紧）：规则层只生成 candidate——端点各自有证据
-        # 不等于边有因果证据（「甲吃早饭」→「甲中彩票」同参与者同先后
-        # 不能证明因果）。未经关系证据验证的边一律 unverified；
-        # 因果查询只走 supported 边（关系证据验证是后续语义步骤，
-        # 09 不自动把规则候选标成 supported）。
-        status = ClaimStatus.UNVERIFIED
+        # 不等于边有因果证据。LinkVerifier 检查目标章原文是否出现
+        # 「原因引用 + 因果连接词」：验证通过 → supported（记录验证
+        # 方法与原文 span）；否则保持 unverified。
+        verification = self._verify_link(book_id, source, target)
+        if verification is not None:
+            status = ClaimStatus.SUPPORTED
+            verification_method = verification.method
+            verification_evidence = json.dumps(
+                {
+                    "chapter_id": verification.chapter_id,
+                    "char_start": verification.char_start,
+                    "char_end": verification.char_end,
+                    "span_text": verification.span_text,
+                    "matched_ref": verification.matched_ref,
+                    "matched_connective": verification.matched_connective,
+                },
+                ensure_ascii=False,
+            )
+        else:
+            status = ClaimStatus.UNVERIFIED
+            verification_method = None
+            verification_evidence = None
         # primary_evidence_id（09 §4「默认保存原因端和结果端 evidence」）：
         # 因果边不新建 claim_evidence 行（event_links 不是 claims 表事实，
         # FK 约束），而是复用原因端事件的第一个 supports 证据做锚定——
@@ -230,9 +260,51 @@ class EventLinkService:
             primary_evidence_id=primary_evidence,
         )
         self._repo.write_event_link(
-            EventLinkRecord(envelope=envelope, payload=payload)
+            EventLinkRecord(
+                envelope=envelope,
+                payload=payload,
+                verification_method=verification_method,
+                verification_evidence=verification_evidence,
+            )
         )
         return status
+
+    def _verify_link(
+        self, book_id: str, source: EventInfo, target: EventInfo
+    ) -> LinkVerification | None:
+        """因果边关系证据验证（09 §4 P0）：目标章原文「原因引用 + 连接词」。
+
+        原因引用 = 原因端参与者 canonical 名 + 原因端 event_type；
+        任一与因果连接词同句出现 → 验证通过。
+        """
+        refs = self._source_refs(source)
+        if not refs:
+            return None
+        target_text = self._repo.chapter_text_for(book_id, target.observed_chapter_id)
+        if not target_text:
+            return None
+        return self._verifier.verify(
+            target.observed_chapter_id, target_text, refs
+        )
+
+    def _source_refs(self, source: EventInfo) -> list[str]:
+        """原因事件的引用表述：参与者 canonical 名 + event_type 标签。"""
+        refs: list[str] = []
+        if source.event_type and len(source.event_type) >= 2:
+            refs.append(source.event_type)
+        if not source.participants:
+            return refs
+        with self._engine.connect() as conn:
+            for pid in source.participants:
+                row = conn.execute(
+                    text(
+                        "SELECT canonical_name FROM entities WHERE canonical_id = :c"
+                    ),
+                    {"c": pid},
+                ).fetchone()
+                if row is not None and row[0] not in refs:
+                    refs.append(row[0])
+        return refs
 
     def _source_evidence(self, event_claim_version_id: str) -> str | None:
         """原因端事件的第一个 supports 证据 id（边锚定用，09 §4）。"""

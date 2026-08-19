@@ -21,6 +21,28 @@ def _cutoff_sql(cutoff: int | None) -> tuple[str, dict[str, object]]:
     return "AND c.observed_ordinal <= :cutoff", {"cutoff": cutoff}
 
 
+def _world_sql(world_at: int | None) -> tuple[str, dict[str, object]]:
+    """world at chapter 的世界有效区间过滤（09 §7，P1 扩展）。
+
+    story_time：world_valid_from <= chapter <= world_valid_to（to NULL 持续）；
+    chapter_proxy：world_valid_from <= chapter（章节近似）；
+    unknown：不返回（世界时间未知，不能表达为精确状态）。
+    与 knowledge_cutoff 是两个独立参数，各自进入过滤（双时间组合）。
+    """
+    if world_at is None:
+        return "", {}
+    return (
+        " AND ("
+        "   (c.world_valid_kind = 'story_time'"
+        "    AND c.world_valid_from <= :world"
+        "    AND (c.world_valid_to IS NULL OR c.world_valid_to >= :world))"
+        "   OR (c.world_valid_kind = 'chapter_proxy'"
+        "    AND c.world_valid_from <= :world)"
+        " )",
+        {"world": world_at},
+    )
+
+
 def _current_filter() -> str:
     """每 fact 最新版本（rn=1）后过滤 retract / 非 supported。"""
     return "q.rn = 1 AND q.operation != 'retract' AND q.claim_status = 'supported'"
@@ -137,13 +159,26 @@ class QueryService:
         return out
 
     def one_hop_relations(
-        self, canonical_id: str, *, knowledge_cutoff: int | None = None
+        self,
+        canonical_id: str,
+        *,
+        knowledge_cutoff: int | None = None,
+        world_at: int | None = None,
     ) -> list[dict]:
-        """一跳关系（from/to 任一为该实体）+ 证据（active，每 fact 当前版本）。"""
-        cutoff_sql, params = _cutoff_sql(knowledge_cutoff)
+        """一跳关系（from/to 任一为该实体）+ 证据（active，每 fact 当前版本）。
+
+        双时间（P1 扩展）：knowledge_cutoff（读者知识）与 world_at
+        （世界时间）两个独立参数同时过滤——世界有效区间未覆盖 world_at
+        的关系不返回，observed 晚于 cutoff 的关系不返回。
+        """
+        cutoff_sql, cutoff_params = _cutoff_sql(knowledge_cutoff)
+        world_sql, world_params = _world_sql(world_at)
         scope = self.entity_scope(canonical_id)
         from_sql, from_params = self._scope_sql(scope, prefix="f")
         to_sql, to_params = self._scope_sql(scope, prefix="t")
+        params: dict[str, object] = {}
+        params.update(cutoff_params)
+        params.update(world_params)
         params.update(from_params)
         params.update(to_params)
         params["book"] = self._book_id
@@ -155,7 +190,7 @@ class QueryService:
                         " q.from_entity_id, q.to_entity_id, q.relation_type, q.relation_raw"
                         " FROM ("
                         "  SELECT c.claim_version_id, c.fact_id, c.observed_ordinal,"
-                        "         c.operation, c.claim_status,"
+                        "         c.operation, c.claim_status, c.world_valid_kind,"
                         "         r.from_entity_id, r.to_entity_id, r.relation_type,"
                         "         r.relation_raw,"
                         "         ROW_NUMBER() OVER (PARTITION BY c.fact_id"
@@ -165,8 +200,10 @@ class QueryService:
                         "  WHERE (r.from_entity_id " + from_sql + " OR r.to_entity_id "
                         + to_sql + ") AND c.book_id = :book"
                         f"  {cutoff_sql}"
+                        f"  {world_sql}"
                         ") q"
                         f" WHERE {_current_filter()}"
+                        "   AND q.world_valid_kind != 'unknown'"
                         " ORDER BY q.observed_ordinal"
                     ),
                     params,
@@ -517,6 +554,69 @@ class QueryService:
                         " ) q"
                         f" WHERE {_current_filter()}"
                         "   AND q.world_valid_kind != 'unknown'"
+                    ),
+                    params,
+                )
+                .mappings()
+                .fetchall()
+            )
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["evidence"] = self._evidence_for(d["claim_version_id"])
+            out.append(d)
+        return out
+
+    def org_state_at(
+        self,
+        canonical_id: str,
+        chapter_ordinal: int,
+        *,
+        knowledge_cutoff: int | None = None,
+    ) -> list[dict]:
+        """某世界时间点（章节序）势力/成员关系状态（org world 查询，P1）。
+
+        与 world_state_at 同构：org_claims 按 world_valid 区间过滤
+        （story_time 用 from/to、chapter_proxy 用 from、unknown 排除），
+        并与 knowledge_cutoff 组合（双时间：世界窗口 + 读者披露）。
+        作用域 = canonical 自身 + 名下 mention（org 或 member 任一命中）。
+        """
+        cutoff_sql, cutoff_params = _cutoff_sql(knowledge_cutoff)
+        scope_sql, scope_params = self._scope_sql(self.entity_scope(canonical_id))
+        params: dict[str, object] = dict(scope_params)
+        params.update(cutoff_params)
+        params["book"] = self._book_id
+        params["chapter"] = chapter_ordinal
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT q.claim_version_id, q.fact_id, q.observed_ordinal,"
+                        " q.org_entity_id, q.member_entity_id, q.role, q.action,"
+                        " q.world_valid_kind FROM ("
+                        " SELECT c.claim_version_id, c.fact_id, c.observed_ordinal,"
+                        " c.operation, c.claim_status, c.world_valid_kind,"
+                        " o.org_entity_id, o.member_entity_id, o.role, o.action,"
+                        " ROW_NUMBER() OVER (PARTITION BY c.fact_id"
+                        "   ORDER BY c._rowid DESC) rn"
+                        " FROM v_active_claims c"
+                        " JOIN org_claims o ON o.claim_version_id = c.claim_version_id"
+                        " WHERE (o.org_entity_id " + scope_sql
+                        + " OR o.member_entity_id " + scope_sql + ")"
+                        " AND c.book_id = :book"
+                        f"  {cutoff_sql}"
+                        " AND ("
+                        "   (c.world_valid_kind = 'story_time'"
+                        "    AND c.world_valid_from <= :chapter"
+                        "    AND (c.world_valid_to IS NULL"
+                        "         OR c.world_valid_to >= :chapter))"
+                        "   OR (c.world_valid_kind = 'chapter_proxy'"
+                        "    AND c.world_valid_from <= :chapter)"
+                        " )"
+                        " ) q"
+                        f" WHERE {_current_filter()}"
+                        "   AND q.world_valid_kind != 'unknown'"
+                        " ORDER BY q.observed_ordinal"
                     ),
                     params,
                 )

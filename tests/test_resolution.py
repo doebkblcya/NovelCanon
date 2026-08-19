@@ -312,6 +312,131 @@ def test_resolver_cross_chapter_continuity_merges() -> None:
     assert plan.unresolved == []
 
 
+def test_resolver_canonical_anchor_from_position_not_mention_id() -> None:
+    """验收 P0：canonical 锚点 = book + chapter + span，不依赖 LLM mention_id
+    ——同一位置同一 surface，mention_id 变化不改变 canonical_id。"""
+    r1 = EntityResolver(book_id="book1")
+    r2 = EntityResolver(book_id="book1")
+    p1 = r1.resolve(
+        [
+            {"mention_id": "m_llm_a", "surface_name": "萧炎", "chapter_id": "ch1",
+             "ordinal": 0, "char_start": 12, "char_end": 14},
+        ],
+        book_id="book1",
+    )
+    p2 = r2.resolve(
+        [
+            {"mention_id": "m_llm_b", "surface_name": "萧炎", "chapter_id": "ch1",
+             "ordinal": 0, "char_start": 12, "char_end": 14},
+        ],
+        book_id="book1",
+    )
+    assert p1.resolved[0].canonical_id == p2.resolved[0].canonical_id, (
+        "同一书同一章同一 span：mention_id 变化不得导致 canonical 漂移"
+    )
+
+
+def test_materialize_then_resolve_isolated_same_name_not_merged(
+    tmp_path, migrated_db: Engine
+) -> None:
+    """验收 P0 集成：materialize→resolve 完整链路。
+
+    materialize 为每个 mention 立即写入临时 alias；resolve_run 必须排除
+    本轮临时 alias（只 seed 已确认的历史 canonical alias），否则同名实体
+    直接走 seed-alias 合并，绕过 v3 的隔章歧义判断。
+    两个不相邻章节（第 1/3 章）、无共同证据的「王明」→ unresolved。
+    """
+    from novelcanon.extraction.materialize import materialize_draft
+
+    chapters = [
+        ("第一章", "王明在茶楼独饮，心事重重。"),
+        ("第二章", "萧炎修炼斗之气，境界渐长。"),
+        ("第三章", "王明在刑场被斩首，围观者叹息。"),
+    ]
+    epub = tmp_path / "resolve-flow.epub"
+    make_fixture_epub(epub, chapters, title="消歧链路")
+    book_id = import_book(migrated_db, epub, book_id="book_resolve_flow").book_id
+    repo = Repository(migrated_db)
+    chs = repo.list_chapters(book_id)
+    full = repo.get_book_text(book_id)
+    texts = {c["ordinal"]: full[c["char_start"] : c["char_end"]] for c in chs}
+    run_id = RunManager(migrated_db).create(book_id, input_hash="resolve-flow")
+
+    class _Draft:
+        def __init__(self, chapter_id, ordinal, mentions):
+            self.chapter_id = chapter_id
+            self.ordinal = ordinal
+            self.mentions = mentions
+            self.claims = []
+            self.entity_tiers = {}
+
+    ch1 = next(c for c in chs if c["ordinal"] == 0)
+    ch3 = next(c for c in chs if c["ordinal"] == 2)
+    for ch, mid in ((ch1, "m_wm_1"), (ch3, "m_wm_3")):
+        materialize_draft(
+            migrated_db,
+            run_id=run_id,
+            book_id="book_resolve_flow",
+            draft=_Draft(ch["chapter_id"], ch["ordinal"], [(mid, "王明")]),
+            canonical_map={mid: mid},
+            chapter_text=texts[ch["ordinal"]],
+            repo=repo,
+        )
+
+    # P0-2：materialize 落库的 mention 必须携带章节内字符位置（稳定锚点）
+    with migrated_db.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT mention_id, chapter_id, char_start, char_end"
+                " FROM entity_mentions ORDER BY mention_id"
+            )
+        ).fetchall()
+    assert len(rows) == 2
+    assert all(r[2] is not None and r[3] is not None for r in rows), (
+        "mention 必须落库章节内字符位置（不能依赖 LLM mention_id）"
+    )
+    # 两章王明锚点由 chapter_id + 章内 span 区分（位置是章内坐标）
+    assert rows[0][1] != rows[1][1], "两章王明必须位于不同章节"
+
+    stats = ResolutionService(migrated_db).resolve_run(run_id, book_id)
+    with migrated_db.connect() as conn:
+        unres = conn.execute(
+            text(
+                "SELECT surface_name, reason FROM unresolved_mentions WHERE run_id = :r"
+            ),
+            {"r": run_id},
+        ).fetchall()
+    wm = [u for u in unres if u[0] == "王明"]
+    assert stats.unresolved >= 2, f"王明 不得被 seed-alias 合并：{unres}"
+    assert len(wm) == 2 and all(u[1] == "ambiguous-name-no-continuity" for u in wm), (
+        f"隔章孤立同名必须 unresolved：{unres}"
+    )
+    with migrated_db.connect() as conn:
+        mapped_wm = conn.execute(
+            text(
+                "SELECT count(*) FROM entity_resolutions er"
+                " JOIN entity_mentions m ON m.mention_id = er.mention_id"
+                " WHERE er.run_id = :r AND m.surface_name = '王明'"
+            ),
+            {"r": run_id},
+        ).scalar()
+    assert mapped_wm == 0, "王明 不得被映射为 canonical（v3 歧义判断必须生效）"
+
+
+def test_materialize_position_anchor_deterministic() -> None:
+    """验收 P0：materialize 的位置锚点确定性与文本绑定——同一章同一
+    surface 得到相同章节内位置（不依赖抽取次序 / mention_id）。"""
+    from novelcanon.extraction.materialize import _locate_surface
+
+    text = "萧炎在测验广场握紧拳头，萧战远远看着他。"
+    assert _locate_surface(text, "萧炎") == (0, 2)
+    assert _locate_surface(text, "萧战") == (12, 14)
+    # 标点/空白容差：surface 含标点/空白也能定位
+    assert _locate_surface("萧 炎 站 在 广场", "萧炎") == (0, 3)
+    # 未出现 → None（resolver 兜底 mention_id）
+    assert _locate_surface(text, "药老") is None
+
+
 # ── service 落库 + 投影 ────────────────────────────────────────
 
 

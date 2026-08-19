@@ -80,10 +80,17 @@ class EvidenceRecord(BaseModel):
 
 
 class EventLinkRecord(BaseModel):
-    """一等事实表 event_links（§5.3）。"""
+    """一等事实表 event_links（§5.3）。
+
+    verification_method / verification_evidence：因果边关系证据验证记录
+    （09 §4 P0——边 supported 必须有关系证据；验证通过时记录方法与
+    原文 span，可审计）。
+    """
 
     envelope: ClaimEnvelope
     payload: EventLinkPayload
+    verification_method: str | None = None
+    verification_evidence: str | None = None
 
 
 class CanonicalMemoryV4(BaseModel):

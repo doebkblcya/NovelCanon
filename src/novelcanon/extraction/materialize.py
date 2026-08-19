@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
@@ -60,6 +61,32 @@ _PAYLOAD_MODELS = {
     "foreshadowing": ForeshadowPayload,
     "term_definition": TermDefinitionPayload,
 }
+
+# 定位 mention 用的标点/空白（与证据匹配同一容差口径）
+_MENTION_PUNCT = re.compile(r"[\s,，。！？；：、．.·…—–-”“\"'‘’()（）\[\]【】<>《》]+")
+
+
+def _locate_surface(chapter_text: str, surface: str) -> tuple[int, int] | None:
+    """章内定位 surface 的**首次出现**（标点/空白容差），返回原文半开区间。
+
+    验收 P0：canonical 稳定锚点必须来自章节内字符位置（book_id +
+    chapter_id + span），不能依赖 LLM 生成的 mention_id（重新抽取时本地
+    ID 变化会导致 canonical 漂移）。同一 surface 取首次出现：确定性、
+    与抽取次序无关（同章同 surface 合并为同一 canonical，v3 规则）。
+    """
+    norm_text = _MENTION_PUNCT.sub("", chapter_text)
+    norm_surface = _MENTION_PUNCT.sub("", surface or "").strip()
+    if not norm_surface:
+        return None
+    orig_idx: list[int] = []
+    for i, ch in enumerate(chapter_text):
+        if _MENTION_PUNCT.match(ch):
+            continue
+        orig_idx.append(i)
+    pos = norm_text.find(norm_surface)
+    if pos < 0:
+        return None
+    return orig_idx[pos], orig_idx[pos + len(norm_surface) - 1] + 1
 
 
 @dataclass
@@ -192,8 +219,17 @@ def materialize_draft(
             )
             stats.entities += 1
         # mention_id 必须来自输入（稳定幂等主键）；随机 ID 会破坏幂等
+        # P0：落库携带章节内字符位置（稳定 canonical 锚点，不依赖
+        # LLM mention_id）；surface 未定位到时留空（resolver 兜底）。
+        mention_span = _locate_surface(chapter_text, surface)
         repo.write_mention(
-            mention_id, draft.chapter_id, surface, run_id, canonical_id=canonical_id
+            mention_id,
+            draft.chapter_id,
+            surface,
+            run_id,
+            canonical_id=canonical_id,
+            char_start=mention_span[0] if mention_span else None,
+            char_end=mention_span[1] if mention_span else None,
         )
         stats.mentions += 1
         res = repo.write_alias(

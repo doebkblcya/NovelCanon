@@ -395,6 +395,35 @@ def test_generation_client_concurrent_retry_counts_isolated() -> None:
     asyncio.run(main())
 
 
+def test_generation_client_retry_exhaustion_carries_meta() -> None:
+    """验收 P1：重试耗尽时（Usage 尚未构造）内部尝试次数与失败消耗的
+    prompt token 必须附加到最终异常，供 runner 入账——「所有模型调用
+    均可审计」含失败调用。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "down"})
+
+    async def main() -> None:
+        client = GenerationClient(
+            _profile(max_retries=3),
+            api_key="secret-key",
+            tokenizer=TOK,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        with pytest.raises(httpx.HTTPStatusError) as excinfo:
+            await client.complete("prompt-for-audit")
+        exc = excinfo.value
+        # 3 次尝试全部失败 → provider_retry_count = 3（失败尝试数）
+        assert getattr(exc, "provider_retry_count", 0) == 3, (
+            f"重试耗尽的失败尝试数必须可审计：{getattr(exc, 'provider_retry_count', None)}"
+        )
+        # 失败尝试消耗的 prompt token 估计必须 > 0
+        assert getattr(exc, "provider_input_tokens", 0) > 0, (
+            "失败调用消耗的 token 必须进入异常元数据"
+        )
+
+    asyncio.run(main())
+
+
 def test_fake_generation_client_returns_mapping() -> None:
     fake = FakeGenerationClient({"阿远": '{"ok": 1}'})
     result = asyncio.run(fake.complete("章内有阿远二字"))

@@ -67,6 +67,34 @@ def response_hash(raw_text: str) -> str:
     return stable_config_hash({"response": raw_text})
 
 
+def attach_retry_meta(
+    exc: BaseException,
+    failures: int,
+    prompt: str,
+    tokenizer: Tokenizer | None,
+) -> None:
+    """把 provider 内部重试的累计计量附加到最终异常（P1：失败也入账）。
+
+    - provider_retry_count：本次调用失败的尝试次数（含最终失败）；
+    - provider_input_tokens：失败尝试消耗的 prompt token 估计
+      （tokenizer 计量 × 失败次数；限流/服务端错误通常不返回 usage）。
+
+    runner 在异常路径读取并并入账本；附加失败（异常类型不可变）不阻塞
+    原异常抛出。
+    """
+    try:
+        exc.provider_retry_count = int(failures)  # type: ignore[attr-defined]
+        est = 0
+        if failures and tokenizer is not None:
+            try:
+                est = int(tokenizer.count(prompt)) * failures
+            except Exception:  # noqa: BLE001 —— 计量失败不影响审计主数据
+                est = 0
+        exc.provider_input_tokens = est  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 —— 附加失败不吞原异常
+        pass
+
+
 class GenerationClient:
     """OpenAI 兼容 provider 适配器（httpx + tenacity）。"""
 
@@ -114,21 +142,27 @@ class GenerationClient:
             retry=retry_if_exception(_is_retryable),
         )
         failures = 0  # 本次调用内失败的尝试数（成功前的重试次数）
-        async for attempt_state in retrying:
-            with attempt_state:
-                try:
-                    response = await self._client.post(
-                        f"{profile.base_url.rstrip('/')}/chat/completions",
-                        headers=headers,
-                        json=body,
-                    )
-                    response.raise_for_status()
-                    break
-                except Exception:  # noqa: BLE001
-                    failures += 1
-                    raise
-        else:  # pragma: no cover - tenacity reraise 后不可达
-            raise RuntimeError("unreachable: retrying loop exhausted")
+        try:
+            async for attempt_state in retrying:
+                with attempt_state:
+                    try:
+                        response = await self._client.post(
+                            f"{profile.base_url.rstrip('/')}/chat/completions",
+                            headers=headers,
+                            json=body,
+                        )
+                        response.raise_for_status()
+                        break
+                    except Exception:  # noqa: BLE001
+                        failures += 1
+                        raise
+        except BaseException as exc:  # noqa: BLE001 —— 重试耗尽/传输错误
+            # P1 修复：重试耗尽时（所有尝试都失败，Usage 尚未构造）内部
+            # 尝试次数与失败调用消耗的 prompt token 也要可审计——把累计
+            # 数据附加到最终异常，runner 记账时读取并入账本。
+            attach_retry_meta(exc, failures, prompt, self._tokenizer)
+            raise
+        # 成功路径：break 退出循环，正常继续解析 usage
 
         data = response.json()
         content = ""
