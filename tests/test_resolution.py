@@ -600,6 +600,89 @@ def test_materialize_position_anchor_deterministic() -> None:
     assert _locate_surface(text, "药老") is None
 
 
+def test_same_service_two_books_seed_not_residue(
+    tmp_path, migrated_db: Engine
+) -> None:
+    """验收 P0：复用同一 ResolutionService 处理书 A 再处理书 B，书 B 的
+    同名实体不得命中书 A 的 canonical——seed 必须整份替换而非增量追加
+    （书 A 已激活的 alias 不得跨书残留）。"""
+    from novelcanon.extraction.materialize import materialize_draft
+
+    def import_one(name, book_id, chapter_text):
+        epub = tmp_path / f"{name}.epub"
+        make_fixture_epub(epub, [("第一章", chapter_text)], title=name)
+        return import_book(migrated_db, epub, book_id=book_id).book_id
+
+    book_a = import_one("书A", "book_two_a", "萧炎在测验广场握拳，众人围观。")
+    book_b = import_one("书B", "book_two_b", "萧炎在山门练剑，剑气纵横。")
+
+    class _Draft:
+        def __init__(self, chapter_id, ordinal, mentions):
+            self.chapter_id = chapter_id
+            self.ordinal = ordinal
+            self.mentions = mentions
+            self.claims = []
+            self.entity_tiers = {}
+
+    def materialize_one(book_id, run_id, mid, surface):
+        repo = Repository(migrated_db)
+        ch = repo.list_chapters(book_id)[0]
+        full = repo.get_book_text(book_id)
+        text = full[ch["char_start"] : ch["char_end"]]
+        materialize_draft(
+            migrated_db,
+            run_id=run_id,
+            book_id=book_id,
+            draft=_Draft(ch["chapter_id"], ch["ordinal"], [(mid, surface)]),
+            canonical_map={mid: mid},
+            chapter_text=text,
+            repo=repo,
+        )
+
+    service = ResolutionService(migrated_db)  # 同一个 service 实例
+
+    # 书 A：materialize 萧炎 → resolve → 激活（成为可信 alias 源）
+    run_a = RunManager(migrated_db).create(book_a, input_hash="bookA-run")
+    materialize_one(book_a, run_a, "m_xa", "萧炎")
+    service.resolve_run(run_a, book_a)
+    from novelcanon.pipeline.validation import Activator
+    from novelcanon.schemas.types import RunStatus
+
+    mgr = RunManager(migrated_db)
+    for f, t in (
+        (RunStatus.CREATED, RunStatus.RUNNING),
+        (RunStatus.RUNNING, RunStatus.VALIDATING),
+        (RunStatus.VALIDATING, RunStatus.READY_TO_ACTIVATE),
+    ):
+        assert mgr.transition(run_a, f, t)
+    assert Activator(migrated_db).activate(run_a) is None
+
+    # 书 B：materialize 萧炎 → 用同一个 service resolve（书 B 无历史 alias）
+    run_b = RunManager(migrated_db).create(book_b, input_hash="bookB-run")
+    materialize_one(book_b, run_b, "m_xb", "萧炎")
+    service.resolve_run(run_b, book_b)
+
+    with migrated_db.connect() as conn:
+        ca = conn.execute(
+            text(
+                "SELECT canonical_id FROM entity_resolutions WHERE run_id = :r"
+            ),
+            {"r": run_a},
+        ).fetchone()[0]
+        cb = conn.execute(
+            text(
+                "SELECT canonical_id, reason FROM entity_resolutions WHERE run_id = :r"
+            ),
+            {"r": run_b},
+        ).fetchone()
+    assert ca != cb[0], (
+        f"书 B 的萧炎不得命中书 A 的 canonical（seed 跨书残留）：{ca} == {cb[0]}"
+    )
+    assert cb[1] == "exact-surface-match", (
+        f"书 B 的萧炎必须走自身消歧而非 seed-alias：{cb}"
+    )
+
+
 # ── service 落库 + 投影 ────────────────────────────────────────
 
 

@@ -466,28 +466,12 @@ class Repository:
                 text("SELECT 1 FROM event_links WHERE claim_version_id = :v"), {"v": version_id}
             ).fetchone()
             if existing:
-                # 幂等命中：复用版本，仍把该 run 加入成员关系（09 §4）。
-                # 边状态是「当前验证聚合」（与 claim_status 同语义，非
-                # append-only）：本轮重新验证通过 → 提升为 supported 并
-                # 记录验证信息；验证不通过（更严格规则）→ 降级为
-                # unverified，避免历史宽松验证长期残留（P0 可审计）。
-                conn.execute(
-                    text(
-                        "UPDATE event_links SET claim_status = :status,"
-                        " verification_method = :vm, verification_evidence = :ve"
-                        " WHERE claim_version_id = :v"
-                    ),
-                    {
-                        "status": (
-                            "supported" if verification_method is not None else "unverified"
-                        ),
-                        "vm": verification_method,
-                        "ve": verification_evidence,
-                        "v": version_id,
-                    },
-                )
-                # world_valid 幂等自愈：存量/旧写入缺省时补齐（P1：图谱边
-                # 必须按 world_valid 过滤，chapter_proxy = 披露章节）
+                # 幂等命中：复用版本，仍把该 run 加入成员关系（09 §4）；
+                # 全局行的 claim_status/verification **不再被改写**（激活前
+                # 不改变 active 查询结果——验证结果按 run 作用域记录）；
+                # world_valid 缺省时幂等自愈（P1：图谱边必须按 world_valid
+                # 过滤）。
+                self._record_verification(conn, record, version_id)
                 conn.execute(
                     text(
                         "UPDATE event_links SET world_valid_kind = :wk,"
@@ -547,10 +531,45 @@ class Repository:
                     "wc": wv_conf,
                 },
             )
+            self._record_verification(conn, record, version_id)
             self._record_event_link_observation(
                 conn, version_id, record.envelope.created_by_run_id
             )
             return WriteResult(claim_version_id=version_id, is_new=True)
+
+    def _record_verification(
+        self, conn: Connection, record: EventLinkRecord, version_id: str
+    ) -> None:
+        """本轮验证结论按 run 作用域记录（P0：激活隔离）。
+
+        每个 run 对每条边有独立验证行；查询经 active run 的 observation
+        关联该 run 的验证行——未激活 run 的验证结果不得改写 active 查询。
+        claim_status = 本轮验证结论（有 verification_method → supported，
+        否则 unverified）。
+        """
+        conn.execute(
+            text(
+                "INSERT OR REPLACE INTO event_link_verifications"
+                " (claim_version_id, extraction_run_id, claim_status,"
+                "  verification_method, verification_evidence, verified_at)"
+                " VALUES (:v, :run, :st, :vm, :ve, :ts)"
+            ),
+            {
+                "v": version_id,
+                "run": record.envelope.created_by_run_id,
+                # 有验证方法 → 本轮验证通过；无方法时以 envelope 状态为准
+                # （手工/外部写入 supported 的边保持 supported）。
+                "st": (
+                    "supported"
+                    if record.verification_method is not None
+                    or record.envelope.claim_status.value == "supported"
+                    else "unverified"
+                ),
+                "vm": record.verification_method,
+                "ve": record.verification_evidence,
+                "ts": now_iso(),
+            },
+        )
 
     def _record_event_link_observation(
         self, conn: Connection, version_id: str, run_id: str

@@ -432,6 +432,41 @@ def test_ledger_sums_provider_internal_and_outer_retries(
     asyncio.run(main())
 
 
+def test_ledger_records_structured_failure_usage(migrated_db: Engine) -> None:
+    """验收 P0：结构化失败（Map 解析/Schema 修复耗尽）返回 failed=True 时，
+    已发生模型调用的 usage 必须进入 Token 账本（失败但成功收到响应）。"""
+    _ensure_book(migrated_db)
+    tasks = [_task("ch1")]
+
+    async def process(task: ChapterTask) -> ProcessResult:
+        # 模拟 Map 段解析失败：内部已发生 2 次调用（含 1 次结构修复）
+        return ProcessResult(
+            payload={},
+            failed=True,
+            error="Map 响应解析失败",
+            usage=Usage(
+                input_tokens=50,
+                output_tokens=10,
+                retry_count=1,
+                provider="fake",
+                model="fake-model",
+                profile_id="fp",
+            ),
+        )
+
+    async def main() -> None:
+        run_id, summary, issues = await _full_run(
+            migrated_db, tasks, process, timeout_seconds=1.0
+        )
+        assert issues is not None and summary.failed == 1
+        led = TokenLedger(migrated_db).summary(run_id)
+        assert led["input_tokens"] == 50, f"结构化失败的调用必须入账：{led}"
+        assert led["output_tokens"] == 10
+        assert led["retry_count"] == 1
+
+    asyncio.run(main())
+
+
 # ── Token 账本汇总 ─────────────────────────────────────────────
 
 

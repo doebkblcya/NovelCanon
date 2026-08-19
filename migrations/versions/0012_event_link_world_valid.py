@@ -9,13 +9,18 @@ world_at 参数。本迁移：
 
 - event_links 补 world_valid_kind / world_valid_from / world_valid_to /
   world_valid_confidence（与 claims 同构）；
+- **数据约束（验收 P1）**：kind 枚举（story_time/chapter_proxy/unknown）、
+  confidence 0–1 范围、组合约束（kind 非 unknown 时必须有 from），
+  由 SQLite CHECK 兜底（新增事实字段的约束不弱于 claims 表）；
 - 回填：存量边按 chapter_proxy 语义（world_valid_from = observed_ordinal，
   事件在披露章节发生）补齐，立即可查询。
+
+注：SQLite 的 ALTER TABLE ADD COLUMN 支持内联 CHECK（对新写入强制），
+跨列组合约束挂在 from 列上引用已存在的 kind 列。
 """
 
 from __future__ import annotations
 
-import sqlalchemy as sa
 from alembic import op
 
 revision = "0012_event_link_world_valid"
@@ -25,21 +30,24 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "event_links",
-        sa.Column("world_valid_kind", sa.Text, nullable=True),
+    op.execute(
+        "ALTER TABLE event_links ADD COLUMN world_valid_kind TEXT"
+        " CHECK (world_valid_kind IS NULL OR world_valid_kind IN"
+        " ('story_time','chapter_proxy','unknown'))"
     )
-    op.add_column(
-        "event_links",
-        sa.Column("world_valid_from", sa.Integer, nullable=True),
+    # 组合约束：kind 非 NULL 且非 unknown 时必须给出 world_valid_from
+    op.execute(
+        "ALTER TABLE event_links ADD COLUMN world_valid_from INTEGER"
+        " CHECK (world_valid_from IS NOT NULL OR world_valid_kind IS NULL"
+        " OR world_valid_kind = 'unknown')"
     )
-    op.add_column(
-        "event_links",
-        sa.Column("world_valid_to", sa.Integer, nullable=True),
+    op.execute(
+        "ALTER TABLE event_links ADD COLUMN world_valid_to INTEGER"
     )
-    op.add_column(
-        "event_links",
-        sa.Column("world_valid_confidence", sa.REAL, nullable=True),
+    op.execute(
+        "ALTER TABLE event_links ADD COLUMN world_valid_confidence REAL"
+        " CHECK (world_valid_confidence IS NULL OR"
+        " (world_valid_confidence >= 0 AND world_valid_confidence <= 1))"
     )
     # 回填：存量边按 chapter_proxy（world_valid_from = 披露章节）补齐
     op.execute(

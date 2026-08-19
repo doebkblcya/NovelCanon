@@ -73,10 +73,11 @@ Map 只读取当前章以及明确配置的有限上下文。其职责是抽取�
 - Schema 错误最多进行有限次数的结构修复请求。
 - 输入无效和确定性契约错误不重试。
 - 每次重试单独计量。
-- **失败调用也可审计（验收 P1）**：provider 内部重试耗尽时（Usage 尚未
+- **失败调用也可审计（验收 P0/P1）**：provider 内部重试耗尽时（Usage 尚未
   构造），失败尝试数与消耗的 prompt token 估计附加到最终异常
   （provider_retry_count / provider_input_tokens），runner 在异常路径
-  读取并入账本——Token 账本覆盖成功、失败和重试调用。
+  读取并入账本；**结构化失败（Map 解析/Schema 修复耗尽）返回 failed 时，
+  已发生调用的 usage 同样入账**——Token 账本覆盖成功、失败和重试调用。
 
 ### 5. 质量迭代
 

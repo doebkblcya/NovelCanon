@@ -203,8 +203,29 @@ class PipelineRunner:
                     # process_fn 返回 failed = 结构化错误已定论（内部已处理
                     # 传输重试/结构修复），直接失败，不在此处重试；payload 保留
                     # 供 staging 记录 invalid 详情。
+                    # P0：失败但已发生模型调用（Map 解析/Schema 修复耗尽）——
+                    # result.usage + retry_usage 必须入账，不得漏记。
+                    self._ledger.record(
+                        LedgerEntry(
+                            run_id=self._run_id,
+                            book_id=self._book_id,
+                            chapter_id=task.chapter_id,
+                            stage=stage,
+                            usage=result.usage + retry_usage,
+                        )
+                    )
                     return result
                 if schema_check is not None and not schema_check(result.payload):
+                    # 外部 schema_check 失败：原始 result.usage 不得丢弃
+                    self._ledger.record(
+                        LedgerEntry(
+                            run_id=self._run_id,
+                            book_id=self._book_id,
+                            chapter_id=task.chapter_id,
+                            stage=stage,
+                            usage=result.usage + retry_usage,
+                        )
+                    )
                     return ProcessResult(failed=True, error="schema 校验失败")
                 # P1 修复：不再用 replace 覆盖 result.usage 的 provider 内部
                 # retry_count；此前外层失败尝试的累计 retry_usage（runner

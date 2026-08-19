@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import sqlalchemy
 from sqlalchemy import Engine, text
 
 from novelcanon.events import EventLinkService
@@ -961,3 +962,104 @@ def test_event_link_world_valid_round_trip(tmp_path, migrated_db: Engine) -> Non
     assert q.causal_paths(version_ids[0], world_at=0, knowledge_cutoff=10) == [], (
         "world_at 与 knowledge_cutoff 独立过滤"
     )
+
+
+def test_unactivated_run_does_not_change_active_causal_view(
+    tmp_path, migrated_db: Engine
+) -> None:
+    """验收 P0：未激活 run 重新链接并验证失败时，不得改写旧 active run
+    同一边的状态——激活前 active 查询结果不变（验证结果按 run 作用域记录）。"""
+    from novelcanon.events.verifier import LinkVerifier
+
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    # run1：激活并链接（拜师→突破 关系证据验证通过 → supported）
+    run1, version_ids = _seed_events(migrated_db, book_id, ids, texts)
+    _link_events(migrated_db, book_id, run1)
+    q = QueryService(migrated_db, book_id)
+    before = {p["event"]["claim_version_id"] for p in q.causal_paths(version_ids[0])}
+    assert before, "run1 激活后因果链可见"
+
+    # run2：同一书新 run（running，不激活），用 NullVerifier 链接——
+    # 相同事件 payload → 相同边版本（共享全局行），但验证全部失败
+    run2, version_ids2 = _seed_events(migrated_db, book_id, ids, texts)
+    assert version_ids2 == version_ids, "相同 payload → 相同版本 id（共享全局行）"
+
+    class _NullVerifier(LinkVerifier):
+        def verify(self, *args, **kwargs):  # noqa: ARG002
+            return None
+
+    EventLinkService(migrated_db, verifier=_NullVerifier()).link_run(run2, book_id)
+
+    # active 查询结果不得因 run2 的验证而改变
+    after = {p["event"]["claim_version_id"] for p in q.causal_paths(version_ids[0])}
+    assert after == before, "未激活 run 的验证不得改写 active 查询结果"
+    # 全局行状态也未被改写（仍 supported）
+    with migrated_db.connect() as conn:
+        st = conn.execute(
+            text(
+                "SELECT claim_status FROM event_links"
+                " WHERE source_event_id = :s AND target_event_id = :t"
+            ),
+            {"s": version_ids[0], "t": version_ids[1]},
+        ).fetchone()
+    assert st is not None and st[0] == "supported", (
+        f"全局行状态不得被未激活 run 改写：{st}"
+    )
+    # run2 自己的验证行是 unverified（run 作用域隔离）
+    with migrated_db.connect() as conn:
+        v2 = conn.execute(
+            text(
+                "SELECT claim_status FROM event_link_verifications"
+                " WHERE claim_version_id = (SELECT claim_version_id FROM event_links"
+                "   WHERE source_event_id = :s AND target_event_id = :t)"
+                " AND extraction_run_id = :r"
+            ),
+            {"s": version_ids[0], "t": version_ids[1], "r": run2},
+        ).fetchone()
+    assert v2 is not None and v2[0] == "unverified", (
+        f"run2 的验证行应为 unverified：{v2}"
+    )
+
+
+def test_event_link_world_valid_column_constraints(
+    tmp_path, migrated_db: Engine
+) -> None:
+    """验收 P1：event_links.world_valid 列由 SQLite CHECK 兜底——非法 kind、
+    越界 confidence、kind 非 unknown 且缺 from 均被拒绝（新增事实字段
+    的约束不弱于 claims 表）。"""
+    import pytest
+
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
+
+    def raw_insert(wv_kind, wv_from, wv_conf):
+        with migrated_db.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO event_links (claim_version_id, fact_id,"
+                    " source_event_id, target_event_id, relation_type, confidence,"
+                    " claim_status, observed_chapter_id, observed_ordinal,"
+                    " world_valid_kind, world_valid_from, world_valid_confidence)"
+                    " VALUES (:v, :f, :s, :t, 'causes', 0.8, 'unverified', :ch, 1,"
+                    " :wk, :wf, :wc)"
+                ),
+                {
+                    "v": f"ver_wv_{wv_kind or 'none'}_{wv_conf}",
+                    "f": f"fact_wv_{wv_kind or 'none'}",
+                    "s": version_ids[0],
+                    "t": version_ids[1],
+                    "ch": ids[1],
+                    "wk": wv_kind,
+                    "wf": wv_from,
+                    "wc": wv_conf,
+                },
+            )
+
+    # 合法：chapter_proxy + from + confidence 在界内
+    raw_insert("chapter_proxy", 1, 0.8)
+    with pytest.raises(sqlalchemy.exc.IntegrityError):  # 非法 kind
+        raw_insert("bogus", 1, 0.8)
+    with pytest.raises(sqlalchemy.exc.IntegrityError):  # confidence 越界
+        raw_insert("chapter_proxy", 1, 1.5)
+    with pytest.raises(sqlalchemy.exc.IntegrityError):  # kind 非 unknown 且缺 from
+        raw_insert("chapter_proxy", None, 0.8)

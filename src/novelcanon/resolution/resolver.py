@@ -120,10 +120,16 @@ class EntityResolver:
         """预置已知 alias（surface → canonical），保证跨 run 稳定。
 
         来自库里已有 alias claim（阶段 07 materialize 已写入）。
+
+        P0：**整份替换**而非增量追加——复用同一 Resolver 处理书 A 后再
+        处理书 B 时，书 B 不得命中书 A 的历史 alias（跨书合并）；同书已
+        失效 alias 也不得残留。每次 resolve_run 前调用方传入该书当前
+        的可信 alias 全集，_seeded 即该书唯一真相。
         """
-        for surface, canonical in known_aliases.items():
-            norm = normalize_surface(surface)
-            self._seeded[norm] = canonical
+        self._seeded = {
+            normalize_surface(surface): canonical
+            for surface, canonical in known_aliases.items()
+        }
 
     def resolve(
         self,
