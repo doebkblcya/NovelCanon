@@ -222,18 +222,23 @@ class PipelineRunner:
                 for kind, task, result in batch:
                     if kind == "reuse":
                         assert isinstance(result, dict)
+                        # 原始 checkpoint 的 source_run_id 为空，真正来源是写入该
+                        # checkpoint 行的 run（result["run_id"]）；链式复用则沿用
+                        # 已记录的 source_run_id（来源链等价，成员关系相同）。
+                        source_run_id = result.get("source_run_id") or result["run_id"]
                         self._checkpoint.save_with(
                             conn,
                             self._run_id,
                             task.checkpoint_fields,
                             result["payload"],
-                            source_run_id=result.get("source_run_id"),
+                            source_run_id=source_run_id,
                         )
-                        # 复用章节：把该章产物关联到当前 run（成员关系，
-                        # 使激活后 active 视图仍能看到复用 claim/alias，P0）
+                        # 复用章节：仅把来源 run 明确拥有的产物关联到当前 run
+                        # （成员关系按 source_run 复制，失败 run 的 staging 不泄漏）
                         self._repo.associate_chapter_products(
                             conn,
                             self._run_id,
+                            source_run_id,
                             str(task.checkpoint_fields["chapter_id"]),
                         )
                     elif isinstance(result, ProcessResult) and result.failed:

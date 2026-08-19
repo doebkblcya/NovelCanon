@@ -166,6 +166,10 @@ def materialize_draft(
     （证据 span hash 校验用）。
     """
     repo = repo or Repository(engine)
+    # 写入边界校验（P1）：run / 章节必须属于该书，防止把书 B 的章节挂到
+    # 书 A 的 active run 上（查询层按 run.book_id 过滤会把错挂数据投影成 A）。
+    repo.ensure_run_belongs_to_book(run_id, book_id)
+    repo.ensure_chapter_belongs_to_book(draft.chapter_id, book_id)
     stats = MaterializeStats()
 
     # ── entities / mentions / aliases ──────────────────────────
@@ -204,6 +208,13 @@ def materialize_draft(
     # ── claims + evidence ──────────────────────────────────────
     for claim in draft.claims:
         ctype = str(claim.claim_type)
+        # Map 契约：claim 只能描述本章（observed_chapter_id == draft.chapter_id），
+        # 证据已要求归属 observed_chapter_id，因此 claim/evidence 都落在本书内。
+        if claim.observed_chapter_id != draft.chapter_id:
+            raise ValueError(
+                f"claim.observed_chapter_id {claim.observed_chapter_id} 与本章"
+                f" {draft.chapter_id} 不一致"
+            )
         fact_id = _fact_id_for(ctype, claim.fact_fields)
         payload_dict = dict(claim.payload)
         if ctype == "state" and "subject_entity_id" not in payload_dict:

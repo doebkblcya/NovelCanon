@@ -58,15 +58,15 @@ def _build_golden_book(engine: Engine, epub: Path) -> tuple[str, dict[int, str],
     return result.book_id, chapter_ids, chapter_texts
 
 
-async def _run_golden_pipeline(
-    engine: Engine,
-    book_id: str,
+def _make_chapter_tasks(
     chapter_ids: dict[int, str],
     chapter_texts: dict[int, str],
-) -> tuple[str, object]:
-    """固定 Draft 跑一遍流水线并激活；返回 (run_id, summary)。"""
-    drafts = {d.ordinal: d for d in make_golden_drafts(chapter_ids, chapter_texts)}
-    tasks = [
+    book_id: str,
+    *,
+    key_prefix: str = "",
+) -> list[ChapterTask]:
+    """构造章节任务；key_prefix 改变 content_hash 使 checkpoint 键失效（重新抽取）。"""
+    return [
         ChapterTask(
             chapter_id=cid,
             ordinal=ordinal,
@@ -74,8 +74,8 @@ async def _run_golden_pipeline(
             checkpoint_fields={
                 "book_id": book_id,
                 "chapter_id": cid,
-                "content_hash": hashlib.sha256(chapter_texts[ordinal].encode())
-                .hexdigest(),
+                "content_hash": key_prefix
+                + hashlib.sha256(chapter_texts[ordinal].encode()).hexdigest(),
                 "pipeline_version": "golden-p1",
                 "prompt_version": "golden-v1",
                 "compression_version": "",
@@ -84,6 +84,17 @@ async def _run_golden_pipeline(
         )
         for ordinal, cid in chapter_ids.items()
     ]
+
+
+async def _run_golden_pipeline(
+    engine: Engine,
+    book_id: str,
+    chapter_ids: dict[int, str],
+    chapter_texts: dict[int, str],
+) -> tuple[str, object]:
+    """固定 Draft 跑一遍流水线并激活；返回 (run_id, summary)。"""
+    drafts = {d.ordinal: d for d in make_golden_drafts(chapter_ids, chapter_texts)}
+    tasks = _make_chapter_tasks(chapter_ids, chapter_texts, book_id)
     repo = Repository(engine)
 
     async def process(task: ChapterTask) -> ProcessResult:
@@ -396,25 +407,7 @@ def test_failed_run_keeps_active_queries_unchanged(tmp_path, migrated_db: Engine
         concurrency=1,
         retry_policy=RetryPolicy(max_attempts=2, base_delay=0.01),
     )
-    tasks = [
-        ChapterTask(
-            chapter_id=cid,
-            ordinal=ordinal,
-            content=chapter_texts[ordinal],
-            checkpoint_fields={
-                "book_id": book_id,
-                "chapter_id": cid,
-                # content_hash 加前缀使 run2 不复用 run1 的 checkpoint（重新抽取）
-                "content_hash": "fail-run-"
-                + hashlib.sha256(chapter_texts[ordinal].encode()).hexdigest(),
-                "pipeline_version": "golden-p1",
-                "prompt_version": "golden-v1",
-                "compression_version": "",
-                "schema_version": "v1",
-            },
-        )
-        for ordinal, cid in chapter_ids.items()
-    ]
+    tasks = _make_chapter_tasks(chapter_ids, chapter_texts, book_id, key_prefix="fail-run-")
     summary = asyncio.run(runner.run(tasks, process))
     issues = finish_run(migrated_db, run2, total_chapters=len(tasks), summary=summary)
     assert issues is not None, "run2 有失败章节，激活必须失败"
@@ -495,6 +488,141 @@ def test_materialize_rejects_bad_evidence(tmp_path, migrated_db: Engine) -> None
             run_id=run_id,
             book_id=book_id,
             draft=bad_owner,
+            canonical_map=MENTION_MAP,
+            chapter_text=chapter_texts[0],
+            repo=repo,
+        )
+
+
+def test_reuse_does_not_leak_failed_run_products(tmp_path, migrated_db: Engine) -> None:
+    """验收 P0：复用正常 checkpoint 不得带入同章失败 run 的 staging 产物。
+
+    场景：正常 run1 激活 → 失败 run2 在第 1 章写入 failed_only=leak 后失败 →
+    run3 复用 run1 的 checkpoint 并激活 → failed_only 必须仍不可见。
+    """
+    epub = tmp_path / "golden.epub"
+    make_fixture_epub(epub, GOLDEN_CHAPTERS)
+    book_id, chapter_ids, chapter_texts = _build_golden_book(migrated_db, epub)
+    repo = Repository(migrated_db)
+    mgr = RunManager(migrated_db)
+
+    # run1 正常激活
+    run1, _ = asyncio.run(_run_golden_pipeline(migrated_db, book_id, chapter_ids, chapter_texts))
+    assert mgr.get(run1)["status"] == RunStatus.ACTIVE.value
+
+    # run2（failed）：ch0 用新键写入 failed_only=leak，ch1 故意失败
+    drafts = {d.ordinal: d for d in make_golden_drafts(chapter_ids, chapter_texts)}
+    d0 = drafts[0]
+    leak_claim = GoldenClaim(
+        claim_type="state",
+        payload={"field": "failed_only", "value": "leak", "raw_value": "leak"},
+        fact_fields={"subject_entity_id": "ent_xiaoshi", "field": "failed_only"},
+        observed_chapter_id=d0.chapter_id,
+        observed_ordinal=0,
+        evidence=GoldenEvidence(d0.chapter_id, 0, 1, chapter_texts[0][0:1]),
+    )
+    d0_leak = replace(d0, claims=d0.claims + [leak_claim])
+
+    async def process_fail(task: ChapterTask) -> ProcessResult:
+        if task.ordinal == 1:
+            raise NonRetryableError("故意失败：该章不可重试")
+        from novelcanon.extraction import materialize_draft
+
+        materialize_draft(
+            migrated_db,
+            run_id=_CURRENT_RUN[0],
+            book_id=book_id,
+            draft=d0_leak if task.ordinal == 0 else drafts[task.ordinal],
+            canonical_map=MENTION_MAP,
+            chapter_text=task.content,
+            repo=repo,
+        )
+        return ProcessResult(
+            payload={"chapter_id": task.chapter_id},
+            usage=Usage(input_tokens=100, output_tokens=20, provider="golden", model="fixed"),
+        )
+
+    _CURRENT_RUN[0] = None
+    run2 = mgr.create(book_id, input_hash="leak-run")
+    _CURRENT_RUN[0] = run2
+    assert mgr.transition(run2, RunStatus.CREATED, RunStatus.RUNNING)
+    tasks_fail = _make_chapter_tasks(chapter_ids, chapter_texts, book_id, key_prefix="fail-run-")
+    summary = asyncio.run(
+        PipelineRunner(
+            migrated_db,
+            run2,
+            book_id,
+            concurrency=1,
+            retry_policy=RetryPolicy(max_attempts=2, base_delay=0.01),
+        ).run(tasks_fail, process_fail)
+    )
+    issues = finish_run(migrated_db, run2, total_chapters=len(tasks_fail), summary=summary)
+    assert issues is not None
+    assert mgr.get(run2)["status"] == RunStatus.FAILED.value
+
+    q = QueryService(migrated_db, book_id)
+    assert q.current_state("ent_xiaoshi", "failed_only") is None, "run2 未激活，staging 不可见"
+
+    # run3：用 run1 的原始键 → 全部命中 run1 checkpoint → 激活
+    run3, _ = await_pipeline(migrated_db, book_id, chapter_ids, chapter_texts)
+    assert mgr.get(run3)["status"] == RunStatus.ACTIVE.value
+    assert mgr.get(run1)["status"] == RunStatus.SUPERSEDED.value
+    assert mgr.get(run2)["status"] == RunStatus.FAILED.value
+
+    # 验收核心：run3 激活后 failed_only 仍不可见（未随复用泄漏）
+    assert q.current_state("ent_xiaoshi", "failed_only") is None, (
+        "失败 run 的 claim 不得随 checkpoint 复用进入 active view"
+    )
+    # 正常数据完整
+    assert q.current_state("ent_xiaoshi", "cultivation_realm")["value"] == "元婴"
+    assert q.display_name("ent_xiaoshi") == "林风"
+    assert {"学徒", "未婚夫妻", "师徒", "少主"} <= {
+        r["relation_type"] for r in q.one_hop_relations("ent_xiaoshi")
+    }
+    # mention 审计：run_id 保持首次创建者（run1），成员关系经 observations 复制
+    with migrated_db.connect() as conn:
+        runs = conn.execute(
+            text("SELECT DISTINCT run_id FROM entity_mentions WHERE chapter_id = :c"),
+            {"c": chapter_ids[0]},
+        ).fetchall()
+    assert [r[0] for r in runs] == [run1], "复用不得改写 mention.run_id（首次创建审计）"
+
+
+def test_materialize_rejects_wrong_book(tmp_path, migrated_db: Engine) -> None:
+    """验收 P1：materialize 的 book_id 参与写入边界校验，错挂章节/run 被拒绝。"""
+    epub = tmp_path / "golden.epub"
+    make_fixture_epub(epub, GOLDEN_CHAPTERS)
+    book_id, chapter_ids, chapter_texts = _build_golden_book(migrated_db, epub)
+    drafts = {d.ordinal: d for d in make_golden_drafts(chapter_ids, chapter_texts)}
+    d0 = drafts[0]
+
+    from novelcanon.extraction import materialize_draft
+
+    repo = Repository(migrated_db)
+    # 书 B：只有 book + chapter，无 run
+    repo.create_book("book_b", "另一本书", source_format="epub")
+    repo.create_chapter("ch_b", "book_b", 1, title="B第一章", char_start=0, char_end=10)
+    run_a = RunManager(migrated_db).create(book_id, input_hash="x")
+    run_b = RunManager(migrated_db).create("book_b", input_hash="x")
+
+    # run 属于书 A，却声明 book_id=书 B → 拒绝
+    with pytest.raises(ValueError, match="属于 book"):
+        materialize_draft(
+            migrated_db,
+            run_id=run_a,
+            book_id="book_b",
+            draft=d0,
+            canonical_map=MENTION_MAP,
+            chapter_text=chapter_texts[0],
+            repo=repo,
+        )
+    # draft.chapter_id 属于书 A，run 属于书 B → 拒绝
+    with pytest.raises(ValueError, match="属于 book"):
+        materialize_draft(
+            migrated_db,
+            run_id=run_b,
+            book_id="book_b",
+            draft=d0,
             canonical_map=MENTION_MAP,
             chapter_text=chapter_texts[0],
             repo=repo,

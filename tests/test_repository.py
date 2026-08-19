@@ -15,13 +15,14 @@ from sqlalchemy import Engine, text
 from novelcanon.schemas.envelope import ClaimEnvelope
 from novelcanon.schemas.ids import (
     alias_fact_id,
+    event_fact_id,
     evidence_id,
     new_uuid_id,
     relation_fact_id,
     state_fact_id,
 )
 from novelcanon.schemas.memory import AliasClaim, EntityRecord, EvidenceRecord
-from novelcanon.schemas.payloads import RelationPayload, StatePayload
+from novelcanon.schemas.payloads import EventPayload, RelationPayload, StatePayload
 from novelcanon.schemas.types import (
     ClaimStatus,
     EvidenceStance,
@@ -449,3 +450,103 @@ def test_state_subject_must_exist_entity(repo: Repository) -> None:
         )
     # PRAGMA foreign_key_check 依然无错（触发器约束不在 FK 检查范围）
     assert repo.foreign_key_check() == []
+
+
+# ── 验收第二轮 P1：state_claims 真 NOT NULL + FK（0006 重建表）──
+
+
+def test_state_claims_subject_not_null_at_db(repo: Repository) -> None:
+    """直接 SQL 也不能写 NULL subject（NOT NULL 列约束）。"""
+    book, ch = _seed_book_chapter(repo)
+    run = new_uuid_id("run")
+    repo.start_run(run, book)
+    with pytest.raises(Exception), repo._engine.begin() as conn:  # noqa: B017, SLF001
+        conn.execute(
+            text(
+                "INSERT INTO state_claims (claim_version_id, field, value, raw_value,"
+                " subject_entity_id, target_entity_id)"
+                " VALUES (:v, 'realm', 'x', 'x', NULL, NULL)"
+            ),
+            {"v": new_uuid_id("st")},
+        )
+
+
+def test_delete_entity_referenced_by_state_rejected(repo: Repository) -> None:
+    """状态引用的实体不可删除（FK NO ACTION，foreign_keys=ON）。"""
+    book, ch = _seed_book_chapter(repo)
+    run = new_uuid_id("run")
+    repo.start_run(run, book)
+    _write_state(
+        repo, run, state_fact_id("e1", "realm"), "realm", "x",
+        subject_entity_id="e1", chapter_id=ch, ordinal=1,
+    )
+    with pytest.raises(Exception), repo._engine.begin() as conn:  # noqa: B017, SLF001
+        conn.execute(text("DELETE FROM entities WHERE canonical_id = 'e1'"))
+
+
+# ── 验收第二轮 P1：事件查询默认事实过滤 ─────────────────────────
+
+
+def _write_event(
+    repo: Repository,
+    run_id: str,
+    fact_id: str,
+    *,
+    summary: str,
+    chapter_id: str,
+    ordinal: int,
+    participants: list[str],
+    entity_run: str,
+) -> str:
+    """写一个事件版本（含参与者）；返回 claim_version_id。"""
+    for ent in participants:
+        _ensure_entity(repo, entity_run, ent)
+    env = _envelope(
+        run_id, fact_id, chapter_id=chapter_id, ordinal=ordinal, claim_type="event"
+    )
+    result = repo.write_claim(
+        env, EventPayload(event_type="测试事件", summary=summary)
+    )
+    for ent in participants:
+        repo.add_event_participant(result.claim_version_id, ent)
+    return result.claim_version_id
+
+
+def test_event_participants_requires_current_supported(repo: Repository) -> None:
+    """验收 P1：事件查询只返回 active run 中当前 supported 非 retract 版本。"""
+    from novelcanon.query import QueryService
+
+    book, ch = _seed_book_chapter(repo)
+    run = new_uuid_id("run")
+    repo.start_run(run, book)
+    repo.finish_run(run, RunStatus.ACTIVE)
+
+    fact = event_fact_id(
+        "测试事件", ["e1", "e2"], None, ch, 1
+    )
+    v1 = _write_event(
+        repo, run, fact, summary="初版描述", chapter_id=ch, ordinal=1,
+        participants=["e1", "e2"], entity_run=run,
+    )
+    v2 = _write_event(
+        repo, run, fact, summary="更新描述", chapter_id=ch, ordinal=2,
+        participants=["e1", "e2"], entity_run=run,
+    )
+    repo.set_claim_status(v1, "supported")
+    repo.set_claim_status(v2, "supported")
+
+    q = QueryService(repo._engine, book)  # noqa: SLF001
+    # 当前版本 v2 → 可查
+    cur = q.event_participants(v2)
+    assert cur is not None
+    assert {p["entity_id"] for p in cur["participants"]} == {"e1", "e2"}
+    # 历史版本 v1 → 拒绝（不是该 fact 当前版本）
+    assert q.event_participants(v1) is None, "历史事件版本不得返回"
+
+    # unverified 事件（不同 fact）→ 拒绝
+    fact_uv = event_fact_id("测试事件", ["e3"], None, ch, 2)
+    v_uv = _write_event(
+        repo, run, fact_uv, summary="未验证", chapter_id=ch, ordinal=3,
+        participants=["e3"], entity_run=run,
+    )
+    assert q.event_participants(v_uv) is None, "unverified 事件不得返回"

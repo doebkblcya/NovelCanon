@@ -371,39 +371,68 @@ class Repository:
         )
 
     def associate_chapter_products(
-        self, conn: Connection, run_id: str, chapter_id: str
+        self, conn: Connection, new_run_id: str, source_run_id: str, chapter_id: str
     ) -> None:
-        """把一章的全部产物关联到某 run（checkpoint 复用时调用，P0）。
+        """把某章**来源 run 明确拥有**的产物关联到新 run（checkpoint 复用时，P0）。
 
-        checkpoint 命中意味着「该章输入不变 → 输出不变」，因此该章既有
-        claim/alias/mention 全部被当前 run 重新确认：
-        - claims → claim_observations（active 视图可见性）；
-        - aliases → alias_observations（display_name 可见性）；
-        - mentions → run_id 更新为当前 run（最近确认来源）。
+        只复制来源 run 成员关系中的 claim/alias/mention，绝不按章节反查全表：
+        同章其他 run（如失败 run）的 staging 产物不得随复用进入新 active run。
+        mention 通过 mention_observations 复制，entity_mentions.run_id 保持
+        首次创建审计，不被改写。
         """
         ts = now_iso()
         conn.execute(
             text(
                 "INSERT OR IGNORE INTO claim_observations (claim_version_id, extraction_run_id,"
                 " observed_at)"
-                " SELECT c.claim_version_id, :run, :ts FROM claims c"
-                " WHERE c.observed_chapter_id = :ch"
+                " SELECT c.claim_version_id, :new_run, :ts FROM claims c"
+                " JOIN claim_observations src ON src.claim_version_id = c.claim_version_id"
+                " WHERE src.extraction_run_id = :src AND c.observed_chapter_id = :ch"
             ),
-            {"run": run_id, "ts": ts, "ch": chapter_id},
+            {"new_run": new_run_id, "ts": ts, "src": source_run_id, "ch": chapter_id},
         )
         conn.execute(
             text(
                 "INSERT OR IGNORE INTO alias_observations (claim_version_id, extraction_run_id,"
                 " observed_at)"
-                " SELECT a.claim_version_id, :run, :ts FROM entity_alias_claims a"
-                " WHERE a.observed_chapter_id = :ch"
+                " SELECT a.claim_version_id, :new_run, :ts FROM entity_alias_claims a"
+                " JOIN alias_observations src ON src.claim_version_id = a.claim_version_id"
+                " WHERE src.extraction_run_id = :src AND a.observed_chapter_id = :ch"
             ),
-            {"run": run_id, "ts": ts, "ch": chapter_id},
+            {"new_run": new_run_id, "ts": ts, "src": source_run_id, "ch": chapter_id},
         )
         conn.execute(
-            text("UPDATE entity_mentions SET run_id = :run WHERE chapter_id = :ch"),
-            {"run": run_id, "ch": chapter_id},
+            text(
+                "INSERT OR IGNORE INTO mention_observations (mention_id, extraction_run_id,"
+                " observed_at)"
+                " SELECT m.mention_id, :new_run, :ts FROM entity_mentions m"
+                " JOIN mention_observations src ON src.mention_id = m.mention_id"
+                " WHERE src.extraction_run_id = :src AND m.chapter_id = :ch"
+            ),
+            {"new_run": new_run_id, "ts": ts, "src": source_run_id, "ch": chapter_id},
         )
+
+    def ensure_run_belongs_to_book(self, run_id: str, book_id: str) -> None:
+        """写入边界校验：run 必须属于该书（materialize 入口，P1）。"""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT book_id FROM extraction_runs WHERE run_id = :r"), {"r": run_id}
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"run {run_id} 不存在")
+        if row[0] != book_id:
+            raise ValueError(f"run {run_id} 属于 book {row[0]}，不能用于 book {book_id}")
+
+    def ensure_chapter_belongs_to_book(self, chapter_id: str, book_id: str) -> None:
+        """写入边界校验：章节必须属于该书（materialize 入口，P1）。"""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT book_id FROM chapters WHERE chapter_id = :c"), {"c": chapter_id}
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"chapter {chapter_id} 不存在")
+        if row[0] != book_id:
+            raise ValueError(f"chapter {chapter_id} 属于 book {row[0]}，不能用于 book {book_id}")
 
     @staticmethod
     def _latest_version_of_fact(
@@ -615,6 +644,14 @@ class Repository:
                     "run": run_id,
                     "ts": now_iso(),
                 },
+            )
+            # mention 成员关系（run_id 列保持首次创建审计，成员关系走 observations）
+            conn.execute(
+                text(
+                    "INSERT OR IGNORE INTO mention_observations (mention_id, extraction_run_id,"
+                    " observed_at) VALUES (:m, :run, :ts)"
+                ),
+                {"m": mention_id, "run": run_id, "ts": now_iso()},
             )
 
     def record_merge(

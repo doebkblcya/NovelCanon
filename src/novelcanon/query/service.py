@@ -149,10 +149,11 @@ class QueryService:
     def event_participants(self, event_claim_version_id: str) -> dict | None:
         """事件参与者（§5.2）+ 事件证据与章节定位。
 
-        仅当事件属于当前书 active run 时返回：
-        {"event": {claim_version_id, event_type, summary, observed_chapter_id,
-                   observed_ordinal, evidence}, "participants": [...]}。
-        否则返回 None（事件不存在 / 非 active / 其他书）。
+        仅当事件版本满足全部默认事实条件时返回：
+        - 属于当前书 active run；
+        - 是本书该 fact 的当前版本（active 中最新）；
+        - operation != 'retract' 且 claim_status = 'supported'。
+        返回 {"event": {...}, "participants": [...]}；否则 None。
         """
         with self._engine.connect() as conn:
             row = (
@@ -166,6 +167,15 @@ class QueryService:
                         " JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
                         " WHERE e.claim_version_id = :e AND r.status = 'active'"
                         "   AND r.book_id = :book"
+                        "   AND c.operation != 'retract' AND c.claim_status = 'supported'"
+                        "   AND c.claim_version_id = ("
+                        "       SELECT c2.claim_version_id FROM claims c2"
+                        "       JOIN claim_observations o2 ON o2.claim_version_id ="
+                        "            c2.claim_version_id"
+                        "       JOIN extraction_runs r2 ON r2.run_id = o2.extraction_run_id"
+                        "       WHERE c2.fact_id = c.fact_id AND r2.status = 'active'"
+                        "         AND r2.book_id = :book"
+                        "       ORDER BY c2.rowid DESC LIMIT 1)"
                     ),
                     {"e": event_claim_version_id, "book": self._book_id},
                 )
