@@ -14,6 +14,8 @@ class GenerationProfile(BaseModel):
     """generation 模型运行配置，版本化引用（定版方案 §13.1）。
 
     不绑定具体厂商/型号；密钥只从安全环境读取，绝不进入本模型。
+    provider 为适配器名（openai-compatible 等）；api_key_env 指定存放密钥的
+    环境变量名，密钥本身不落库、不进 config_hash。
     """
 
     profile_id: str
@@ -21,6 +23,10 @@ class GenerationProfile(BaseModel):
     max_output_tokens: int
     structured_output_mode: str
     tokenizer_id: str
+    provider: str = "openai-compatible"
+    model: str = ""
+    base_url: str = ""
+    api_key_env: str = ""
     concurrency_limit: int = 4
     requests_per_minute: int = 60
     tokens_per_minute: int = 0

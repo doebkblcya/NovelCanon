@@ -21,9 +21,8 @@ def test_help_lists_all_commands() -> None:
 
 
 def test_unimplemented_commands_are_explicit() -> None:
-    """阶段 03 后 import/index 已实现；其余命令仍显式返回「尚未实现」。"""
+    """阶段 06 后 import/index/extract 已实现；其余命令仍显式返回「尚未实现」。"""
     cases: dict[str, list[str]] = {
-        "extract": ["extract"],
         "activate": ["activate"],
         "query": ["query"],
         "inspect": ["inspect"],
@@ -32,6 +31,46 @@ def test_unimplemented_commands_are_explicit() -> None:
         result = runner.invoke(app, args)
         assert result.exit_code == 0, f"{cmd} 失败: {result.output}"
         assert "尚未实现" in result.stdout
+
+
+def test_extract_requires_book_argument() -> None:
+    """阶段 06：extract 已实现，缺 book_id 参数报用法错误而非「尚未实现」。"""
+    result = runner.invoke(app, ["extract"])
+    assert result.exit_code != 0
+    assert "尚未实现" not in result.stdout
+    assert "book_id" in result.stderr or "book_id" in result.stdout
+
+
+def test_extract_dry_run_validates_config_and_book(tmp_path) -> None:
+    """extract --dry-run：无模型调用，校验配置 + 章节并退出。"""
+    from tests.helpers import FIXTURE_CHAPTERS, make_fixture_epub
+
+    epub = tmp_path / "fixture.epub"
+    make_fixture_epub(epub, FIXTURE_CHAPTERS, title="CLI测试书")
+
+    db = tmp_path / "cli.db"
+    env = {
+        "NOVELCANON_DB_PATH": str(db),
+        "NOVELCANON_LLM_MODEL": "test-model",
+        "NOVELCANON_LLM_BASE_URL": "https://example.invalid/v1",
+    }
+    result = runner.invoke(app, ["import", str(epub)], env=env)
+    assert result.exit_code == 0, result.output
+    import re
+
+    book_id = re.search(r"book=(book_[0-9a-f]+)", result.stdout).group(1)
+
+    # dry-run：不调用模型，打印章节数并退出 0
+    result = runner.invoke(app, ["extract", book_id, "--dry-run"], env=env)
+    assert result.exit_code == 0, result.output
+    assert "dry-run" in result.stdout
+    assert "章节=3" in result.stdout
+
+    # 缺少模型配置 → 明确报错
+    bad_env = {"NOVELCANON_DB_PATH": str(db)}
+    result = runner.invoke(app, ["extract", book_id, "--dry-run"], env=bad_env)
+    assert result.exit_code != 0
+    assert "NOVELCANON_LLM_MODEL" in result.stderr or "NOVELCANON_LLM_MODEL" in result.stdout
 
 
 def test_invalid_env_config_fails_at_startup() -> None:

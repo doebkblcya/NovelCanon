@@ -9,10 +9,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
+from typing import Protocol
 
 from sqlalchemy import Engine
+from sqlalchemy.engine import Connection
 
 from novelcanon.pipeline.checkpoint import CheckpointService
 from novelcanon.pipeline.ledger import LedgerEntry, TokenLedger, Usage
@@ -62,6 +65,21 @@ SchemaCheck = Callable[[dict], bool]
 Item = tuple[str, ChapterTask, dict | ProcessResult]
 
 
+class StagingWriter(Protocol):
+    """阶段 06：Map 产物 staging 写入（map_drafts；writer 事务内调用）。"""
+
+    def write(
+        self,
+        conn: Connection,
+        run_id: str,
+        task: ChapterTask,
+        payload: dict,
+        *,
+        source_run_id: str | None = None,
+        error: str | None = None,
+    ) -> None: ...
+
+
 class PipelineRunner:
     """并发 worker + 有界队列 + 单 writer 批处理。"""
 
@@ -78,6 +96,7 @@ class PipelineRunner:
         limiter: TokenBucket | None = None,
         checkpoint: CheckpointService | None = None,
         ledger: TokenLedger | None = None,
+        staging: StagingWriter | None = None,
     ) -> None:
         self._engine = engine
         self._run_id = run_id
@@ -90,6 +109,7 @@ class PipelineRunner:
         self._checkpoint = checkpoint or CheckpointService(engine)
         self._ledger = ledger or TokenLedger(engine)
         self._repo = Repository(engine)
+        self._staging = staging
 
     async def run(
         self,
@@ -179,7 +199,10 @@ class PipelineRunner:
                     await self._limiter.acquire()
                 result = await asyncio.wait_for(process_fn(task), timeout=timeout_seconds)
                 if result.failed:
-                    raise RetryableError(result.error or "provider 返回失败")
+                    # process_fn 返回 failed = 结构化错误已定论（内部已处理
+                    # 传输重试/结构修复），直接失败，不在此处重试；payload 保留
+                    # 供 staging 记录 invalid 详情。
+                    return result
                 if schema_check is not None and not schema_check(result.payload):
                     return ProcessResult(failed=True, error="schema 校验失败")
                 self._ledger.record(
@@ -222,6 +245,10 @@ class PipelineRunner:
                 for kind, task, result in batch:
                     if kind == "reuse":
                         assert isinstance(result, dict)
+                        # checkpoint.payload 是 TEXT（JSON 字符串），需还原为 dict
+                        payload = result["payload"]
+                        if isinstance(payload, str):
+                            payload = json.loads(payload)
                         # 原始 checkpoint 的 source_run_id 为空，真正来源是写入该
                         # checkpoint 行的 run（result["run_id"]）；链式复用则沿用
                         # 已记录的 source_run_id（来源链等价，成员关系相同）。
@@ -230,7 +257,7 @@ class PipelineRunner:
                             conn,
                             self._run_id,
                             task.checkpoint_fields,
-                            result["payload"],
+                            payload,
                             source_run_id=source_run_id,
                         )
                         # 复用章节：仅把来源 run 明确拥有的产物关联到当前 run
@@ -241,6 +268,14 @@ class PipelineRunner:
                             source_run_id,
                             str(task.checkpoint_fields["chapter_id"]),
                         )
+                        if self._staging is not None:
+                            self._staging.write(
+                                conn,
+                                self._run_id,
+                                task,
+                                payload,
+                                source_run_id=source_run_id,
+                            )
                     elif isinstance(result, ProcessResult) and result.failed:
                         self._checkpoint.save_with(
                             conn,
@@ -249,10 +284,22 @@ class PipelineRunner:
                             {"error": result.error},
                             status="failed",
                         )
+                        if self._staging is not None:
+                            self._staging.write(
+                                conn,
+                                self._run_id,
+                                task,
+                                result.payload,
+                                error=result.error,
+                            )
                     elif isinstance(result, ProcessResult):
                         self._checkpoint.save_with(
                             conn, self._run_id, task.checkpoint_fields, result.payload
                         )
+                        if self._staging is not None:
+                            self._staging.write(
+                                conn, self._run_id, task, result.payload
+                            )
                         self._ledger.record_with(
                             conn,
                             LedgerEntry(

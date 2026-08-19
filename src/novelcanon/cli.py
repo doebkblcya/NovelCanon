@@ -14,7 +14,7 @@ import typer
 from sqlalchemy import Engine
 
 from novelcanon import __version__
-from novelcanon.config.settings import AppSettings
+from novelcanon.config.settings import AppSettings, GenerationProfile
 from novelcanon.logging import bind_run_context, configure_logging
 
 app = typer.Typer(
@@ -118,11 +118,194 @@ def _open_db() -> Engine:
     return create_db_engine(settings.db_path)
 
 
-@app.command()
-def extract() -> None:
-    """逐章 Map 抽取 ExtractionDraftV1（阶段 06 实现）。"""
+@app.command("extract")
+def extract(
+    book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],
+    limit: Annotated[int | None, typer.Option(help="只处理前 N 章（开发用）")] = None,
+    concurrency: Annotated[int, typer.Option(help="并发 worker 数")] = 4,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="只验证配置与章节，不调用模型")
+    ] = False,
+) -> None:
+    """逐章 Map 抽取 ExtractionDraftV1（阶段 06）。"""
     _log_command_invoked("extract")
-    typer.echo("尚未实现：extract（阶段 06 逐章 Map 抽取）")
+    engine = _open_db()
+    try:
+        _run_extract(engine, book_id, limit=limit, concurrency=concurrency, dry_run=dry_run)
+    finally:
+        engine.dispose()
+
+
+def _cli_generation_profile(concurrency: int) -> GenerationProfile:
+    """从安全环境构造 CLI generation profile（密钥只读环境，不落库）。"""
+    import os
+
+    model = os.environ.get("NOVELCANON_LLM_MODEL", "")
+    base_url = os.environ.get("NOVELCANON_LLM_BASE_URL", "")
+    profile = GenerationProfile(
+        profile_id=os.environ.get("NOVELCANON_LLM_PROFILE", "cli"),
+        context_window=int(os.environ.get("NOVELCANON_LLM_CONTEXT_WINDOW", "8192")),
+        max_output_tokens=int(os.environ.get("NOVELCANON_LLM_MAX_OUTPUT", "2048")),
+        structured_output_mode=os.environ.get("NOVELCANON_LLM_MODE", "json_object"),
+        tokenizer_id=os.environ.get("NOVELCANON_LLM_TOKENIZER", "fake-v1"),
+        provider=os.environ.get("NOVELCANON_LLM_PROVIDER", "openai-compatible"),
+        model=model,
+        base_url=base_url,
+        api_key_env="NOVELCANON_LLM_API_KEY",
+        concurrency_limit=max(1, concurrency),
+    )
+    if not model or not base_url:
+        raise typer.BadParameter(
+            "缺少模型配置：请设置 NOVELCANON_LLM_MODEL 与 NOVELCANON_LLM_BASE_URL"
+            "（API key 用 NOVELCANON_LLM_API_KEY，本地 provider 可省略）"
+        )
+    return profile
+
+
+def _tokenizer_for(profile: GenerationProfile):
+    """按 profile.tokenizer_id 构造 tokenizer（fake-v1 / tiktoken-*）。"""
+    from novelcanon.retrieval.tokenizer import FakeTokenizer, TiktokenAdapter
+
+    if profile.tokenizer_id == "fake-v1" or profile.tokenizer_id.startswith("fake"):
+        return FakeTokenizer()
+    if profile.tokenizer_id.startswith("tiktoken-"):
+        return TiktokenAdapter(encoding=profile.tokenizer_id.removeprefix("tiktoken-"))
+    raise typer.BadParameter(f"未知 tokenizer_id：{profile.tokenizer_id}")
+
+
+def _run_extract(
+    engine: Engine,
+    book_id: str,
+    *,
+    limit: int | None = None,
+    concurrency: int = 4,
+    dry_run: bool = False,
+) -> None:
+    """Map 流水线：真实 provider 按章产出 Draft 入 staging（run 保持 running）。"""
+    import asyncio
+
+    from novelcanon.config.hash import stable_config_hash
+    from novelcanon.extraction.map_pipeline import build_map_process_fn
+    from novelcanon.extraction.staging import MapStaging
+    from novelcanon.generation import default_map_prompts
+    from novelcanon.generation.client import GenerationClient, resolve_api_key
+    from novelcanon.pipeline import (
+        ChapterTask,
+        PipelineRunner,
+        RunManager,
+        checkpoint_key,
+    )
+    from novelcanon.pipeline.checkpoint import CHECKPOINT_FIELDS
+    from novelcanon.schemas.types import RunStatus
+    from novelcanon.storage.repository import Repository
+
+    profile = _cli_generation_profile(concurrency)
+    prompts = default_map_prompts()
+    repo = Repository(engine)
+    chapters = repo.list_chapters(book_id)
+    if limit is not None:
+        chapters = chapters[:limit]
+    if not chapters:
+        typer.echo(f"❌ book={book_id} 没有章节，请先 novelcanon import")
+        raise typer.Exit(1)
+
+    tokenizer = _tokenizer_for(profile)
+    typer.echo(
+        f"Map 抽取 book={book_id} 章节={len(chapters)} profile={profile.profile_id}"
+        f" model={profile.model or '（未配置）'} tokenizer={tokenizer.tokenizer_id}"
+    )
+    if dry_run:
+        typer.echo("✅ dry-run：配置与章节校验通过，未调用模型")
+        return
+
+    api_key = resolve_api_key(profile)
+    if api_key is None and profile.api_key_env:
+        typer.echo(f"⚠️  未设置 {profile.api_key_env}；若 provider 需要鉴权将失败")
+    client = GenerationClient(profile, tokenizer=tokenizer, api_key=api_key)
+
+    pipeline_version = "map-p1"
+    schema_version = stable_config_hash(
+        {"schema": prompts.schema_json, "profile": profile.config_hash}
+    )
+    prompt_version = prompts.version()
+
+    tasks = [
+        ChapterTask(
+            chapter_id=ch["chapter_id"],
+            ordinal=ch["ordinal"],
+            content=repo.get_book_text(book_id)[ch["char_start"] : ch["char_end"]],
+            checkpoint_fields={
+                "book_id": book_id,
+                "chapter_id": ch["chapter_id"],
+                "content_hash": ch["content_hash"] or "",
+                "pipeline_version": pipeline_version,
+                "prompt_version": prompt_version,
+                "compression_version": "",
+                "schema_version": schema_version,
+            },
+        )
+        for ch in chapters
+    ]
+
+    process_fn = build_map_process_fn(
+        book_id=book_id,
+        profile=profile,
+        prompts=prompts,
+        tokenizer=tokenizer,
+        client=client,
+    )
+
+    mgr = RunManager(engine)
+    run_id = mgr.create(
+        book_id,
+        input_hash=stable_config_hash(
+            {
+                "chapters": [
+                    checkpoint_key({k: t.checkpoint_fields[k] for k in CHECKPOINT_FIELDS})
+                    for t in tasks
+                ]
+            }
+        ),
+        pipeline_version=pipeline_version,
+        prompt_version=prompt_version,
+        schema_version=schema_version,
+    )
+    assert mgr.transition(run_id, RunStatus.CREATED, RunStatus.RUNNING)
+
+    runner = PipelineRunner(
+        engine,
+        run_id,
+        book_id,
+        concurrency=concurrency,
+        staging=MapStaging(),
+    )
+    summary = asyncio.run(
+        runner.run(
+            tasks,
+            process_fn,
+            stage="map",
+            timeout_seconds=profile.timeout_seconds + 5,
+        )
+    )
+    from novelcanon.generation.report import extraction_report
+
+    report = extraction_report(engine, run_id)
+    typer.echo(
+        f"✅ run={run_id} 完成：总={summary.total}"
+        f" 新={summary.completed - summary.reused} 复用={summary.reused}"
+        f" 失败={summary.failed}"
+    )
+    typer.echo(
+        "   staging："
+        f"valid={report['chapters'].get('valid', 0)}"
+        f" invalid={report['chapters'].get('invalid', 0)}"
+        f" failed={report['chapters'].get('failed', 0)}"
+        f" claims={report['extraction']['claims']}"
+        f" mentions={report['extraction']['mentions']}"
+        f" unresolved={report['extraction']['unresolved']}"
+        f" tokens={report['tokens'].get('total', 0)}"
+    )
+    typer.echo("   run 状态保持 running（阶段 07 证据验证后 activate）")
 
 
 @app.command()
