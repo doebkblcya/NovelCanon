@@ -100,24 +100,48 @@ def _seed_multi_run_links(tmp_path, engine: Engine) -> tuple[str, str]:
                 "ch": chs[1]["chapter_id"], "run": run1,
             },
         )
-    # run2 复用同一边（成员关系 = observations）
+    # 第二条边：claim_status=supported 但方法/证据是空字符串/纯空白
+    # （P0：回填必须把空字符串视为缺失 → 降级 unverified）
+    from novelcanon.schemas.types import EventLinkType as _ELT
+
+    edge2_fact = event_link_fact_id(vids[1], _ELT.CAUSES, vids[0])
+    edge2_id = f"edge2_{edge2_fact[:20]}"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO event_links (claim_version_id, fact_id,"
+                " source_event_id, target_event_id, relation_type, confidence,"
+                " claim_status, observed_chapter_id, observed_ordinal,"
+                " created_by_run_id, world_valid_kind, world_valid_from,"
+                " world_valid_confidence, verification_method,"
+                " verification_evidence)"
+                " VALUES (:v, :f, :s, :t, 'causes', 0.8, 'supported',"
+                " :ch, 1, :run, 'chapter_proxy', 1, 1.0, '', '  ')"
+            ),
+            {
+                "v": edge2_id, "f": edge2_fact, "s": vids[1], "t": vids[0],
+                "ch": chs[0]["chapter_id"], "run": run1,
+            },
+        )
+    # run2 复用两条边（成员关系 = observations）
     run2 = RunManager(engine).create(book_id, input_hash="r2")
     with engine.begin() as conn:
-        for run in (run1, run2):
-            conn.execute(
-                text(
-                    "INSERT INTO event_link_observations (claim_version_id,"
-                    " extraction_run_id, observed_at) VALUES (:v, :run, :ts)"
-                ),
-                {"v": edge_id, "run": run, "ts": "2026-01-01T00:00:00+00:00"},
-            )
+        for eid in (edge_id, edge2_id):
+            for run in (run1, run2):
+                conn.execute(
+                    text(
+                        "INSERT INTO event_link_observations (claim_version_id,"
+                        " extraction_run_id, observed_at) VALUES (:v, :run, :ts)"
+                    ),
+                    {"v": eid, "run": run, "ts": "2026-01-01T00:00:00+00:00"},
+                )
     # run2 是当前 active run（复用者）——升级后它必须有验证行
     with engine.begin() as conn:
         conn.execute(
             text("UPDATE extraction_runs SET status = 'active' WHERE run_id = :r"),
             {"r": run2},
         )
-    return book_id, edge_id, vids[0]
+    return book_id, edge_id, edge2_id, vids[0]
 
 
 def test_0013_backfill_from_observations(tmp_path) -> None:
@@ -129,7 +153,7 @@ def test_0013_backfill_from_observations(tmp_path) -> None:
     db = tmp_path / "mig0013.db"
     engine = create_db_engine(db)
     _upgrade(db, "0012_event_link_world_valid")
-    book_id, edge_id, src_event = _seed_multi_run_links(tmp_path, engine)
+    book_id, edge_id, edge2_id, src_event = _seed_multi_run_links(tmp_path, engine)
 
     _upgrade(db, "head")
     with engine.connect() as conn:
@@ -147,6 +171,21 @@ def test_0013_backfill_from_observations(tmp_path) -> None:
         f"回填状态 = 全局 supported（带方法/证据）：{rows}"
     )
     assert all(r[2] == "causal-connective" for r in rows)
+
+    # 空字符串/纯空白证据的 supported 存量 → 回填降级为 unverified
+    with engine.connect() as conn:
+        rows2 = conn.execute(
+            text(
+                "SELECT extraction_run_id, claim_status, verification_method"
+                " FROM event_link_verifications WHERE claim_version_id = :e"
+                " ORDER BY extraction_run_id"
+            ),
+            {"e": edge2_id},
+        ).fetchall()
+    assert len(rows2) == 2, f"edge2 也应回填两个 run：{rows2}"
+    assert all(r[1] == "unverified" and r[2] is None for r in rows2), (
+        f"空字符串证据必须降级为 unverified：{rows2}"
+    )
 
     # active run（run2，复用者）升级后因果查询仍可见（INNER JOIN 不丢边）
     from novelcanon.query import QueryService

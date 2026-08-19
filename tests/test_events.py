@@ -957,6 +957,44 @@ def test_supported_requires_verification_evidence(
     assert row is not None and row[0] == "unverified", (
         f"无证据的 supported 必须被降级：{row}"
     )
+    # 空字符串/纯空白的方法与证据同样视为缺失（P0：不得绕过硬约束）
+    for method, evidence in (("", "证据"), ("  ", "   ")):
+        repo.write_event_link(
+            EventLinkRecord(
+                envelope=ClaimEnvelope(
+                    fact_id=event_link_fact_id(src, EventLinkType.CAUSES, tgt),
+                    claim_version_id="",
+                    claim_type="event_link",
+                    operation=Operation.ASSERT,
+                    claim_status=ClaimStatus.SUPPORTED,
+                    observed_chapter_id=ids[2],
+                    observed_ordinal=2,
+                    created_by_run_id=run_id,
+                    created_at="2026-01-01T00:00:00+00:00",
+                ),
+                payload=EventLinkPayload(
+                    source_event_id=src, target_event_id=tgt,
+                    relation_type=EventLinkType.CAUSES,
+                ),
+                verification_method=method,
+                verification_evidence=evidence,
+            )
+        )
+        with migrated_db.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT v.claim_status, v.verification_method"
+                    " FROM event_link_verifications v"
+                    " JOIN event_links l ON l.claim_version_id = v.claim_version_id"
+                    " WHERE l.source_event_id = :s AND l.target_event_id = :t"
+                    " AND v.extraction_run_id = :r"
+                ),
+                {"s": src, "t": tgt, "r": run_id},
+            ).fetchone()
+        assert row is not None and row[0] == "unverified", (
+            f"空字符串证据不得写成 supported：method={method!r} evidence={evidence!r}"
+        )
+        assert row[1] is None, "降级时验证信息应清空"
     # 该边不得进入默认因果回答
     q = QueryService(migrated_db, book_id)
     paths = q.causal_paths(src)
@@ -1127,3 +1165,44 @@ def test_event_link_world_valid_column_constraints(
         raw_insert("chapter_proxy", None, 0.8)
     with pytest.raises(sqlalchemy.exc.IntegrityError):  # kind 不允许 NULL（默认 unknown）
         raw_insert(None, None, 0.8)
+
+
+def test_event_link_verification_status_enum(tmp_path, migrated_db: Engine) -> None:
+    """验收 P1：event_link_verifications.claim_status 枚举约束
+    （unverified/supported/contested/rejected）——非法状态不得写入，
+    损坏数据不被查询层静默忽略。"""
+    import pytest
+
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
+    _link_events(migrated_db, book_id, run_id)
+    with migrated_db.connect() as conn:
+        # 找到一条已存在的验证行做模板
+        row = conn.execute(
+            text(
+                "SELECT claim_version_id, extraction_run_id FROM"
+                " event_link_verifications LIMIT 1"
+            )
+        ).fetchone()
+    assert row is not None
+    with pytest.raises(sqlalchemy.exc.IntegrityError), migrated_db.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO event_link_verifications (claim_version_id,"
+                " extraction_run_id, claim_status, verification_method,"
+                " verification_evidence, verified_at)"
+                " VALUES (:v, :r, 'bogus', 'm', 'e', '2026-01-01')"
+            ),
+            {"v": row[0], "r": row[1]},
+        )
+    # 合法枚举可写
+    with migrated_db.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT OR REPLACE INTO event_link_verifications (claim_version_id,"
+                " extraction_run_id, claim_status, verification_method,"
+                " verification_evidence, verified_at)"
+                " VALUES (:v, :r, 'contested', 'm', 'e', '2026-01-01')"
+            ),
+            {"v": row[0], "r": row[1]},
+        )

@@ -546,15 +546,14 @@ class Repository:
         关联该 run 的验证行——未激活 run 的验证结果不得改写 active 查询。
 
         **supported ⇒ 关系证据硬约束**：只有同时携带 verification_method
-        与 verification_evidence（非空）才写 supported；调用方仅凭
-        envelope.claim_status=supported（无方法/证据）会被**降级为
-        unverified**——supported 边必须有可审计的关系证据（数据库约束
-        ck_event_link_verification_supported 兜底）。
+        与 verification_evidence（**非空——空字符串/纯空白视为缺失**）才写
+        supported；调用方仅凭 envelope.claim_status=supported（无方法/证据）
+        会被**降级为 unverified**——supported 边必须有可审计的关系证据
+        （数据库约束 ck_event_link_verification_supported 兜底）。
         """
-        verified = (
-            record.verification_method is not None
-            and record.verification_evidence is not None
-        )
+        verified = bool(
+            (record.verification_method or "").strip()
+        ) and bool((record.verification_evidence or "").strip())
         conn.execute(
             text(
                 "INSERT OR REPLACE INTO event_link_verifications"
@@ -566,8 +565,8 @@ class Repository:
                 "v": version_id,
                 "run": record.envelope.created_by_run_id,
                 "st": "supported" if verified else "unverified",
-                "vm": record.verification_method if verified else None,
-                "ve": record.verification_evidence if verified else None,
+                "vm": (record.verification_method or "").strip() if verified else None,
+                "ve": (record.verification_evidence or "").strip() if verified else None,
                 "ts": now_iso(),
             },
         )

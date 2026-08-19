@@ -52,32 +52,39 @@ def upgrade() -> None:
         sa.Column("verification_method", sa.Text, nullable=True),
         sa.Column("verification_evidence", sa.Text, nullable=True),
         sa.Column("verified_at", sa.Text, nullable=False),
-        # supported ⇒ 关系证据硬约束：方法 + 证据必须同时非空
+        # claim_status 枚举约束（P1）：损坏数据不得被查询层静默忽略
+        sa.CheckConstraint(
+            "claim_status IN ('unverified','supported','contested','rejected')",
+            name="ck_event_link_verification_status",
+        ),
+        # supported ⇒ 关系证据硬约束：方法 + 证据必须同时**非空**
+        # （trim 后 length > 0——空字符串/纯空白视为缺失，P0）
         sa.CheckConstraint(
             "claim_status != 'supported' OR"
-            " (verification_method IS NOT NULL"
-            " AND verification_evidence IS NOT NULL)",
+            " (length(trim(verification_method)) > 0"
+            " AND length(trim(verification_evidence)) > 0)",
             name="ck_event_link_verification_supported",
         ),
     )
     # 回填：为每个 (link, run) 观察关系补验证行（成员关系是复用的真相）。
-    # supported 且缺方法/证据的存量降级为 unverified（硬约束兜底）。
+    # supported 且缺方法/证据（含空字符串/纯空白）的存量降级为 unverified
+    # （硬约束兜底）。
     op.execute(
         "INSERT OR IGNORE INTO event_link_verifications"
         " (claim_version_id, extraction_run_id, claim_status,"
         "  verification_method, verification_evidence, verified_at)"
         " SELECT o.claim_version_id, o.extraction_run_id,"
         "        CASE WHEN l.claim_status = 'supported'"
-        "                  AND l.verification_method IS NOT NULL"
-        "                  AND l.verification_evidence IS NOT NULL"
+        "                  AND length(trim(l.verification_method)) > 0"
+        "                  AND length(trim(l.verification_evidence)) > 0"
         "             THEN 'supported' ELSE 'unverified' END,"
         "        CASE WHEN l.claim_status = 'supported'"
-        "                  AND l.verification_method IS NOT NULL"
-        "                  AND l.verification_evidence IS NOT NULL"
+        "                  AND length(trim(l.verification_method)) > 0"
+        "                  AND length(trim(l.verification_evidence)) > 0"
         "             THEN l.verification_method ELSE NULL END,"
         "        CASE WHEN l.claim_status = 'supported'"
-        "                  AND l.verification_method IS NOT NULL"
-        "                  AND l.verification_evidence IS NOT NULL"
+        "                  AND length(trim(l.verification_method)) > 0"
+        "                  AND length(trim(l.verification_evidence)) > 0"
         "             THEN l.verification_evidence ELSE NULL END,"
         "        datetime('now')"
         " FROM event_link_observations o"
