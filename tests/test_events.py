@@ -38,14 +38,15 @@ from tests.helpers import make_fixture_epub
 BOOK_ID = "book_events"
 
 # 5 章：主角历练线（拜师→突破→遇险→获救→复仇）。
-# 第 2/4/5 章含因果连接词（「入门之后…因此…」「于是…」「伤愈之后…」），
-# 供 LinkVerifier 做关系证据验证；第 3 章无因果表述（突破→遇险保持 unverified）。
+# 第 2/4/5 章含「源事件动作锚点 + 强因果连接词」（拜师…因此 / 遭妖兽
+# 围攻…于是 / 获救…因此），供 LinkVerifier 做关系证据验证；第 3 章
+# 无源事件锚点/连接词（突破→遇险保持 unverified，纯时间先后不算因果）。
 EVENT_CHAPTERS: list[tuple[str, str]] = [
     ("第一章", "陆尘拜入青云宗，成为药老的关门弟子。"),
-    ("第二章", "入门之后，陆尘闭关苦修三月，因此境界突破至筑基期。"),
+    ("第二章", "拜师之后，陆尘闭关苦修三月，因此境界突破至筑基期。"),
     ("第三章", "陆尘下山历练，在荒山遭妖兽围攻。"),
-    ("第四章", "药老闻讯赶到，于是出手救下重伤的陆尘。"),
-    ("第五章", "伤愈之后，陆尘立誓，必报此仇。"),
+    ("第四章", "闻听陆尘遭妖兽围攻，药老立即赶到，于是出手救下重伤的陆尘。"),
+    ("第五章", "获救之后，陆尘因此立誓，必报此仇。"),
 ]
 
 
@@ -170,7 +171,7 @@ def _link_events(
     """生成候选 → LinkVerifier 关系证据验证 → 落库跨章链接（先激活 run）。
 
     LinkVerifier 检查目标章原文「原因引用 + 因果连接词」：验证通过的边
-    （如 拜师→突破，第 2 章含「入门之后…因此…」）自动 supported；
+    （如 拜师→突破，第 2 章含「拜师…因此」）自动 supported；
     无关系证据的边（如 突破→遇险，第 3 章无因果表述）保持 unverified。
     """
     mgr = RunManager(migrated_db)
@@ -834,7 +835,7 @@ def test_rule_links_without_evidence_stay_unverified(
 
     - 突破→遇险（目标章第 3 章无因果表述）→ 保持 unverified，不进默认
       因果回答（「甲吃早饭」→「甲中彩票」同参与者同先后同理）；
-    - 拜师→突破（第 2 章「入门之后…因此…」）→ LinkVerifier 验证通过
+    - 拜师→突破（第 2 章「拜师…因此」）→ LinkVerifier 验证通过
       supported（自动因果链非空，不再依赖手工写入）。
     """
     book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
@@ -896,6 +897,67 @@ def test_link_verifier_promotes_evidence_edges(
     assert row is not None
     assert row[0] == "supported", "拜师→突破 必须有关系证据 → supported"
     assert row[1] == "causal-connective", f"验证方法应记录：{row[1]}"
-    assert row[2] is not None and "入门之后" in row[2], (
+    assert row[2] is not None and "拜师之后" in row[2], (
         f"验证证据 span 必须落库：{row[2]}"
+    )
+
+
+def test_link_verifier_requires_action_anchor_and_strong_connective() -> None:
+    """验收 P0：LinkVerifier 不得把时间先后误判为因果。
+
+    - 参与者共现 + 纯时间词（随后）→ 不验证（甲吃早饭，随后甲中彩票）；
+    - 强连接词但目标句无源事件动作/摘要锚点 → 不验证（连接词可能指向
+      章内另一件事）；
+    - 源事件动作锚点 + 强连接词同句 → 验证通过。
+    """
+    from novelcanon.events.verifier import LinkVerifier
+
+    v = LinkVerifier()
+    # 源事件锚点 = event_type + summary（不含参与者）
+    refs = ["吃早饭", "甲吃早饭"]
+    # 纯时间推进词不是因果充分条件
+    assert v.verify("ch2", "甲吃早饭，随后甲中了彩票。", refs) is None, (
+        "纯时间词不得支持因果"
+    )
+    # 强连接词但无源事件动作锚点（连接词可能指向章内另一件事）
+    assert v.verify("ch2", "甲中了彩票，因此他请大家吃饭。", refs) is None, (
+        "无源事件动作锚点不得支持因果"
+    )
+    # 源事件动作锚点 + 强连接词同句 → 验证通过
+    r = v.verify("ch2", "甲吃早饭，因此他中了彩票。", refs)
+    assert r is not None, "源事件动作锚点 + 强连接词必须验证通过"
+    assert r.matched_ref == "吃早饭" and r.matched_connective == "因此"
+
+
+def test_event_link_world_valid_round_trip(tmp_path, migrated_db: Engine) -> None:
+    """验收 P1：event link 具有 world-valid 语义（chapter_proxy），
+    causal_paths 支持 world_at 参数并与 knowledge_cutoff 组合。"""
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
+    _link_events(migrated_db, book_id, run_id)
+    # 落库：world_valid_kind = chapter_proxy，from = observed_ordinal
+    with migrated_db.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT world_valid_kind, world_valid_from FROM event_links"
+                " WHERE source_event_id = :s AND target_event_id = :t"
+            ),
+            {"s": version_ids[0], "t": version_ids[1]},
+        ).fetchall()
+    assert rows, "拜师→突破 必须落库"
+    kind, wfrom = rows[0]
+    assert kind == "chapter_proxy", f"图谱边世界时间应为 chapter_proxy：{kind}"
+    assert wfrom == 1, f"world_valid_from = 最大证据披露章节：{wfrom}"
+
+    q = QueryService(migrated_db, book_id)
+    # world_at=0（第 1 章）：边在 ordinal 1 成立 → 不可见
+    assert q.causal_paths(version_ids[0], world_at=0) == [], (
+        "world_at=0 时 ordinal 1 的边不可见"
+    )
+    # world_at=1：可见
+    paths = q.causal_paths(version_ids[0], world_at=1)
+    assert paths, "world_at=1 时边可见"
+    # 双参数组合：world_at=0 且 cutoff 足够大 → 仍不可见（world 独立生效）
+    assert q.causal_paths(version_ids[0], world_at=0, knowledge_cutoff=10) == [], (
+        "world_at 与 knowledge_cutoff 独立过滤"
     )

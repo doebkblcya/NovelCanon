@@ -391,6 +391,47 @@ def test_ledger_folds_provider_retry_meta_on_exhaustion(
     asyncio.run(main())
 
 
+def test_ledger_sums_provider_internal_and_outer_retries(
+    migrated_db: Engine,
+) -> None:
+    """验收 P1：成功后的账本 = result.usage（含 provider 内部 retry_count）
+    + 此前外层失败尝试的累计 retry_usage——不再用 replace 覆盖，也不丢弃
+    失败后成功的调用与 token。"""
+    _ensure_book(migrated_db)
+    tasks = [_task("ch1")]
+    calls = {"n": 0}
+
+    async def process(task: ChapterTask) -> ProcessResult:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RetryableError("瞬时网络错误")  # 第一次外层失败
+        return ProcessResult(
+            payload={"chapter_id": task.chapter_id, "ordinal": task.ordinal},
+            # 成功调用携带 provider 内部 retry_count=2（429 后成功）
+            usage=Usage(
+                input_tokens=100,
+                output_tokens=20,
+                retry_count=2,
+                provider="fake",
+                model="fake-model",
+                profile_id="fp",
+            ),
+        )
+
+    async def main() -> None:
+        run_id, summary, issues = await _full_run(
+            migrated_db, tasks, process, timeout_seconds=1.0
+        )
+        assert issues is None and summary.completed == 1
+        led = TokenLedger(migrated_db).summary(run_id)
+        # 总重试 = 外层 1 次 + provider 内部 2 次 = 3（不得覆盖为 1）
+        assert led["retry_count"] == 3, f"provider 内部重试不得被外层覆盖：{led}"
+        assert led["input_tokens"] == 100
+        assert led["output_tokens"] == 20
+
+    asyncio.run(main())
+
+
 # ── Token 账本汇总 ─────────────────────────────────────────────
 
 

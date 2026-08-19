@@ -91,13 +91,17 @@ class ResolutionService:
     ) -> dict[str, str]:
         """库里已有 alias：surface → canonical（跨 run 复用，08 §2）。
 
-        只 seed「已确认的历史 canonical alias」（验收 P0）：
+        只 seed「已确认的历史 canonical alias」（验收 P0，两轮收紧）：
         - **排除本轮 run 的临时 mention alias**：materialize 为每个 mention
           立即写一条 surface → mention 级实体的 alias；若全部 seed 进
           Resolver，同名实体直接走 seed-alias 合并，绕过 v3 的隔章歧义
-          判断（两个不相邻章节、无共同证据的「王明」被误合并）。
-        - alias 指向 mention 级实体（未消歧）时，经 entity_resolutions
-          投影到已消歧 canonical（历史 alias 不改写，查询层投影）。
+          判断；
+        - **只取可信 run**：alias 必须来自已激活（active）的 run——未激活/
+          失败 run 的 alias 是未定论产物，不得成为 seed；
+        - **要求存在 canonical resolution**：alias 指向的 mention 必须已经
+          消歧（entity_resolutions 有行）——首轮 unresolved 的 mention
+          没有 resolution，其 alias 不得让次轮同名 mention 被 seed-alias
+          强制合并（首轮 unresolved → 次轮仍走 v3 歧义判断）。
 
         同一 surface 多条 alias 时取「最早披露」的 canonical（首次披露
         surface 是 canonical 的内部名，08 §基本原则），保证方向稳定。
@@ -113,8 +117,9 @@ class ResolutionService:
                     "SELECT a.surface_name, a.canonical_id, a.observed_ordinal"
                     " FROM entity_alias_claims a"
                     " JOIN alias_observations o ON o.claim_version_id = a.claim_version_id"
+                    " JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
                     " JOIN chapters ch ON ch.chapter_id = a.observed_chapter_id"
-                    f" WHERE ch.book_id = :b {excl_sql}"
+                    f" WHERE ch.book_id = :b AND r.status = 'active' {excl_sql}"
                     " ORDER BY a.observed_ordinal ASC, a.rowid ASC"
                 ),
                 params,
@@ -123,14 +128,20 @@ class ResolutionService:
         for surface, canonical, _ordinal in rows:
             if surface in aliases:
                 continue  # 首个（最早披露）胜出
-            aliases[surface] = self._resolve_canonical(canonical)
+            resolved = self._resolve_canonical(canonical)
+            if resolved is None:
+                # 无 canonical resolution（首轮 unresolved / 未消歧）：
+                # 该 alias 是临时 mention 实体，不得成为 seed（P0）
+                continue
+            aliases[surface] = resolved
         return aliases
 
-    def _resolve_canonical(self, canonical_id: str) -> str:
+    def _resolve_canonical(self, canonical_id: str) -> str | None:
         """mention 级 canonical → 已消歧 canonical（经 entity_resolutions）。
 
         alias 的 canonical_id 若仍是 mention（materialize 时尚未消歧），
         投影到消歧后的 canonical；已经是最终 canonical 则原样保留。
+        无 resolution 行（该 mention 未消歧 / unresolved）→ None（不 seed）。
         """
         with self._engine.connect() as conn:
             row = conn.execute(
@@ -139,7 +150,22 @@ class ResolutionService:
                 ),
                 {"m": canonical_id},
             ).fetchone()
-        return row[0] if row is not None else canonical_id
+            if row is not None:
+                return row[0]
+            # alias 指向 mention 级临时实体（materialize 阶段写入 entities，
+            # 但未消歧）→ 不得成为 seed（首轮 unresolved 的 alias 即此形态）
+            is_mention = conn.execute(
+                text("SELECT 1 FROM entity_mentions WHERE mention_id = :m"),
+                {"m": canonical_id},
+            ).fetchone()
+            if is_mention is not None:
+                return None
+            # 非 mention 的 canonical（已消歧实体本身）：alias 直接有效
+            exists = conn.execute(
+                text("SELECT 1 FROM entities WHERE canonical_id = :c"),
+                {"c": canonical_id},
+            ).fetchone()
+        return canonical_id if exists is not None else None
 
     # ── 应用计划（幂等落库）─────────────────────────────────────
 

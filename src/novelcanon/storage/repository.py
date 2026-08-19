@@ -457,27 +457,49 @@ class Repository:
         version_id = claim_version_id(record.envelope.fact_id, version_key)
         verification_evidence = record.verification_evidence
         verification_method = record.verification_method
+        wv_kind = record.envelope.world_valid_kind.value
+        wv_from = record.envelope.world_valid_from
+        wv_to = record.envelope.world_valid_to
+        wv_conf = record.envelope.world_valid_confidence
         with self._engine.begin() as conn:
             existing = conn.execute(
                 text("SELECT 1 FROM event_links WHERE claim_version_id = :v"), {"v": version_id}
             ).fetchone()
             if existing:
-                # 幂等命中：复用版本，仍把该 run 加入成员关系（09 §4）；
-                # 若本轮关系证据验证通过，把边提升为 supported 并记录验证
-                # 信息（P0：验证是后续语义步骤，重跑可补验/覆盖）。
-                if verification_method is not None:
-                    conn.execute(
-                        text(
-                            "UPDATE event_links SET claim_status = 'supported',"
-                            " verification_method = :vm, verification_evidence = :ve"
-                            " WHERE claim_version_id = :v"
+                # 幂等命中：复用版本，仍把该 run 加入成员关系（09 §4）。
+                # 边状态是「当前验证聚合」（与 claim_status 同语义，非
+                # append-only）：本轮重新验证通过 → 提升为 supported 并
+                # 记录验证信息；验证不通过（更严格规则）→ 降级为
+                # unverified，避免历史宽松验证长期残留（P0 可审计）。
+                conn.execute(
+                    text(
+                        "UPDATE event_links SET claim_status = :status,"
+                        " verification_method = :vm, verification_evidence = :ve"
+                        " WHERE claim_version_id = :v"
+                    ),
+                    {
+                        "status": (
+                            "supported" if verification_method is not None else "unverified"
                         ),
-                        {
-                            "vm": verification_method,
-                            "ve": verification_evidence,
-                            "v": version_id,
-                        },
-                    )
+                        "vm": verification_method,
+                        "ve": verification_evidence,
+                        "v": version_id,
+                    },
+                )
+                # world_valid 幂等自愈：存量/旧写入缺省时补齐（P1：图谱边
+                # 必须按 world_valid 过滤，chapter_proxy = 披露章节）
+                conn.execute(
+                    text(
+                        "UPDATE event_links SET world_valid_kind = :wk,"
+                        " world_valid_from = :wf, world_valid_to = :wt,"
+                        " world_valid_confidence = :wc"
+                        " WHERE claim_version_id = :v AND world_valid_kind IS NULL"
+                    ),
+                    {
+                        "wk": wv_kind, "wf": wv_from, "wt": wv_to,
+                        "wc": wv_conf, "v": version_id,
+                    },
+                )
                 self._record_event_link_observation(
                     conn, version_id, record.envelope.created_by_run_id
                 )
@@ -498,9 +520,11 @@ class Repository:
                     " target_event_id, relation_type, confidence, claim_status,"
                     " observed_chapter_id,"
                     " observed_ordinal, supersedes_version_id, primary_evidence_id,"
-                    " created_by_run_id, verification_method, verification_evidence)"
+                    " created_by_run_id, verification_method, verification_evidence,"
+                    " world_valid_kind, world_valid_from, world_valid_to,"
+                    " world_valid_confidence)"
                     " VALUES (:v, :fact, :src, :tgt, :rt, :conf, :status, :och, :oord,"
-                    " :sup, :pev, :run, :vm, :ve)"
+                    " :sup, :pev, :run, :vm, :ve, :wk, :wf, :wt, :wc)"
                 ),
                 {
                     "v": version_id,
@@ -517,6 +541,10 @@ class Repository:
                     "run": record.envelope.created_by_run_id,
                     "vm": verification_method,
                     "ve": verification_evidence,
+                    "wk": wv_kind,
+                    "wf": wv_from,
+                    "wt": wv_to,
+                    "wc": wv_conf,
                 },
             )
             self._record_event_link_observation(

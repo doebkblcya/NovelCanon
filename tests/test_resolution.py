@@ -423,6 +423,169 @@ def test_materialize_then_resolve_isolated_same_name_not_merged(
     assert mapped_wm == 0, "王明 不得被映射为 canonical（v3 歧义判断必须生效）"
 
 
+def test_unresolved_round_one_not_seeded_into_round_two(
+    tmp_path, migrated_db: Engine
+) -> None:
+    """验收 P0：首轮 unresolved 的 mention alias 不得成为次轮 seed。
+
+    首轮 unresolved 的 alias 没有 entity_resolutions（_resolve_canonical
+    此前直接返回临时实体 ID）；次轮同名 mention 若被 seed-alias 强制合并
+    则绕过 v3 歧义判断。修复后：只 seed 可信（active）run 且存在 canonical
+    resolution 的 alias——首轮 unresolved → 次轮仍走 v3 歧义判断。
+    """
+    from novelcanon.extraction.materialize import materialize_draft
+
+    chapters = [
+        ("第一章", "王明在茶楼独饮，心事重重。"),
+        ("第二章", "萧炎修炼斗之气，境界渐长。"),
+        ("第三章", "王明在刑场被斩首，围观者叹息。"),
+        ("第四章", "萧战在山门静坐，一言不发。"),
+    ]
+    epub = tmp_path / "resolve-flow2.epub"
+    make_fixture_epub(epub, chapters, title="消歧链路二")
+    book_id = import_book(migrated_db, epub, book_id="book_resolve_flow2").book_id
+    repo = Repository(migrated_db)
+    chs = repo.list_chapters(book_id)
+    full = repo.get_book_text(book_id)
+    texts = {c["ordinal"]: full[c["char_start"] : c["char_end"]] for c in chs}
+
+    class _Draft:
+        def __init__(self, chapter_id, ordinal, mentions):
+            self.chapter_id = chapter_id
+            self.ordinal = ordinal
+            self.mentions = mentions
+            self.claims = []
+            self.entity_tiers = {}
+
+    def materialize_wm(run_id, mids):
+        ch1 = next(c for c in chs if c["ordinal"] == 0)
+        ch3 = next(c for c in chs if c["ordinal"] == 2)
+        for ch, mid in ((ch1, mids[0]), (ch3, mids[1])):
+            materialize_draft(
+                migrated_db,
+                run_id=run_id,
+                book_id=book_id,
+                draft=_Draft(ch["chapter_id"], ch["ordinal"], [(mid, "王明")]),
+                canonical_map={mid: mid},
+                chapter_text=texts[ch["ordinal"]],
+                repo=repo,
+            )
+
+    # 第 1 轮：materialize ch1+ch3 王明 → resolve → 激活（可信历史）
+    run1 = RunManager(migrated_db).create(book_id, input_hash="round1")
+    materialize_wm(run1, ("m_wm_r1a", "m_wm_r1b"))
+    stats1 = ResolutionService(migrated_db).resolve_run(run1, book_id)
+    assert stats1.unresolved == 2, "首轮隔章孤立王明必须 unresolved"
+    from novelcanon.pipeline.validation import Activator
+    from novelcanon.schemas.types import RunStatus
+
+    mgr = RunManager(migrated_db)
+    for f, t in (
+        (RunStatus.CREATED, RunStatus.RUNNING),
+        (RunStatus.RUNNING, RunStatus.VALIDATING),
+        (RunStatus.VALIDATING, RunStatus.READY_TO_ACTIVATE),
+    ):
+        assert mgr.transition(run1, f, t)
+    assert Activator(migrated_db).activate(run1) is None
+
+    # 第 2 轮：新增 run（同章王明，新 mention_id）→ 不得被 run1 的
+    # 未消歧 alias seed 合并，仍走 v3 歧义判断 → unresolved
+    run2 = RunManager(migrated_db).create(book_id, input_hash="round2")
+    materialize_wm(run2, ("m_wm_r2a", "m_wm_r2b"))
+    stats2 = ResolutionService(migrated_db).resolve_run(run2, book_id)
+    with migrated_db.connect() as conn:
+        reasons = conn.execute(
+            text(
+                "SELECT reason, count(*) FROM entity_resolutions"
+                " WHERE run_id = :r GROUP BY reason"
+            ),
+            {"r": run2},
+        ).fetchall()
+    assert stats2.unresolved == 2, (
+        f"次轮王明必须仍 unresolved（run1 未消歧 alias 不得 seed）：{reasons}"
+    )
+    assert "seed-alias" not in dict(reasons), (
+        f"次轮不得出现 seed-alias 合并：{reasons}"
+    )
+    # unresolved_mentions 是 (surface, chapter) 级别的正式产物：首轮已
+    # 登记（唯一约束），次轮同位置 mention 仍未被映射——book 级记录仍在
+    with migrated_db.connect() as conn:
+        wm_unres = conn.execute(
+            text(
+                "SELECT count(*) FROM unresolved_mentions"
+                " WHERE surface_name = '王明'"
+            )
+        ).scalar()
+    assert wm_unres == 2, "首轮 unresolved → 次轮仍 unresolved（P0 回归）"
+
+
+def test_display_name_real_flow_materialize_resolve_activate(
+    tmp_path, migrated_db: Engine
+) -> None:
+    """验收 P0：真实 materialize→resolve→activate 链路中 display_name
+    必须返回非空展示名。
+
+    materialize 写入的 alias.canonical_id 是章级 mention 实体，消歧后
+    查询层经 entity_resolutions 投影——无需手工补写 canonical alias。
+    """
+    from novelcanon.extraction.materialize import materialize_draft
+
+    chapters = [
+        ("第一章", "王明在茶楼独饮，萧炎远远看着他。"),
+    ]
+    epub = tmp_path / "resolve-name.epub"
+    make_fixture_epub(epub, chapters, title="展示名链路")
+    book_id = import_book(migrated_db, epub, book_id="book_resolve_name").book_id
+    repo = Repository(migrated_db)
+    chs = repo.list_chapters(book_id)
+    full = repo.get_book_text(book_id)
+    ch_text = full[chs[0]["char_start"] : chs[0]["char_end"]]
+    run_id = RunManager(migrated_db).create(book_id, input_hash="display-name")
+
+    class _Draft:
+        def __init__(self, chapter_id, ordinal, mentions):
+            self.chapter_id = chapter_id
+            self.ordinal = ordinal
+            self.mentions = mentions
+            self.claims = []
+            self.entity_tiers = {}
+
+    materialize_draft(
+        migrated_db,
+        run_id=run_id,
+        book_id=book_id,
+        draft=_Draft(chs[0]["chapter_id"], 0, [("m_wm", "王明")]),
+        canonical_map={"m_wm": "m_wm"},
+        chapter_text=ch_text,
+        repo=repo,
+    )
+    ResolutionService(migrated_db).resolve_run(run_id, book_id)
+    from novelcanon.pipeline.validation import Activator
+    from novelcanon.schemas.types import RunStatus
+
+    mgr = RunManager(migrated_db)
+    for f, t in (
+        (RunStatus.CREATED, RunStatus.RUNNING),
+        (RunStatus.RUNNING, RunStatus.VALIDATING),
+        (RunStatus.VALIDATING, RunStatus.READY_TO_ACTIVATE),
+    ):
+        assert mgr.transition(run_id, f, t)
+    assert Activator(migrated_db).activate(run_id) is None
+
+    with migrated_db.connect() as conn:
+        canonical = conn.execute(
+            text(
+                "SELECT canonical_id FROM entity_resolutions WHERE mention_id = 'm_wm'"
+            )
+        ).fetchone()[0]
+    q = QueryService(migrated_db, book_id)
+    assert q.display_name(canonical) == "王明", (
+        "真实 materialize→resolve→activate 链路 display_name 必须非空"
+    )
+    # cutoff 语义仍生效（alias 披露 ordinal=0 → cutoff=0 可见）
+    assert q.display_name(canonical, knowledge_cutoff=0) == "王明"
+
+
 def test_materialize_position_anchor_deterministic() -> None:
     """验收 P0：materialize 的位置锚点确定性与文本绑定——同一章同一
     surface 得到相同章节内位置（不依赖抽取次序 / mention_id）。"""

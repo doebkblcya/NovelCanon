@@ -26,7 +26,12 @@ from novelcanon.schemas.envelope import ClaimEnvelope
 from novelcanon.schemas.ids import claim_version_id, event_link_fact_id
 from novelcanon.schemas.memory import EventLinkRecord
 from novelcanon.schemas.payloads import EventLinkPayload
-from novelcanon.schemas.types import ClaimStatus, ClaimType, Operation
+from novelcanon.schemas.types import (
+    ClaimStatus,
+    ClaimType,
+    Operation,
+    WorldValidKind,
+)
 from novelcanon.storage.repository import Repository, now_iso
 
 
@@ -255,6 +260,13 @@ class EventLinkService:
             claim_status=status,
             observed_chapter_id=target.observed_chapter_id,
             observed_ordinal=observed_ordinal,
+            # 图谱边世界有效时间（P1，09 §7）：默认 chapter_proxy——
+            # 事件边在「原因端+结果端证据最大披露章节」成立（世界时间
+            # 近似 = 披露章节；明确 story_time 的边留后续语义标注）。
+            world_valid_kind=WorldValidKind.CHAPTER_PROXY,
+            world_valid_from=observed_ordinal,
+            world_valid_to=None,
+            world_valid_confidence=1.0,
             created_by_run_id=run_id,
             created_at=now_iso(),
             primary_evidence_id=primary_evidence,
@@ -288,22 +300,18 @@ class EventLinkService:
         )
 
     def _source_refs(self, source: EventInfo) -> list[str]:
-        """原因事件的引用表述：参与者 canonical 名 + event_type 标签。"""
+        """源事件的动作/摘要锚点（P0 收紧：**不含参与者**）。
+
+        候选生成本来就要求参与者交集——目标章出现参与者名是必然的，
+        不能作为因果证据。只有源事件的 event_type 标签与 summary 原文
+        出现在目标章（且与强连接词同句）才构成关系证据。
+        """
         refs: list[str] = []
         if source.event_type and len(source.event_type) >= 2:
             refs.append(source.event_type)
-        if not source.participants:
-            return refs
-        with self._engine.connect() as conn:
-            for pid in source.participants:
-                row = conn.execute(
-                    text(
-                        "SELECT canonical_name FROM entities WHERE canonical_id = :c"
-                    ),
-                    {"c": pid},
-                ).fetchone()
-                if row is not None and row[0] not in refs:
-                    refs.append(row[0])
+        summary = (source.summary or "").strip()
+        if len(summary) >= 2:
+            refs.append(summary)
         return refs
 
     def _source_evidence(self, event_claim_version_id: str) -> str | None:

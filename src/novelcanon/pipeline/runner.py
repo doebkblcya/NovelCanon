@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from sqlalchemy import Engine
@@ -206,13 +206,20 @@ class PipelineRunner:
                     return result
                 if schema_check is not None and not schema_check(result.payload):
                     return ProcessResult(failed=True, error="schema 校验失败")
+                # P1 修复：不再用 replace 覆盖 result.usage 的 provider 内部
+                # retry_count；此前外层失败尝试的累计 retry_usage（runner
+                # 重试 + provider 失败尝试的 token/次数）也必须写入账本——
+                # 「失败后成功」与「429 后成功」的调用与 token 不丢失。
+                # retry_usage 已含每次外层失败尝试的 retry_count=1
+                # （attempt == 外层失败次数），直接相加，不重复计外层。
+                usage = result.usage + retry_usage
                 self._ledger.record(
                     LedgerEntry(
                         run_id=self._run_id,
                         book_id=self._book_id,
                         chapter_id=task.chapter_id,
                         stage=stage,
-                        usage=replace(result.usage, retry_count=attempt),
+                        usage=usage,
                     )
                 )
                 return result

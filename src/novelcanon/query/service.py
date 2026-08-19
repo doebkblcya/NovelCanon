@@ -86,7 +86,14 @@ class QueryService:
         return f"IN ({placeholders})", {f"{prefix}{i}": e for i, e in enumerate(scope)}
 
     def display_name(self, canonical_id: str, *, knowledge_cutoff: int | None = None) -> str | None:
-        """某章截止前已披露的展示名（§9.1：只能来自截止前的 alias claim）。"""
+        """某章截止前已披露的展示名（§9.1：只能来自截止前的 alias claim）。
+
+        P0 修复：materialize 写入的 alias.canonical_id 是章级 mention 实体
+        （消歧前的临时实体），展示名查询经 entity_resolutions 投影——
+        COALESCE(er.canonical_id, a.canonical_id) 才是该 alias 对应的最终
+        canonical。真实 materialize→resolve→activate 流程无需手工补写
+        canonical alias 即可返回展示名（历史 claim 不改写，查询层投影）。
+        """
         cutoff_sql = ""
         params: dict[str, object] = {}
         if knowledge_cutoff is not None:
@@ -100,7 +107,9 @@ class QueryService:
                     "SELECT a.surface_name FROM entity_alias_claims a"
                     " JOIN alias_observations o ON o.claim_version_id = a.claim_version_id"
                     " JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
-                    " WHERE a.canonical_id = :cid AND r.status = 'active' AND r.book_id = :book"
+                    " LEFT JOIN entity_resolutions er ON er.mention_id = a.canonical_id"
+                    " WHERE COALESCE(er.canonical_id, a.canonical_id) = :cid"
+                    " AND r.status = 'active' AND r.book_id = :book"
                     f" {cutoff_sql}"
                     " ORDER BY a.observed_ordinal DESC, a.rowid DESC LIMIT 1"
                 ),
@@ -334,6 +343,7 @@ class QueryService:
         event_claim_version_id: str,
         *,
         knowledge_cutoff: int | None = None,
+        world_at: int | None = None,
         max_depth: int = 5,
     ) -> list[dict]:
         """从某事件沿 event_links 递归展开因果链（causes/enables）。
@@ -343,9 +353,13 @@ class QueryService:
         - 路径置信度 = 边置信度乘积；
         - 只走 supported 边；任一端证据在 cutoff 后不可见时截断该分支
           （09 §4「任一端证据在 cutoff 后不可见时，该边不可用于回答」）；
+        - 双时间（P1）：world_at 与 knowledge_cutoff 两个独立参数同时过滤
+          ——图谱边按 world_valid 区间（chapter_proxy：from <= world；
+          story_time：from <= world <= to）过滤，与读者披露独立；
         - 多路径按置信度降序（09 §5）。
         """
         cutoff_sql = ""
+        world_sql = ""
         params: dict[str, object] = {
             "start": event_claim_version_id,
             "book": self._book_id,
@@ -354,6 +368,17 @@ class QueryService:
         if knowledge_cutoff is not None:
             cutoff_sql = "AND l.observed_ordinal <= :cutoff"
             params["cutoff"] = knowledge_cutoff
+        if world_at is not None:
+            world_sql = (
+                " AND ("
+                "   (l.world_valid_kind = 'chapter_proxy'"
+                "    AND l.world_valid_from <= :world)"
+                "   OR (l.world_valid_kind = 'story_time'"
+                "    AND l.world_valid_from <= :world"
+                "    AND (l.world_valid_to IS NULL OR l.world_valid_to >= :world))"
+                " )"
+            )
+            params["world"] = world_at
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
@@ -369,7 +394,7 @@ class QueryService:
                         "  JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
                         "  WHERE l.source_event_id = :start AND r.status = 'active'"
                         "    AND r.book_id = :book AND l.claim_status = 'supported'"
-                        f"    {cutoff_sql}"
+                        f"    {cutoff_sql}{world_sql}"
                         "  UNION ALL"
                         "  SELECT c.src, l.target_event_id,"
                         "         c.path || '>' || l.target_event_id,"
@@ -382,7 +407,7 @@ class QueryService:
                         "  JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
                         "  WHERE r.status = 'active' AND r.book_id = :book"
                         "    AND l.claim_status = 'supported'"
-                        f"    {cutoff_sql}"
+                        f"    {cutoff_sql}{world_sql}"
                         "    AND c.depth < :depth"
                         "    AND instr(c.visited, l.target_event_id) = 0"
                         ")"
@@ -427,6 +452,7 @@ class QueryService:
         event_claim_version_id: str,
         *,
         knowledge_cutoff: int | None = None,
+        world_at: int | None = None,
         max_depth: int = 5,
     ) -> list[dict]:
         """从某事件沿 event_links **反向**找 causes 来源（results 查询）。
@@ -438,8 +464,11 @@ class QueryService:
 
         P1 修复：递归 CTE 初始分支与递归分支都必须限定 relation_type =
         'causes'——enables/prevents 不是 causes 的反向结果，不得混入。
+        P1：world_at（图谱边 world_valid 区间）与 knowledge_cutoff 双参数
+        同时过滤。
         """
         cutoff_sql = ""
+        world_sql = ""
         params: dict[str, object] = {
             "start": event_claim_version_id,
             "book": self._book_id,
@@ -448,6 +477,17 @@ class QueryService:
         if knowledge_cutoff is not None:
             cutoff_sql = "AND l.observed_ordinal <= :cutoff"
             params["cutoff"] = knowledge_cutoff
+        if world_at is not None:
+            world_sql = (
+                " AND ("
+                "   (l.world_valid_kind = 'chapter_proxy'"
+                "    AND l.world_valid_from <= :world)"
+                "   OR (l.world_valid_kind = 'story_time'"
+                "    AND l.world_valid_from <= :world"
+                "    AND (l.world_valid_to IS NULL OR l.world_valid_to >= :world))"
+                " )"
+            )
+            params["world"] = world_at
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
@@ -464,7 +504,7 @@ class QueryService:
                         "  WHERE l.target_event_id = :start AND r.status = 'active'"
                         "    AND r.book_id = :book AND l.claim_status = 'supported'"
                         "    AND l.relation_type = 'causes'"
-                        f"    {cutoff_sql}"
+                        f"    {cutoff_sql}{world_sql}"
                         "  UNION ALL"
                         "  SELECT l.source_event_id, c.tgt,"
                         "         l.source_event_id || '<' || c.path,"
@@ -478,7 +518,7 @@ class QueryService:
                         "  WHERE r.status = 'active' AND r.book_id = :book"
                         "    AND l.claim_status = 'supported'"
                         "    AND l.relation_type = 'causes'"
-                        f"    {cutoff_sql}"
+                        f"    {cutoff_sql}{world_sql}"
                         "    AND c.depth < :depth"
                         "    AND instr(c.visited, l.source_event_id) = 0"
                         ")"
