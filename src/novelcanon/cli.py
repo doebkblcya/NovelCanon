@@ -319,6 +319,64 @@ def _run_extract(
     typer.echo("   run 状态保持 running（阶段 07 证据验证后 activate）")
 
 
+@app.command("resolve")
+def resolve(
+    book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],
+    run_id: Annotated[str | None, typer.Option(help="要消歧的 run_id；缺省取该书最新 running run")] = None,
+) -> None:
+    """阶段 08：实体消歧（mention → canonical，跨 run 稳定）。"""
+    _log_command_invoked("resolve")
+    engine = _open_db()
+    try:
+        _run_resolve(engine, book_id, run_id=run_id)
+    finally:
+        engine.dispose()
+
+
+def _run_resolve(engine: Engine, book_id: str, *, run_id: str | None = None) -> None:
+    """读取 run 的 mention，执行确定性消歧并落库投影/审计。"""
+    from novelcanon.pipeline.run import RunManager
+    from novelcanon.resolution import ResolutionService
+    from novelcanon.storage.repository import Repository
+
+    repo = Repository(engine)
+    if run_id is None:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT run_id FROM extraction_runs WHERE book_id = :b"
+                    " AND status = 'running' ORDER BY started_at DESC LIMIT 1"
+                ),
+                {"b": book_id},
+            ).fetchone()
+        if row is None:
+            typer.echo(f"❌ book={book_id} 没有 running run，请先 novelcanon extract")
+            raise typer.Exit(1)
+        run_id = row[0]
+    run = RunManager(engine).get(run_id)
+    if run is None or run["book_id"] != book_id:
+        typer.echo(f"❌ run={run_id} 不存在或不属于 book={book_id}")
+        raise typer.Exit(1)
+
+    service = ResolutionService(engine)
+    stats = service.resolve_run(run_id, book_id)
+    typer.echo(
+        f"✅ 实体消歧 run={run_id}：mentions={stats.mentions}"
+        f" mapped={stats.mapped} unresolved={stats.unresolved}"
+        f" new_entities={stats.new_entities} merges={stats.merges}"
+    )
+    with engine.connect() as conn:
+        canonical_count = conn.execute(
+            text(
+                "SELECT COUNT(DISTINCT canonical_id) FROM entity_resolutions"
+                " WHERE run_id = :r"
+            ),
+            {"r": run_id},
+        ).scalar()
+    typer.echo(f"   canonical 实体数={canonical_count}")
+    typer.echo("   run 状态保持 running（阶段 09 事件链接与双时间后 activate）")
+
+
 @app.command("align")
 def align(
     book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],

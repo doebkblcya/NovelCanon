@@ -33,6 +33,36 @@ class QueryService:
         self._engine = engine
         self._book_id = book_id
 
+    # ── canonical 展开（阶段 08：mention → canonical 投影解析）────
+
+    def entity_scope(self, canonical_id: str) -> list[str]:
+        """把 canonical 展开为查询用实体集合：canonical 自身 + 名下全部 mention_id。
+
+        阶段 07 materialize 时 claim 实体字段引用 mention_id（章级
+        namespace），阶段 08 消歧后 canonical 是唯一查询入口——查询层
+        经 entity_resolutions 投影展开，历史 claim 不改写（08 §6）。
+        """
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT mention_id FROM entity_resolutions WHERE canonical_id = :c"
+                ),
+                {"c": canonical_id},
+            ).fetchall()
+        scope = [canonical_id] + [r[0] for r in rows]
+        # 去重：canonical 自身可能也是某个 mention（首披露实体作锚）
+        return list(dict.fromkeys(scope))
+
+    @staticmethod
+    def _scope_sql(
+        scope: list[str], prefix: str = "e"
+    ) -> tuple[str, dict[str, object]]:
+        """IN 子句（实体集合展开）。prefix 区分多组占位符。"""
+        if not scope:
+            return "1=0", {}
+        placeholders = ", ".join(f":{prefix}{i}" for i in range(len(scope)))
+        return f"IN ({placeholders})", {f"{prefix}{i}": e for i, e in enumerate(scope)}
+
     def display_name(self, canonical_id: str, *, knowledge_cutoff: int | None = None) -> str | None:
         """某章截止前已披露的展示名（§9.1：只能来自截止前的 alias claim）。"""
         cutoff_sql = ""
@@ -72,7 +102,8 @@ class QueryService:
     def entity_state(self, canonical_id: str, *, knowledge_cutoff: int | None = None) -> list[dict]:
         """实体全部状态字段的当前版本（每 fact 最新 + supported + 非 retract）。"""
         cutoff_sql, params = _cutoff_sql(knowledge_cutoff)
-        params["cid"] = canonical_id
+        scope_sql, scope_params = self._scope_sql(self.entity_scope(canonical_id))
+        params.update(scope_params)
         params["book"] = self._book_id
         with self._engine.connect() as conn:
             rows = (
@@ -88,7 +119,7 @@ class QueryService:
                         "           ORDER BY c._rowid DESC) rn"
                         "  FROM v_active_claims c"
                         "  JOIN state_claims s ON s.claim_version_id = c.claim_version_id"
-                        "  WHERE s.subject_entity_id = :cid AND c.book_id = :book"
+                        "  WHERE s.subject_entity_id " + scope_sql + " AND c.book_id = :book"
                         f"  {cutoff_sql}"
                         ") q"
                         f" WHERE {_current_filter()}"
@@ -110,7 +141,11 @@ class QueryService:
     ) -> list[dict]:
         """一跳关系（from/to 任一为该实体）+ 证据（active，每 fact 当前版本）。"""
         cutoff_sql, params = _cutoff_sql(knowledge_cutoff)
-        params["cid"] = canonical_id
+        scope = self.entity_scope(canonical_id)
+        from_sql, from_params = self._scope_sql(scope, prefix="f")
+        to_sql, to_params = self._scope_sql(scope, prefix="t")
+        params.update(from_params)
+        params.update(to_params)
         params["book"] = self._book_id
         with self._engine.connect() as conn:
             rows = (
@@ -127,8 +162,8 @@ class QueryService:
                         "           ORDER BY c._rowid DESC) rn"
                         "  FROM v_active_claims c"
                         "  JOIN relation_claims r ON r.claim_version_id = c.claim_version_id"
-                        "  WHERE (r.from_entity_id = :cid OR r.to_entity_id = :cid)"
-                        "    AND c.book_id = :book"
+                        "  WHERE (r.from_entity_id " + from_sql + " OR r.to_entity_id "
+                        + to_sql + ") AND c.book_id = :book"
                         f"  {cutoff_sql}"
                         ") q"
                         f" WHERE {_current_filter()}"

@@ -1,1 +1,20 @@
-"""实体消歧：canonical 映射、别名披露、合并审计（阶段 08 实现）。"""
+"""实体消歧（阶段 08，docs/implementation/08）。"""
+
+from novelcanon.resolution.resolver import (
+    EntityResolver,
+    ResolutionPlan,
+    ResolvedMention,
+    normalize_surface,
+    is_generic,
+)
+from novelcanon.resolution.service import ResolutionService, ResolveStats
+
+__all__ = [
+    "EntityResolver",
+    "ResolutionPlan",
+    "ResolvedMention",
+    "ResolutionService",
+    "ResolveStats",
+    "is_generic",
+    "normalize_surface",
+]
