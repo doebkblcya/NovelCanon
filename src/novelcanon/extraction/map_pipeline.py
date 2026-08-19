@@ -164,13 +164,12 @@ def build_map_process_fn(
         for part in parts:
             total_usage = total_usage + part.usage
 
-        last = parts[-1]
         if any(p.parsed is None for p in parts):
             issues = [i for p in parts for i in p.issues] or [
                 Issue("parse_error", "响应解析失败")
             ]
             return ProcessResult(
-                payload=_invalid_payload(issues, last),
+                payload=_invalid_payload(issues, parts),
                 usage=total_usage,
                 failed=True,
                 error=f"Map 响应解析失败：{issues[0].message}",
@@ -186,11 +185,11 @@ def build_map_process_fn(
         draft, issues = validator.validate(merged)
         if draft is not None:
             return ProcessResult(
-                payload=_valid_payload(draft, last),
+                payload=_valid_payload(draft, parts),
                 usage=total_usage,
             )
         return ProcessResult(
-            payload=_invalid_payload(issues, last),
+            payload=_invalid_payload(issues, parts),
             usage=total_usage,
             failed=True,
             error=f"Draft 校验失败：{issues[0].message}",
@@ -199,24 +198,45 @@ def build_map_process_fn(
     return process
 
 
-def _valid_payload(draft: ExtractionDraftV1, last: _SegmentPart) -> dict:
+def _combine_hashes(parts: list[_SegmentPart]) -> str:
+    """多段请求的聚合 hash：全部段的 hash 稳定拼接（06 修复：
+    不再只保存最后一组，全部请求/响应可审计）。"""
+    from novelcanon.config.hash import stable_config_hash
+
+    return stable_config_hash(
+        {
+            "requests": [p.request_hash for p in parts],
+            "responses": [p.response_hash for p in parts],
+        }
+    )
+
+
+def _combine_raw(parts: list[_SegmentPart]) -> str:
+    """多段响应摘要（完整原文过大，保存每段 hash + 前 200 字符）。"""
+    return "\n---\n".join(
+        f"[{p.response_hash[:12]}…] {p.raw_text[:200]}"
+        for p in parts
+    )
+
+
+def _valid_payload(draft: ExtractionDraftV1, parts: list[_SegmentPart]) -> dict:
     return {
         "draft": draft.model_dump(mode="json"),
-        "request_hash": last.request_hash,
-        "response_hash": last.response_hash,
+        "request_hash": _combine_hashes(parts),
+        "response_hash": _combine_hashes(parts),
         "validation_issues": [],
         "status": "valid",
-        "raw_response": last.raw_text,
+        "raw_response": _combine_raw(parts),
     }
 
 
-def _invalid_payload(issues: list[Issue], last: _SegmentPart) -> dict:
+def _invalid_payload(issues: list[Issue], parts: list[_SegmentPart]) -> dict:
     return {
         "draft": None,
-        "request_hash": last.request_hash,
-        "response_hash": last.response_hash,
+        "request_hash": _combine_hashes(parts),
+        "response_hash": _combine_hashes(parts),
         "validation_issues": [{"code": i.code, "message": i.message} for i in issues],
         "status": "invalid",
         "error_summary": issues[0].message if issues else None,
-        "raw_response": last.raw_text,
+        "raw_response": _combine_raw(parts),
     }

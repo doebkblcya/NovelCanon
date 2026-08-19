@@ -17,6 +17,10 @@ class SpanCandidate:
 
     候选必须切自规范化原文（chapter_text[char_start:char_end]），
     hash 可 100% 复现；排序按 literal_match_rate / 距离 / 上下文。
+
+    hard_match_rate：硬锚（实体 surface / relation_raw / value 等 claim
+    内容词）命中率——只有硬锚全部命中的候选才可能支持 claim（P0 修复：
+    字面共现不能直接判定事实成立）。
     """
 
     chapter_id: str
@@ -24,6 +28,7 @@ class SpanCandidate:
     char_end: int
     span_text: str
     literal_match_rate: float = 0.0
+    hard_match_rate: float = 0.0
     score: float = 0.0
     matched_anchors: list[str] = field(default_factory=list)
     total_anchors: int = 0

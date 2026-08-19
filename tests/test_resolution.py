@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from sqlalchemy import Engine, text
 
-from novelcanon.ingestion.normalize import sha256
 from novelcanon.ingestion.service import import_book
 from novelcanon.pipeline import RunManager
 from novelcanon.query import QueryService
@@ -63,21 +62,21 @@ def _seed_mentions(migrated_db: Engine, book_id: str, ids, texts) -> str:
     run_id = RunManager(migrated_db).create(book_id, input_hash="resolve-fixture")
     # 按章写入 mentions（mention_id 章级 namespace，同 stage 07）
     mentions: list[tuple[str, str, str, str]] = []  # (mention_id, chapter, surface, canonical)
-    for ordinal, (title, text) in enumerate(RESOLVE_CHAPTERS):
+    for ordinal, (_title, ch_text) in enumerate(RESOLVE_CHAPTERS):
         ch_id = ids[ordinal]
         prefix = ch_id[:12]
         surfaces = []
-        if "小石" in text:
+        if "小石" in ch_text:
             surfaces.append(("小石", "小石"))
-        if "林风" in text:
+        if "林风" in ch_text:
             surfaces.append(("林风", "林风"))
-        if "林锋" in text:
+        if "林锋" in ch_text:
             surfaces.append(("林锋", "林锋"))
-        if "铁匠" in text:
+        if "铁匠" in ch_text:
             surfaces.append(("铁匠", "铁匠"))
-        if "小荷" in text:
+        if "小荷" in ch_text:
             surfaces.append(("小荷", "小荷"))
-        if "青云子" in text:
+        if "青云子" in ch_text:
             surfaces.append(("青云子", "青云子"))
         for i, (surface, _) in enumerate(surfaces):
             mid = f"{prefix}_m{ordinal}_{i}"
@@ -193,28 +192,43 @@ def test_resolver_seed_alias_identity_reveal() -> None:
 
 
 def test_resolver_idempotent_stable() -> None:
-    """相同输入 → 相同 canonical 分配（可重放）。"""
+    """相同输入 → 相同 canonical 分配（P0：干净重建同输入同 ID）。"""
     r1 = EntityResolver()
     r2 = EntityResolver()
     mentions = [
-        {"mention_id": "a", "surface_name": "萧炎"},
-        {"mention_id": "b", "surface_name": "萧薰儿"},
-        {"mention_id": "c", "surface_name": "萧炎"},
+        {"mention_id": "a", "surface_name": "萧炎", "chapter_id": "ch1"},
+        {"mention_id": "b", "surface_name": "萧薰儿", "chapter_id": "ch1"},
+        {"mention_id": "c", "surface_name": "萧炎", "chapter_id": "ch2"},
     ]
     p1 = r1.resolve(mentions)
     p2 = r2.resolve(mentions)
     m1 = {m.mention_id: m.canonical_id for m in p1.resolved}
     m2 = {m.mention_id: m.canonical_id for m in p2.resolved}
-    # 同一实体必须同 canonical，但两个独立 resolver 实例生成的 UUID 不同——
-    # 稳定性靠 seed（库里 alias）保证，这里验证「组结构」稳定
-    g1 = {}
-    for m in p1.resolved:
-        g1.setdefault(m.canonical_id, set()).add(m.mention_id)
-    g2 = {}
-    for m in p2.resolved:
-        g2.setdefault(m.canonical_id, set()).add(m.mention_id)
-    assert {frozenset(v) for v in g1.values()} == {frozenset(v) for v in g2.values()}
-    assert m1["a"] == m1["c"], "同 run 内同实体必须同 canonical"
+    # 独立 resolver 相同输入必须得到相同 canonical_id（确定性 hash）
+    assert m1 == m2, f"确定性 canonical_id 必须一致：{m1} vs {m2}"
+    assert m1["a"] == m1["c"], "跨章同 surface 必须同 canonical"
+
+
+def test_resolver_same_chapter_same_name_not_merged() -> None:
+    """P0 回归：同一章内两个同 surface mention（同名不同人物）不合并。"""
+    r = EntityResolver()
+    plan = r.resolve(
+        [
+            {"mention_id": "a", "surface_name": "王明", "chapter_id": "ch1"},
+            {"mention_id": "b", "surface_name": "王明", "chapter_id": "ch1"},
+            {"mention_id": "c", "surface_name": "王明", "chapter_id": "ch2"},
+        ]
+    )
+    canonicals = {m.canonical_id for m in plan.resolved}
+    assert len(canonicals) == 3, (
+        f"同章同名不同人物不得误合并（a/b 同章应独立）：{canonicals}"
+    )
+    reasons = {m.mention_id: m.reason for m in plan.resolved}
+    assert reasons["a"] == "same-chapter-name-conflict"
+    # 跨章 c 与 a 的 surface 相同但 a 已冲突 → 独立（保守：不猜测）
+    assert canonicals == {
+        m.canonical_id for m in plan.resolved
+    }  # 三个独立 ID
 
 
 # ── service 落库 + 投影 ────────────────────────────────────────
@@ -281,7 +295,7 @@ def test_cutoff_safe_display_name(tmp_path, migrated_db: Engine) -> None:
     book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
     run_id = _seed_mentions(migrated_db, book_id, ids, texts)
     service = ResolutionService(migrated_db)
-    stats = service.resolve_run(run_id, book_id)
+    service.resolve_run(run_id, book_id)
 
     # 找到 林风 canonical（经 seed alias 小石→林风 合并）
     canonical = None
@@ -300,8 +314,8 @@ def test_cutoff_safe_display_name(tmp_path, migrated_db: Engine) -> None:
 
     # 写 alias claims：小石（ordinal 0 起）与林风（ordinal 3 起）
     repo = Repository(migrated_db)
-    from novelcanon.schemas.memory import AliasClaim
     from novelcanon.schemas.ids import alias_fact_id
+    from novelcanon.schemas.memory import AliasClaim
 
     for surface, ordinal in (("小石", 0), ("林风", 3)):
         repo.write_alias(
@@ -356,7 +370,7 @@ def test_query_scope_expands_mentions(tmp_path, migrated_db: Engine) -> None:
     book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
     run_id = _seed_mentions(migrated_db, book_id, ids, texts)
     service = ResolutionService(migrated_db)
-    stats = service.resolve_run(run_id, book_id)
+    service.resolve_run(run_id, book_id)
 
     # 找 萧炎 类 canonical（此处用 seed 后的小石 canonical 演示）
     q = QueryService(migrated_db, book_id)

@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol
 
 from sqlalchemy import Engine
@@ -47,6 +47,7 @@ from novelcanon.schemas.types import (
     EvidenceStance,
     EvidenceType,
     Operation,
+    WorldValidKind,
 )
 from novelcanon.storage.evidence_policy import aggregate_claim_status
 from novelcanon.storage.repository import Repository, now_iso
@@ -93,19 +94,22 @@ class GoldenClaimLike(Protocol):
 
 
 @dataclass(frozen=True)
-class GoldenDraftLike:
-    """materialize 输入的最小契约（黄金 draft / 未来 Map Draft 的适配面）。
+class GoldenDraftLike(Protocol):
+    """materialize 输入的最小契约（黄金 draft / Map Draft 适配层共用）。
 
     - mentions: (mention_id, surface_name)，mention_id 必须稳定（幂等主键，
       禁止调用方每次生成随机 ID）；
     - entity_tiers: canonical_id → tier（默认 MINOR，不硬编码测试实体）。
+
+    实现方：GoldenDraft（黄金，阶段 05）与 evidence.service._AlignedDraft
+    （Map，阶段 07）都提供这些属性。
     """
 
     chapter_id: str
     ordinal: int
-    mentions: list[tuple[str, str]] = field(default_factory=list)
-    claims: list[GoldenClaimLike] = field(default_factory=list)
-    entity_tiers: Mapping[str, EntityTier] = field(default_factory=dict)
+    mentions: list[tuple[str, str]]
+    claims: list[GoldenClaimLike]
+    entity_tiers: Mapping[str, EntityTier]
 
 
 def _fact_id_for(claim_type: str, fact_fields: Mapping[str, object]) -> str:
@@ -239,6 +243,12 @@ def materialize_draft(
             operation=claim.operation,
             observed_chapter_id=claim.observed_chapter_id,
             observed_ordinal=claim.observed_ordinal,
+            # 世界有效时间（09 §7）：无明确 story_time 时用 chapter_proxy
+            # （world_valid_from = 披露章节，章节近似世界时间）。
+            world_valid_kind=WorldValidKind.CHAPTER_PROXY,
+            world_valid_from=claim.observed_ordinal,
+            world_valid_to=None,
+            world_valid_confidence=1.0,
             created_by_run_id=run_id,
             created_at=now_iso(),
         )

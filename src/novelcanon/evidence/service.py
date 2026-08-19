@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from typing import cast
 
 from sqlalchemy import Engine
 
@@ -29,12 +30,12 @@ from novelcanon.evidence.verifiers import (
     NullEntailmentVerifier,
     Verification,
 )
-from novelcanon.extraction.materialize import materialize_draft
+from novelcanon.extraction.materialize import GoldenDraftLike, materialize_draft
 from novelcanon.schemas.draft import (
     ExtractionDraftV1,
     ProvisionalClaim,
 )
-from novelcanon.schemas.types import EvidenceStance, EvidenceType
+from novelcanon.schemas.types import Operation
 from novelcanon.storage.repository import Repository
 
 _VERIFY_VERSION = "v1"
@@ -163,11 +164,11 @@ class EvidenceService:
                 self._engine,
                 run_id=run_id,
                 book_id=book_id,
-                draft=_AlignedDraft(
+                draft=cast(GoldenDraftLike, _AlignedDraft(  # 结构匹配（Protocol）
                     draft,
                     [c for c, _ in with_evidence],
                     ns,
-                ),
+                )),
                 canonical_map={ns(m_id): ns(m_id) for m_id in mention_surface},
                 chapter_text=chapter_text,
                 repo=self._repo,
@@ -211,7 +212,9 @@ class EvidenceService:
                 claim.provisional_claim_id, "ref_missing", message,
             )
             stats.errors.append(
-                self._error_dict(draft.chapter_id, claim.provisional_claim_id, "ref_missing", message)
+                self._error_dict(
+                    draft.chapter_id, claim.provisional_claim_id, "ref_missing", message
+                )
             )
             return []
 
@@ -228,7 +231,9 @@ class EvidenceService:
                 claim.provisional_claim_id, "no_span_found", message,
             )
             stats.errors.append(
-                self._error_dict(draft.chapter_id, claim.provisional_claim_id, "no_span_found", message)
+                self._error_dict(
+                    draft.chapter_id, claim.provisional_claim_id, "no_span_found", message
+                )
             )
             return []
 
@@ -322,7 +327,7 @@ class _AlignedDraft:
     def __init__(
         self,
         draft: ExtractionDraftV1,
-        claims: list["_AdaptedClaim"],
+        claims: list[_AdaptedClaim],
         ns=None,
     ) -> None:
         self._draft = draft
@@ -344,7 +349,7 @@ class _AlignedDraft:
         ]
 
     @property
-    def claims(self) -> list["_AdaptedClaim"]:
+    def claims(self) -> list[_AdaptedClaim]:
         return self._claims
 
     @property
@@ -377,7 +382,7 @@ class _AdaptedClaim:
     def _ns_payload(self, payload: dict) -> dict:
         """把 payload 中的 mention 引用字段替换为章级 namespace。"""
         out = dict(payload)
-        for field in (
+        for fld in (
             "subject_entity_id",
             "from_entity_id",
             "to_entity_id",
@@ -386,11 +391,11 @@ class _AdaptedClaim:
             "location_entity_id",
             "target_entity_id",
         ):
-            mid = out.get(field)
+            mid = out.get(fld)
             if isinstance(mid, str):
-                out[field] = self._ns(mid)
-        for field in ("related_entity_ids", "participants"):
-            ids = out.get(field)
+                out[fld] = self._ns(mid)
+        for fld in ("related_entity_ids", "participants"):
+            ids = out.get(fld)
             if isinstance(ids, list):
                 out[field] = [self._ns(m) if isinstance(m, str) else m for m in ids]
         return out
@@ -400,7 +405,7 @@ class _AdaptedClaim:
         return self._claim.claim_type.value
 
     @property
-    def operation(self) -> object:
+    def operation(self) -> Operation:
         return self._claim.operation
 
     @property

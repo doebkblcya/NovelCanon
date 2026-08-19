@@ -31,10 +31,17 @@ _PUNCTUATION = re.compile(r"[\s,，。！？；：、．.·…—–-”“\"'�
 
 @dataclass(frozen=True)
 class AnchorTerm:
-    """一条锚文本：surface 与来源（mention surface 或 payload 原文字段）。"""
+    """一条锚文本：surface 与来源（mention surface 或 payload 原文字段）。
+
+    hard=True 为「硬锚」：claim 内容词（实体 surface / relation_raw /
+    value / raw_value / clue_anchor），必须全部在原文命中才能支持 claim；
+    hard=False 为「软锚」：模型概括句（summary / definition），
+    原文不逐字出现，只影响候选排序，不决定支持性。
+    """
 
     text: str
     source: str  # "mention:xxx" / "relation_raw" / "summary" / "value" / ...
+    hard: bool = True
 
 
 def _normalize(text: str) -> str:
@@ -51,25 +58,24 @@ def extract_anchors(
 
     - mention_id 引用（subject_entity_id / from_entity_id / to_entity_id /
       org_entity_id / member_entity_id / related_entity_ids / participants）
-      解析为 surface；
+      解析为 surface（硬锚）；
     - event claim：从 local_events 按 sequence/event_type 匹配，补充
-      participants 的 surface（模型 summary 是概括句，原文无逐字匹配，
-      必须用参与者 surface 锚定）；
-    - payload 的原文字段（relation_raw / summary / value / raw_value /
-      clue_anchor / definition）若非空字符串也作为锚文本。
+      participants 的 surface（硬锚）；
+    - payload 原文字段：relation_raw/value/raw_value/clue_anchor 为硬锚，
+      summary/definition 为软锚（概括句不逐字出现，不决定支持性）。
     """
     anchors: list[AnchorTerm] = []
     seen: set[str] = set()
 
-    def add(text: str, source: str) -> None:
+    def add(text: str, source: str, hard: bool = True) -> None:
         text = (text or "").strip()
         if text and text not in seen:
             seen.add(text)
-            anchors.append(AnchorTerm(text=text, source=source))
+            anchors.append(AnchorTerm(text=text, source=source, hard=hard))
 
     payload = claim.get("payload") or {}
     ctype = claim.get("claim_type", "")
-    # mention_id → surface
+    # mention_id → surface（硬锚）
     for field in (
         "subject_entity_id",
         "from_entity_id",
@@ -102,18 +108,18 @@ def extract_anchors(
                     add(mentions[mid], f"event_participant:{mid}")
             break
 
-    # payload 原文字段
-    for field in (
-        "relation_raw",
-        "summary",
-        "value",
-        "raw_value",
-        "clue_anchor",
-        "definition",
+    # payload 原文字段（硬/软按字段区分）
+    for field, hard in (
+        ("relation_raw", True),
+        ("value", True),
+        ("clue_anchor", True),
+        ("summary", False),
+        ("definition", False),
+        ("raw_value", False),
     ):
         raw = payload.get(field)
         if isinstance(raw, str) and len(raw) >= 2:  # 过短短语不参与锚定
-            add(raw, field)
+            add(raw, field, hard=hard)
     return anchors
 
 
@@ -200,7 +206,12 @@ class SpanCandidateGenerator:
         ) -> SpanCandidate | None:
             if not covered:
                 return None
+            hard_total = sum(1 for a in anchors if a.hard)
+            hard_covered = sum(
+                1 for i in covered if i < len(anchors) and anchors[i].hard
+            )
             rate = len(covered) / len(anchors)
+            hard_rate = hard_covered / hard_total if hard_total else 1.0
             span_text = segment_text[lo:hi]
             return SpanCandidate(
                 chapter_id=chapter_id,
@@ -208,7 +219,9 @@ class SpanCandidateGenerator:
                 char_end=segment_start + hi,
                 span_text=span_text,
                 literal_match_rate=rate,
-                score=rate * 1000 - (hi - lo),
+                hard_match_rate=hard_rate,
+                # 排序：硬锚命中率优先，其次总命中率，其次 span 短
+                score=hard_rate * 1000 + rate * 100 - (hi - lo),
                 matched_anchors=[anchors[i].text for i in sorted(covered)],
                 total_anchors=len(anchors),
             )

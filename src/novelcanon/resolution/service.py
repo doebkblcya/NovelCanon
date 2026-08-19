@@ -17,7 +17,11 @@ from dataclasses import dataclass, field
 from sqlalchemy import Engine, text
 
 from novelcanon.config.hash import stable_config_hash
-from novelcanon.resolution.resolver import EntityResolver, ResolutionPlan
+from novelcanon.resolution.resolver import (
+    EntityResolver,
+    ResolutionPlan,
+    ResolvedMention,
+)
 from novelcanon.schemas.memory import EntityRecord
 from novelcanon.schemas.types import EntityTier
 from novelcanon.storage.repository import Repository, now_iso
@@ -174,7 +178,7 @@ class ResolutionService:
             )
 
     def _record_merge_if_needed(
-        self, run_id: str, item: "ResolvedMention", stats: ResolveStats
+        self, run_id: str, item: ResolvedMention, stats: ResolveStats
     ) -> None:
         """若 mention 曾以自身为实体（阶段 07 的章级 namespace 实体），
         记录 merge 审计（from=原实体 → to=canonical），不物理覆盖历史。"""
@@ -210,7 +214,7 @@ class ResolutionService:
         stats.merges += 1
 
     def _write_unresolved(
-        self, run_id: str, book_id: str, item: "ResolvedMention"
+        self, run_id: str, book_id: str, item: ResolvedMention
     ) -> None:
         # 找到 mention 的章内位置（char_start/char_end/context）
         with self._engine.connect() as conn:

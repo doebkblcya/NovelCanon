@@ -316,3 +316,33 @@ def test_map_repair_retries_structure_errors(tmp_path, migrated_db: Engine) -> N
     assert _staging_counts(migrated_db, run_id) == {"valid": 10}
     assert len(client.calls) == 11  # 10 章 + 1 次结构修复请求
     assert any("上次输出不符合要求" in call for call in client.calls)
+
+
+def test_map_multi_segment_combines_hashes() -> None:
+    """06 修复：多段请求保存全部段的聚合 hash（不只最后一组）。"""
+    from novelcanon.extraction.map_pipeline import _combine_hashes, _combine_raw
+    from novelcanon.generation.client import request_hash, response_hash
+
+    class Part:
+        def __init__(self, req: str, resp: str, raw: str) -> None:
+            self.request_hash = req
+            self.response_hash = resp
+            self.raw_text = raw
+
+    parts = [
+        Part(request_hash("seg0", model="m", profile_id="p"),
+             response_hash('{"mentions": []}'), '{"mentions": []}'),
+        Part(request_hash("seg1", model="m", profile_id="p"),
+             response_hash('{"claims": []}'), '{"claims": []}'),
+    ]
+    combined = _combine_hashes(parts)
+    assert combined, "聚合 hash 非空"
+    # 聚合 hash 与任一单段 hash 不同（证明是全部段的组合）
+    assert combined != parts[0].request_hash
+    assert combined != parts[1].request_hash
+    # 段顺序影响聚合（稳定但敏感）
+    assert _combine_hashes(parts) == combined, "同段序列聚合稳定"
+    # raw 摘要包含每段的响应 hash 前缀
+    raw = _combine_raw(parts)
+    assert parts[0].response_hash[:12] in raw
+    assert parts[1].response_hash[:12] in raw

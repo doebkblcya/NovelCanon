@@ -30,33 +30,28 @@ class Verification:
 
 
 class LiteralVerifier:
-    """确定性字面验证（07 §3、§6）。
+    """确定性字面验证（07 §3、§6，P0 修复）。
 
-    规则：
-    - 候选命中全部锚文本（rate == 1.0）→ supports + direct；
-    - 命中部分锚文本（rate >= 0.5）→ supports + contextual（不伪装 direct）；
-    - 命中过少（rate < 0.5）→ 低置信，返回 None（由调用方决定是否走
-      entailment verifier）。
+    规则（关键收紧）：
+    - **硬锚（实体 surface / relation_raw / value / raw_value / clue_anchor）
+      必须全部命中**（hard_match_rate == 1.0）才可能支持 claim——
+      字面共现（「甲与乙并肩而立」含甲乙）不能判定「甲杀死乙」成立；
+    - 硬锚全命中 → supports + direct（span 切自原文，hash 复现）；
+    - 硬锚未全命中（含部分命中）→ 返回 None（claim 保持 unclear /
+      unverified），不产生 contextual supports 伪装证据；
+    - 软锚（summary/definition 概括句）不参与支持性判定，只影响排序。
+
+    部分匹配不是「弱支持」：它证明原文提到了某些词，但不证明 claim
+    成立。低置信语义判定属于 entailment verifier（07 §6）。
     """
 
-    MIN_RATE_DIRECT = 1.0
-    MIN_RATE_CONTEXTUAL = 0.5
-
     def verify(self, candidate: SpanCandidate) -> Verification | None:
-        rate = candidate.literal_match_rate
-        if rate >= self.MIN_RATE_DIRECT:
+        if candidate.hard_match_rate >= 1.0:
             return Verification(
                 stance=EvidenceStance.SUPPORTS,
                 evidence_type=EvidenceType.DIRECT,
-                literal_match_rate=rate,
+                literal_match_rate=candidate.literal_match_rate,
                 method="literal-match-direct",
-            )
-        if rate >= self.MIN_RATE_CONTEXTUAL:
-            return Verification(
-                stance=EvidenceStance.SUPPORTS,
-                evidence_type=EvidenceType.CONTEXTUAL,
-                literal_match_rate=rate,
-                method="literal-match-contextual",
             )
         return None
 

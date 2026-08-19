@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import httpx
 from tenacity import (
-    retry,
+    AsyncRetrying,
     retry_if_exception,
     stop_after_attempt,
     wait_random_exponential,
@@ -84,16 +84,15 @@ class GenerationClient:
             timeout=httpx.Timeout(profile.timeout_seconds)
         )
         self._call = self._make_retrying_call()
+        # 重试审计（P1 修复）：失败尝试计数 + 锁（并发段请求共享 client）
+        import threading
+
+        self._ledger_lock = threading.Lock()
+        self._retry_attempts = 0
 
     def _make_retrying_call(self) -> Callable[[str], Awaitable[httpx.Response]]:
         profile = self._profile
 
-        @retry(
-            reraise=True,
-            stop=stop_after_attempt(max(1, profile.max_retries)),
-            wait=wait_random_exponential(multiplier=0.5, max=8.0),
-            retry=retry_if_exception(_is_retryable),
-        )
         async def call(prompt: str) -> httpx.Response:
             headers = {"Content-Type": "application/json"}
             if self._api_key:
@@ -106,18 +105,48 @@ class GenerationClient:
             }
             if profile.structured_output_mode in ("json", "json_object"):
                 body["response_format"] = {"type": "json_object"}
-            response = await self._client.post(
-                f"{profile.base_url.rstrip('/')}/chat/completions",
-                headers=headers,
-                json=body,
+            retrying = AsyncRetrying(
+                reraise=True,
+                stop=stop_after_attempt(max(1, profile.max_retries)),
+                wait=wait_random_exponential(multiplier=0.5, max=8.0),
+                retry=retry_if_exception(_is_retryable),
             )
-            response.raise_for_status()
-            return response
+            attempt = 0
+            async for attempt_state in retrying:
+                attempt = attempt_state.retry_state.attempt_number
+                with attempt_state:
+                    try:
+                        response = await self._client.post(
+                            f"{profile.base_url.rstrip('/')}/chat/completions",
+                            headers=headers,
+                            json=body,
+                        )
+                        response.raise_for_status()
+                        return response
+                    except Exception:  # noqa: BLE001
+                        # 每次失败尝试都计入账本（P1 修复：provider 内部
+                        # 重试不再对 runner 不可见）
+                        self._record_retry_attempt(attempt)
+                        raise
+            raise RuntimeError("unreachable: retrying loop exhausted")
 
         return call
 
+    def _record_retry_attempt(self, attempt: int) -> None:
+        """记录一次失败尝试（供账本统计）。
+
+        每次失败的 HTTP 尝试都计数；最终 usage.retry_count = 成功前的
+        失败尝试数（重试次数 = 总尝试 - 成功的那次）。
+        """
+        with self._ledger_lock:
+            self._retry_attempts += 1
+
     async def complete(self, prompt: str) -> GenerationResult:
-        """调用 provider 并解析原始输出 + usage（每次重试单独计量由 runner 记账）。"""
+        """调用 provider 并解析原始输出 + usage。
+
+        传输/限流/服务端错误在 client 内部重试（指数退避），每次失败
+        尝试与最终成功调用都可通过 Usage.retry_count 审计（P1 修复）。
+        """
         response = await self._call(prompt)
         data = response.json()
         content = ""
@@ -126,6 +155,21 @@ class GenerationClient:
             message = choices[0].get("message") or {}
             content = message.get("content") or ""
         usage = self._usage_from(data, prompt, content)
+        # 把本次调用经历的失败尝试并入 usage（runner 记账时可见）
+        with self._ledger_lock:
+            retries = self._retry_attempts
+            self._retry_attempts = 0
+        if retries:
+            usage = Usage(
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                reasoning_tokens=usage.reasoning_tokens,
+                cached_input_tokens=usage.cached_input_tokens,
+                retry_count=usage.retry_count + retries,
+                discarded_tokens=usage.discarded_tokens,
+                provider=usage.provider,
+                model=usage.model,
+            )
         return GenerationResult(raw_text=content, usage=usage)
 
     def _usage_from(self, data: dict, prompt: str, content: str) -> Usage:

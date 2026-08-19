@@ -297,7 +297,34 @@ def test_generation_client_retries_429_then_succeeds() -> None:
         result = await _complete_with_transport(_profile(max_retries=5), handler)
         assert result.raw_text == "ok"
         assert calls["n"] == 3
+        # P1 修复：provider 内部重试必须入账（失败尝试 2 次 → retry_count=2）
+        assert result.usage.retry_count == 2, (
+            f"429 重试 2 次必须计入 retry_count：{result.usage.retry_count}"
+        )
 
+    asyncio.run(main())
+
+
+def test_generation_client_retry_exhaustion_discarded() -> None:
+    """重试耗尽：最终失败为 retryable 错误（runner 会重试/判失败）。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "server busy"})
+
+    async def main() -> None:
+        client = GenerationClient(
+            _profile(max_retries=3),
+            api_key="secret-key",
+            tokenizer=TOK,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        try:
+            await client.complete("prompt")
+        except httpx.HTTPStatusError as exc:
+            assert exc.response.status_code == 503
+        else:
+            raise AssertionError("重试耗尽必须抛错（不可静默返回空）")
+
+    asyncio.run(main())
     asyncio.run(main())
 
 

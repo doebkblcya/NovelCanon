@@ -322,7 +322,9 @@ def _run_extract(
 @app.command("link")
 def link(
     book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],
-    run_id: Annotated[str | None, typer.Option(help="要链接的 run_id；缺省取该书最新 running run")] = None,
+    run_id: Annotated[
+        str | None, typer.Option(help="要链接的 run_id；缺省取最新 running run")
+    ] = None,
 ) -> None:
     """阶段 09：跨章事件链接（causes/enables，可验证因果）。"""
     _log_command_invoked("link")
@@ -337,9 +339,6 @@ def _run_link(engine: Engine, book_id: str, *, run_id: str | None = None) -> Non
     """读取 run 的 event claims，生成并落库跨章因果链接。"""
     from novelcanon.events import EventLinkService
     from novelcanon.pipeline.run import RunManager
-    from novelcanon.storage.repository import Repository
-
-    repo = Repository(engine)
     if run_id is None:
         with engine.connect() as conn:
             row = conn.execute(
@@ -375,7 +374,9 @@ def _run_link(engine: Engine, book_id: str, *, run_id: str | None = None) -> Non
 @app.command("resolve")
 def resolve(
     book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],
-    run_id: Annotated[str | None, typer.Option(help="要消歧的 run_id；缺省取该书最新 running run")] = None,
+    run_id: Annotated[
+        str | None, typer.Option(help="要消歧的 run_id；缺省取最新 running run")
+    ] = None,
 ) -> None:
     """阶段 08：实体消歧（mention → canonical，跨 run 稳定）。"""
     _log_command_invoked("resolve")
@@ -390,9 +391,6 @@ def _run_resolve(engine: Engine, book_id: str, *, run_id: str | None = None) -> 
     """读取 run 的 mention，执行确定性消歧并落库投影/审计。"""
     from novelcanon.pipeline.run import RunManager
     from novelcanon.resolution import ResolutionService
-    from novelcanon.storage.repository import Repository
-
-    repo = Repository(engine)
     if run_id is None:
         with engine.connect() as conn:
             row = conn.execute(
@@ -433,7 +431,9 @@ def _run_resolve(engine: Engine, book_id: str, *, run_id: str | None = None) -> 
 @app.command("align")
 def align(
     book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],
-    run_id: Annotated[str | None, typer.Option(help="要对齐的 run_id；缺省取该书最新 running run")] = None,
+    run_id: Annotated[
+        str | None, typer.Option(help="要对齐的 run_id；缺省取最新 running run")
+    ] = None,
 ) -> None:
     """阶段 07：staging Map Draft → 证据对齐 → materialize（run 保持 running）。"""
     _log_command_invoked("align")

@@ -22,7 +22,7 @@ from novelcanon.schemas.envelope import ClaimEnvelope
 from novelcanon.schemas.ids import claim_version_id, event_link_fact_id
 from novelcanon.schemas.memory import EventLinkRecord
 from novelcanon.schemas.payloads import EventLinkPayload
-from novelcanon.schemas.types import ClaimStatus, Operation
+from novelcanon.schemas.types import ClaimStatus, ClaimType, Operation
 from novelcanon.storage.repository import Repository, now_iso
 
 
@@ -70,7 +70,7 @@ class EventLinkService:
                 conn.execute(
                     text(
                         "SELECT c.claim_version_id, c.fact_id, c.observed_ordinal,"
-                        " c.observed_chapter_id,"
+                        " c.observed_chapter_id, c.claim_status, c.operation,"
                         " e.event_type, e.summary, e.location_entity_id,"
                         " e.sequence_in_chapter, e.narrative_weight"
                         " FROM event_claims e"
@@ -98,6 +98,7 @@ class EventLinkService:
             if not participants:
                 continue
             evidence_ordinals = self._evidence_ordinals(d["claim_version_id"])
+            evidence_stances = self._evidence_stances(d["claim_version_id"])
             events.append(
                 EventInfo(
                     claim_version_id=d["claim_version_id"],
@@ -111,9 +112,23 @@ class EventLinkService:
                     sequence_in_chapter=d["sequence_in_chapter"],
                     narrative_weight=d["narrative_weight"],
                     evidence_ordinals=evidence_ordinals,
+                    claim_status=d.get("claim_status", "supported"),
+                    operation=d.get("operation", "assert"),
+                    evidence_stances=evidence_stances,
                 )
             )
         return events
+
+    def _evidence_stances(self, claim_version_id_value: str) -> list[str]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT evidence_stance FROM claim_evidence"
+                    " WHERE claim_version_id = :v"
+                ),
+                {"v": claim_version_id_value},
+            ).fetchall()
+        return [r[0] for r in rows]
 
     def _canonicalize_participants(self, participants: list[str]) -> list[str]:
         """把 mention 级参与者投影为 canonical 实体（经 entity_resolutions）。
@@ -129,10 +144,7 @@ class EventLinkService:
                     ),
                     {"m": p},
                 ).fetchone()
-                if row is not None:
-                    canonical = row[0]
-                else:
-                    canonical = p  # 已是 canonical（或未消歧，保留原样）
+                canonical = row[0] if row is not None else p  # 已是 canonical 时保留
                 if canonical not in out:
                     out.append(canonical)
         return out
@@ -177,9 +189,17 @@ class EventLinkService:
         observed_ordinal = max(ordinals) if ordinals else max(
             source.observed_ordinal, target.observed_ordinal
         )
-        # 证据覆盖：两端都有证据 → supported；否则 unverified（09 §3）
+        # 边状态判定（P0 修复）：因果边 supported 要求
+        # 1) 两端事件 supported（is_supported 已检查 claim_status/operation/
+        #    evidence stance）；
+        # 2) 边本身有验证依据（rule reason 记录 verification_method）。
+        # 两端事件带 supports 证据 → 边 supported；否则 unverified。
         has_evidence = bool(source.evidence_ordinals and target.evidence_ordinals)
         status = ClaimStatus.SUPPORTED if has_evidence else ClaimStatus.UNVERIFIED
+        # primary_evidence_id（09 §4「默认保存原因端和结果端 evidence」）：
+        # 因果边不新建 claim_evidence 行（event_links 不是 claims 表事实，
+        # FK 约束），而是复用原因端事件的第一个 supports 证据做锚定。
+        primary_evidence = self._source_evidence(source.claim_version_id)
 
         fact_id = event_link_fact_id(
             source.claim_version_id,
@@ -198,7 +218,7 @@ class EventLinkService:
         envelope = ClaimEnvelope(
             fact_id=fact_id,
             claim_version_id=version_id,
-            claim_type="event_link",
+            claim_type=ClaimType.EVENT_LINK,
             operation=Operation.ASSERT,
             confidence=cand.confidence,
             claim_status=status,
@@ -206,8 +226,22 @@ class EventLinkService:
             observed_ordinal=observed_ordinal,
             created_by_run_id=run_id,
             created_at=now_iso(),
+            primary_evidence_id=primary_evidence,
         )
         self._repo.write_event_link(
             EventLinkRecord(envelope=envelope, payload=payload)
         )
         return status
+
+    def _source_evidence(self, event_claim_version_id: str) -> str | None:
+        """原因端事件的第一个 supports 证据 id（边锚定用，09 §4）。"""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT evidence_id FROM claim_evidence"
+                    " WHERE claim_version_id = :v AND evidence_stance = 'supports'"
+                    " ORDER BY rowid LIMIT 1"
+                ),
+                {"v": event_claim_version_id},
+            ).fetchone()
+        return row[0] if row else None

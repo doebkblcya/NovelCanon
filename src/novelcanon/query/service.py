@@ -383,6 +383,78 @@ class QueryService:
             )
             return dict(row) if row else None
 
+    # ── results 反向因果查询（09 §3：results = causes 的反向）────
+
+    def causal_results(
+        self,
+        event_claim_version_id: str,
+        *,
+        knowledge_cutoff: int | None = None,
+        max_depth: int = 5,
+    ) -> list[dict]:
+        """从某事件沿 event_links **反向**找 causes 来源（results 查询）。
+
+        results 通过 causes 的反向查询得到（09 §3，不单独存储）：
+        沿「target_event_id = 当前事件」的边反向展开（被什么原因导致）。
+        与 causal_paths 同构：visited 防环、深度上限、置信度乘积、
+        supported 边、cutoff 截断。
+        """
+        cutoff_sql = ""
+        params: dict[str, object] = {
+            "start": event_claim_version_id,
+            "book": self._book_id,
+            "depth": max_depth,
+        }
+        if knowledge_cutoff is not None:
+            cutoff_sql = "AND l.observed_ordinal <= :cutoff"
+            params["cutoff"] = knowledge_cutoff
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "WITH RECURSIVE causes(src, tgt, path, depth, conf, visited) AS ("
+                        "  SELECT l.source_event_id, l.target_event_id,"
+                        "         l.source_event_id || '<' || l.target_event_id,"
+                        "         1, l.confidence,"
+                        "         '[' || l.source_event_id || ',' || l.target_event_id || ']'"
+                        "  FROM event_links l"
+                        "  JOIN event_link_observations o"
+                        "    ON o.claim_version_id = l.claim_version_id"
+                        "  JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
+                        "  WHERE l.target_event_id = :start AND r.status = 'active'"
+                        "    AND r.book_id = :book AND l.claim_status = 'supported'"
+                        f"    {cutoff_sql}"
+                        "  UNION ALL"
+                        "  SELECT l.source_event_id, c.tgt,"
+                        "         l.source_event_id || '<' || c.path,"
+                        "         c.depth + 1, c.conf * l.confidence,"
+                        "         l.source_event_id || ',' || c.visited"
+                        "  FROM causes c"
+                        "  JOIN event_links l ON l.target_event_id = c.src"
+                        "  JOIN event_link_observations o"
+                        "    ON o.claim_version_id = l.claim_version_id"
+                        "  JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
+                        "  WHERE r.status = 'active' AND r.book_id = :book"
+                        "    AND l.claim_status = 'supported'"
+                        f"    {cutoff_sql}"
+                        "    AND c.depth < :depth"
+                        "    AND instr(c.visited, l.source_event_id) = 0"
+                        ")"
+                        " SELECT src, tgt, path, depth, conf"
+                        " FROM causes ORDER BY conf DESC"
+                    ),
+                    params,
+                )
+                .mappings()
+                .fetchall()
+            )
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["event"] = self._event_summary(d["src"])
+            out.append(d)
+        return out
+
     # ── world at chapter（09 §7，与 knowledge cutoff 独立）──────
 
     def world_state_at(
@@ -390,11 +462,13 @@ class QueryService:
     ) -> list[dict]:
         """某世界时间点（章节序）实体的可见状态。
 
-        chapter_proxy 语义（09 §7）：claim 的 observed_ordinal 是状态
-        披露章节，world_valid_from = observed_ordinal（生效起点）；
-        world at chapter 取「在 chapter_ordinal 时已生效且未被后续
-        版本替代」的状态——即 active 中该 fact 的 observed_ordinal
-        <= chapter_ordinal 且为最新（rn=1）版本。
+        world at chapter（09 §7，P0 修复：不再用 observed_ordinal 冒充
+        世界时间）：
+        - story_time：world_valid_from <= chapter <= world_valid_to
+          （to 为 NULL 表示持续生效）；
+        - chapter_proxy：world_valid_from <= chapter（章节近似世界时间，
+          明确标注为近似）；
+        - unknown：不返回（world time 未知，不能表达为精确状态）。
 
         与 knowledge_cutoff 是两个独立参数：world_at 回答「故事世界
         此时如何」，cutoff 回答「读者此时知道什么」。
@@ -408,17 +482,27 @@ class QueryService:
                 conn.execute(
                     text(
                         "SELECT q.claim_version_id, q.fact_id, q.field, q.value,"
-                        " q.observed_ordinal FROM ("
+                        " q.observed_ordinal, q.world_valid_kind FROM ("
                         " SELECT c.claim_version_id, c.fact_id, c.observed_ordinal,"
-                        " c.operation, c.claim_status, s.field, s.value,"
+                        " c.operation, c.claim_status, c.world_valid_kind,"
+                        " s.field, s.value,"
                         " ROW_NUMBER() OVER (PARTITION BY c.fact_id"
                         "   ORDER BY c._rowid DESC) rn"
                         " FROM v_active_claims c"
                         " JOIN state_claims s ON s.claim_version_id = c.claim_version_id"
                         " WHERE s.subject_entity_id " + scope_sql
-                        + " AND c.book_id = :book AND c.observed_ordinal <= :chapter"
+                        + " AND c.book_id = :book"
+                        " AND ("
+                        "   (c.world_valid_kind = 'story_time'"
+                        "    AND c.world_valid_from <= :chapter"
+                        "    AND (c.world_valid_to IS NULL"
+                        "         OR c.world_valid_to >= :chapter))"
+                        "   OR (c.world_valid_kind = 'chapter_proxy'"
+                        "    AND c.world_valid_from <= :chapter)"
+                        " )"
                         " ) q"
                         f" WHERE {_current_filter()}"
+                        "   AND q.world_valid_kind != 'unknown'"
                     ),
                     params,
                 )

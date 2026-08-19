@@ -16,7 +16,6 @@ from __future__ import annotations
 from sqlalchemy import Engine, text
 
 from novelcanon.events import EventLinkService
-from novelcanon.ingestion.normalize import sha256
 from novelcanon.ingestion.service import import_book
 from novelcanon.pipeline import RunManager
 from novelcanon.pipeline.validation import Activator
@@ -27,9 +26,9 @@ from novelcanon.schemas.memory import EventLinkRecord, EvidenceRecord
 from novelcanon.schemas.payloads import EventLinkPayload, EventPayload
 from novelcanon.schemas.types import (
     ClaimStatus,
+    EventLinkType,
     EvidenceStance,
     EvidenceType,
-    EventLinkType,
     Operation,
     RunStatus,
 )
@@ -349,8 +348,79 @@ def test_unknown_world_time_not_precise(tmp_path, migrated_db: Engine) -> None:
         assert e["observed_ordinal"] == 2, "chapter_proxy 事件必须锚定发生章节"
 
 
+# ── P0 回归：world at chapter 按 world_valid 区间过滤 ─────────
+
+
+def test_world_state_at_respects_world_valid(tmp_path, migrated_db: Engine) -> None:
+    """验收 P0：world_valid_from=5 的 story_time 状态在 world_at=0 不返回；
+    unknown 不表达为精确状态。"""
+    from novelcanon.schemas.envelope import ClaimEnvelope
+    from novelcanon.schemas.payloads import StatePayload
+    from novelcanon.schemas.types import WorldValidKind
+
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    run_id = RunManager(migrated_db).create(book_id, input_hash="world-valid")
+    repo = Repository(migrated_db)
+    repo.upsert_entity(
+        __import__("novelcanon.schemas.memory", fromlist=["EntityRecord"]).EntityRecord(
+            canonical_id="ent_x", canonical_name="X", created_by_run_id=run_id
+        )
+    )
+    from novelcanon.config.hash import stable_config_hash
+    from novelcanon.schemas.ids import state_fact_id
+
+    def add_state(field: str, value: str, kind: WorldValidKind, wfrom: int, wto=None):
+        payload = StatePayload(field=field, value=value, raw_value=value, subject_entity_id="ent_x")
+        fact_id = state_fact_id("ent_x", field)
+        vid = claim_version_id(fact_id, stable_config_hash({"v": value, "k": kind.value}))
+        repo.write_claim(
+            ClaimEnvelope(
+                fact_id=fact_id,
+                claim_version_id=vid,
+                claim_type="state",
+                operation=Operation.ASSERT,
+                claim_status=ClaimStatus.SUPPORTED,
+                observed_chapter_id=ids[0],
+                observed_ordinal=0,
+                world_valid_kind=kind,
+                world_valid_from=wfrom,
+                world_valid_to=wto,
+                world_valid_confidence=1.0,
+                created_by_run_id=run_id,
+                created_at="2026-01-01T00:00:00+00:00",
+            ),
+            payload,
+        )
+        return vid
+
+    add_state("f_story", "晚", WorldValidKind.STORY_TIME, 5)  # 世界时间从第 6 章起
+    add_state("f_proxy", "早", WorldValidKind.CHAPTER_PROXY, 0)  # 第 1 章起
+    add_state("f_unknown", "未知", WorldValidKind.UNKNOWN, 0)  # 未知
+
+    # 激活使可见
+    mgr = RunManager(migrated_db)
+    for f, t in (
+        (RunStatus.CREATED, RunStatus.RUNNING),
+        (RunStatus.RUNNING, RunStatus.VALIDATING),
+        (RunStatus.VALIDATING, RunStatus.READY_TO_ACTIVATE),
+    ):
+        assert mgr.transition(run_id, f, t)
+    assert Activator(migrated_db).activate(run_id) is None
+
+    q = QueryService(migrated_db, book_id)
+    early = {s["field"]: s["value"] for s in q.world_state_at("ent_x", 0)}
+    assert "f_story" not in early, (
+        f"story_time from=5 在 world_at=0 不得返回：{early}"
+    )
+    assert early.get("f_proxy") == "早", "chapter_proxy from=0 在 world_at=0 可见"
+    assert "f_unknown" not in early, "unknown 不得表达为精确状态"
+
+    late = {s["field"]: s["value"] for s in q.world_state_at("ent_x", 6)}
+    assert late.get("f_story") == "晚", "story_time 在 world_at=6（>=from=5）可见"
+
+
 def test_results_reverse_of_causes(tmp_path, migrated_db: Engine) -> None:
-    """results 反向查询与 causes 正向结果一致（09 §3）。"""
+    """results 反向查询与 causes 正向结果一致（09 §3，P1 修复）。"""
     book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
     run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
     _link_events(migrated_db, book_id, run_id)
@@ -362,15 +432,25 @@ def test_results_reverse_of_causes(tmp_path, migrated_db: Engine) -> None:
             )
         ).fetchall()
     assert forward, "应有 causes 边"
-    # 反向 = 每条 causes 边翻转（查询层反向：从 target 找 source）
     q = QueryService(migrated_db, book_id)
+    # 正向：每个 causes 边 src → tgt 在 causal_paths 可达
     for src, tgt in forward:
-        reverse_paths = q.causal_paths(tgt)
-        # 反向查询能定位到 src（在某条路径上）
-        src_ids = {node for p in reverse_paths for node in p["path"].split(">")}
-        # causes 是正向边，reverse 应通过 enabled 反向？—— 此处验证：
-        # causes 的正向结果存在且 target 可被 source 到达
-        assert any(p["path"].startswith(src) for p in q.causal_paths(src))
+        forward_paths = q.causal_paths(src)
+        reachable = {p["event"]["claim_version_id"] for p in forward_paths}
+        assert tgt in reachable, f"causes 边 {src}→{tgt} 应被正向路径覆盖"
+    # 反向：tgt 的 causal_results 必须包含 src（results = causes 反向）
+    for src, tgt in forward:
+        reverse_paths = q.causal_results(tgt)
+        sources = {p["event"]["claim_version_id"] for p in reverse_paths}
+        assert src in sources, (
+            f"causes 边 {src}→{tgt} 的反向 results 必须包含 {src}：{sources}"
+        )
+    # 无 causes 边的目标（如获救，只有 enables 入边）：results 为空或仅 enables 来源
+    with migrated_db.connect() as conn:
+        has_causes = conn.execute(
+            text("SELECT source_event_id FROM event_links WHERE relation_type='causes' LIMIT 1")
+        ).fetchone()
+    assert has_causes is not None
 
 
 def test_dual_time_force_regression_guard(tmp_path, migrated_db: Engine) -> None:
@@ -395,7 +475,7 @@ def test_candidate_recall_rate(tmp_path, migrated_db: Engine) -> None:
     黄金期望：拜师→突破（causes，同地点）；遇险→获救（enables，同参与者）。
     召回率 = 命中的黄金链接 / 黄金链接总数。
     """
-    from novelcanon.events.linker import EventInfo, EventLinker, LinkCandidate
+    from novelcanon.events.linker import EventInfo, EventLinker
     from novelcanon.schemas.types import EventLinkType
 
     # 手工构造黄金事件（模拟 _seed_events 的真实形态）
@@ -405,24 +485,28 @@ def test_candidate_recall_rate(tmp_path, migrated_db: Engine) -> None:
             summary="陆尘拜入青云宗", participants=["ent_luchen"],
             location_entity_id="ent_qingyunzong", observed_ordinal=0,
             observed_chapter_id="ch0", sequence_in_chapter=1,
+            evidence_ordinals=[0], evidence_stances=["supports"],
         ),
         EventInfo(
             claim_version_id="e2", fact_id="f2", event_type="突破",
             summary="陆尘突破至筑基期", participants=["ent_luchen"],
             location_entity_id="ent_qingyunzong", observed_ordinal=1,
             observed_chapter_id="ch1", sequence_in_chapter=1,
+            evidence_ordinals=[1], evidence_stances=["supports"],
         ),
         EventInfo(
             claim_version_id="e3", fact_id="f3", event_type="遇险",
             summary="陆尘遭妖兽围攻", participants=["ent_luchen"],
             location_entity_id=None, observed_ordinal=2,
             observed_chapter_id="ch2", sequence_in_chapter=1,
+            evidence_ordinals=[2], evidence_stances=["supports"],
         ),
         EventInfo(
             claim_version_id="e4", fact_id="f4", event_type="获救",
             summary="药老救下陆尘", participants=["ent_luchen", "ent_yaolao"],
             location_entity_id=None, observed_ordinal=3,
             observed_chapter_id="ch3", sequence_in_chapter=1,
+            evidence_ordinals=[3], evidence_stances=["supports"],
         ),
     ]
     # 黄金期望链接（人工标注）
@@ -430,7 +514,10 @@ def test_candidate_recall_rate(tmp_path, migrated_db: Engine) -> None:
     candidates = EventLinker().generate_candidates(events)
     generated = {(c.source.fact_id, c.target.fact_id) for c in candidates}
     recall = len(golden & generated) / len(golden)
-    assert recall >= 0.5, f"候选召回率 {recall} 过低（黄金 {len(golden)} 条，命中 {len(golden & generated)}）"
+    assert recall >= 0.5, (
+        f"候选召回率 {recall} 过低（黄金 {len(golden)} 条，命中"
+        f" {len(golden & generated)}）"
+    )
     # 拜师→突破 同地点 → causes（强因果）
     causes = {
         (c.source.fact_id, c.target.fact_id)
@@ -438,3 +525,39 @@ def test_candidate_recall_rate(tmp_path, migrated_db: Engine) -> None:
         if c.relation_type == EventLinkType.CAUSES
     }
     assert ("f1", "f2") in causes, "同地点同参与者应为 causes"
+
+
+# ── P0 回归：因果边不消费 rejected / refutes 事件 ─────────────
+
+
+def test_rejected_events_produce_no_supported_link(tmp_path, migrated_db: Engine) -> None:
+    """验收 P0：rejected 事件（refutes 证据）不得生成 supported 因果边。
+
+    两个事件 claim_status=rejected、evidence_stance=refutes，即使同参与者
+    同时间顺序，也不能成为因果边端点 → 无 supported 边生成。
+    """
+    from novelcanon.events.linker import EventInfo, EventLinker
+
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    # 直接构造两个 rejected 事件（模拟验收场景）
+    ev1 = EventInfo(
+        claim_version_id="v1", fact_id="f1", event_type="遭遇",
+        summary="甲在乙面前遇险", participants=["ent_a", "ent_b"],
+        location_entity_id=None, observed_ordinal=0,
+        observed_chapter_id=ids[0], sequence_in_chapter=1,
+        evidence_ordinals=[0], evidence_stances=["refutes"],
+        claim_status="rejected", operation="assert",
+    )
+    ev2 = EventInfo(
+        claim_version_id="v2", fact_id="f2", event_type="救援",
+        summary="乙出手相救", participants=["ent_a", "ent_b"],
+        location_entity_id=None, observed_ordinal=1,
+        observed_chapter_id=ids[1], sequence_in_chapter=1,
+        evidence_ordinals=[1], evidence_stances=["refutes"],
+        claim_status="rejected", operation="assert",
+    )
+    # linker 层面：rejected 事件不产生候选
+    candidates = EventLinker().generate_candidates([ev1, ev2])
+    assert candidates == [], f"rejected 事件不得生成因果候选：{candidates}"
+    # 事件本身 is_supported 必须为 False
+    assert not ev1.is_supported and not ev2.is_supported

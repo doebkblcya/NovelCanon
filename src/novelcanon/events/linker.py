@@ -39,6 +39,20 @@ class EventInfo:
     sequence_in_chapter: int
     narrative_weight: float = 0.5
     evidence_ordinals: list[int] = field(default_factory=list)
+    # P0 修复：事件自身状态与证据立场——因果边只消费 supported、
+    # 非 retract、证据为 supports 的事件（09 §4）
+    claim_status: str = "supported"
+    operation: str = "assert"
+    evidence_stances: list[str] = field(default_factory=list)
+
+    @property
+    def is_supported(self) -> bool:
+        return (
+            self.claim_status == "supported"
+            and self.operation != "retract"
+            and bool(self.evidence_stances)
+            and all(s == "supports" for s in self.evidence_stances)
+        )
 
 
 @dataclass(frozen=True)
@@ -64,6 +78,8 @@ class EventLinker:
         """跨章因果候选（§2 候选阻塞）。
 
         规则：
+        - 只消费 supported 事件（P0：端点事件自身 supported、非 retract、
+          证据为 supports，否则不能成为因果边端点）；
         - 参与者交集非空（canonical 化后）；
         - source.ordinal < target.ordinal（时间窗口）；
         - ordinal 差距不超过 max_ordinal_gap；
@@ -71,13 +87,14 @@ class EventLinker:
         - 排除同章内自链（跨章链接，local causes 已在 Map 阶段处理）。
         """
         candidates: list[LinkCandidate] = []
+        supported = [ev for ev in events if ev.is_supported]
         by_participant: dict[str, list[EventInfo]] = {}
-        for ev in events:
+        for ev in supported:
             for p in ev.participants:
                 by_participant.setdefault(p, []).append(ev)
 
         seen: set[tuple[str, str]] = set()
-        for participant, evs in by_participant.items():
+        for evs in by_participant.values():
             for src in evs:
                 for tgt in evs:
                     if src is tgt:

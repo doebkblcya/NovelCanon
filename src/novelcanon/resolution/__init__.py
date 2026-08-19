@@ -4,8 +4,8 @@ from novelcanon.resolution.resolver import (
     EntityResolver,
     ResolutionPlan,
     ResolvedMention,
-    normalize_surface,
     is_generic,
+    normalize_surface,
 )
 from novelcanon.resolution.service import ResolutionService, ResolveStats
 

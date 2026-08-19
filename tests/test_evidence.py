@@ -176,9 +176,15 @@ def test_ref_mapper_multi_segment_ordering() -> None:
     """多段：相邻 offset 推断终点 + 每段 hash 验证。"""
     seg_text = "第一句。第二句！第三句？"
     refs = [
-        RefSourceSegment(segment_id="seg_0", char_offset=0, segment_content_hash=sha256(seg_text[0:4])),
-        RefSourceSegment(segment_id="seg_1", char_offset=4, segment_content_hash=sha256(seg_text[4:8])),
-        RefSourceSegment(segment_id="seg_2", char_offset=8, segment_content_hash=sha256(seg_text[8:12])),
+        RefSourceSegment(
+            segment_id="seg_0", char_offset=0, segment_content_hash=sha256(seg_text[0:4])
+        ),
+        RefSourceSegment(
+            segment_id="seg_1", char_offset=4, segment_content_hash=sha256(seg_text[4:8])
+        ),
+        RefSourceSegment(
+            segment_id="seg_2", char_offset=8, segment_content_hash=sha256(seg_text[8:12])
+        ),
     ]
     mapped = RefMapper("ch_1", seg_text).map(refs)
     assert mapped["seg_0"].char_end == 4
@@ -261,8 +267,14 @@ def test_primary_evidence_is_direct_supports() -> None:
     agg = EvidenceAggregator()
     result = agg.aggregate(
         [
-            AlignedEvidence("ch", 0, 1, "a", stance=EvidenceStance.SUPPORTS, evidence_type=EvidenceType.CONTEXTUAL),
-            AlignedEvidence("ch", 1, 2, "b", stance=EvidenceStance.SUPPORTS, evidence_type=EvidenceType.DIRECT),
+            AlignedEvidence(
+                "ch", 0, 1, "a",
+                stance=EvidenceStance.SUPPORTS, evidence_type=EvidenceType.CONTEXTUAL,
+            ),
+            AlignedEvidence(
+                "ch", 1, 2, "b",
+                stance=EvidenceStance.SUPPORTS, evidence_type=EvidenceType.DIRECT,
+            ),
         ]
     )
     assert result.primary is not None
@@ -465,3 +477,59 @@ def test_align_real_draft_ref_has_pipeline_segments(tmp_path, migrated_db: Engin
         assert span.char_start == seg.char_start
         assert span.char_end == seg.char_end
         assert span.text == seg.content
+
+
+# ── P0 回归：字面共现不能判定事实成立 ─────────────────────────
+
+
+def test_literal_cooccurrence_not_support(tmp_path, migrated_db: Engine) -> None:
+    """验收 P0：原文「甲与乙并肩而立」，claim「甲杀死乙」不得 supported。
+
+    锚文本硬锚 = [甲, 乙, 杀死]；原文只有「甲」「乙」命中，「杀死」
+    未出现 → hard_match_rate < 1.0 → 不产生 supports 证据 → unverified，
+    错误事实不得进入默认查询。
+    """
+    from novelcanon.evidence.span_candidates import (
+        AnchorTerm,
+        SpanCandidateGenerator,
+    )
+    from novelcanon.evidence.verifiers import LiteralVerifier
+
+    text = "甲与乙并肩而立，众人围观。"
+    anchors = [
+        AnchorTerm("甲", "mention:from_entity_id", hard=True),
+        AnchorTerm("乙", "mention:to_entity_id", hard=True),
+        AnchorTerm("杀死", "relation_raw", hard=True),
+    ]
+    candidates = SpanCandidateGenerator().generate("ch_1", 0, text, anchors)
+    verifier = LiteralVerifier()
+    verified = [
+        v for c in candidates if (v := verifier.verify(c)) is not None
+    ]
+    assert verified == [], (
+        f"「甲与乙并肩而立」不得支持「甲杀死乙」：{verified}"
+    )
+
+
+def test_literal_full_hard_anchor_supports(tmp_path, migrated_db: Engine) -> None:
+    """对照：硬锚全命中才支持（原文「甲杀死了乙」→ supports）。"""
+    from novelcanon.evidence.span_candidates import (
+        AnchorTerm,
+        SpanCandidateGenerator,
+    )
+    from novelcanon.evidence.verifiers import LiteralVerifier
+
+    text = "甲在众人面前杀死了乙，血溅当场。"
+    anchors = [
+        AnchorTerm("甲", "mention:from_entity_id", hard=True),
+        AnchorTerm("乙", "mention:to_entity_id", hard=True),
+        AnchorTerm("杀死", "relation_raw", hard=True),
+    ]
+    candidates = SpanCandidateGenerator().generate("ch_1", 0, text, anchors)
+    verifier = LiteralVerifier()
+    verified = [
+        v for c in candidates if (v := verifier.verify(c)) is not None
+    ]
+    assert verified, "硬锚全命中必须产生 supports"
+    assert verified[0].stance == EvidenceStance.SUPPORTS
+    assert verified[0].evidence_type == EvidenceType.DIRECT
