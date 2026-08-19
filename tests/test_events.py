@@ -272,7 +272,8 @@ def test_causal_paths_loop_safe(tmp_path, migrated_db: Engine) -> None:
     book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
     run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
     _link_events(migrated_db, book_id, run_id)
-    # 手工加一条反向边形成环（获救 → 拜师）
+    # 手工加一条反向边形成环（获救 → 拜师）；外部验证必须携带关系证据
+    # （supported ⇒ verification_method/evidence 非空，P0 硬约束）
     src, tgt = version_ids[3], version_ids[0]
     from novelcanon.schemas.ids import event_link_fact_id
 
@@ -294,6 +295,8 @@ def test_causal_paths_loop_safe(tmp_path, migrated_db: Engine) -> None:
                 created_at="2026-01-01T00:00:00+00:00",
             ),
             payload=payload,
+            verification_method="manual-test",
+            verification_evidence="获救与拜师在同一因果链（测试构造）",
         )
     )
     q = QueryService(migrated_db, book_id)
@@ -642,6 +645,7 @@ def test_causal_results_excludes_enables(tmp_path, migrated_db: Engine) -> None:
     repo = Repository(migrated_db)
 
     def write_link(src, tgt, rtype, ordinal):
+        # 外部验证必须携带关系证据（supported ⇒ method/evidence 非空，P0）
         repo.write_event_link(
             EventLinkRecord(
                 envelope=ClaimEnvelope(
@@ -658,6 +662,8 @@ def test_causal_results_excludes_enables(tmp_path, migrated_db: Engine) -> None:
                 payload=EventLinkPayload(
                     source_event_id=src, target_event_id=tgt, relation_type=rtype
                 ),
+                verification_method="manual-test",
+                verification_evidence="手工标注的因果边（查询过滤测试）",
             )
         )
 
@@ -903,6 +909,62 @@ def test_link_verifier_promotes_evidence_edges(
     )
 
 
+def test_supported_requires_verification_evidence(
+    tmp_path, migrated_db: Engine
+) -> None:
+    """验收 P0：supported 必须有关系证据（method + evidence 非空）——
+    仅凭 envelope.claim_status=supported 写入的边被降级为 unverified，
+    不得进入默认因果回答。"""
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
+    _link_events(migrated_db, book_id, run_id)
+
+    # 手工写一条「声称 supported 但无任何验证信息」的边
+    src, tgt = version_ids[1], version_ids[2]  # 突破 → 遇险
+    from novelcanon.schemas.ids import event_link_fact_id
+
+    repo = Repository(migrated_db)
+    repo.write_event_link(
+        EventLinkRecord(
+            envelope=ClaimEnvelope(
+                fact_id=event_link_fact_id(src, EventLinkType.CAUSES, tgt),
+                claim_version_id="",
+                claim_type="event_link",
+                operation=Operation.ASSERT,
+                claim_status=ClaimStatus.SUPPORTED,  # 无方法/证据
+                observed_chapter_id=ids[2],
+                observed_ordinal=2,
+                created_by_run_id=run_id,
+                created_at="2026-01-01T00:00:00+00:00",
+            ),
+            payload=EventLinkPayload(
+                source_event_id=src, target_event_id=tgt,
+                relation_type=EventLinkType.CAUSES,
+            ),
+        )
+    )
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT v.claim_status, v.verification_method"
+                " FROM event_link_verifications v"
+                " JOIN event_links l ON l.claim_version_id = v.claim_version_id"
+                " WHERE l.source_event_id = :s AND l.target_event_id = :t"
+                " AND v.extraction_run_id = :r"
+            ),
+            {"s": src, "t": tgt, "r": run_id},
+        ).fetchone()
+    assert row is not None and row[0] == "unverified", (
+        f"无证据的 supported 必须被降级：{row}"
+    )
+    # 该边不得进入默认因果回答
+    q = QueryService(migrated_db, book_id)
+    paths = q.causal_paths(src)
+    assert tgt not in {p["event"]["claim_version_id"] for p in paths}, (
+        "无证据边不得进入默认因果回答"
+    )
+
+
 def test_link_verifier_requires_action_anchor_and_strong_connective() -> None:
     """验收 P0：LinkVerifier 不得把时间先后误判为因果。
 
@@ -1063,3 +1125,5 @@ def test_event_link_world_valid_column_constraints(
         raw_insert("chapter_proxy", 1, 1.5)
     with pytest.raises(sqlalchemy.exc.IntegrityError):  # kind 非 unknown 且缺 from
         raw_insert("chapter_proxy", None, 0.8)
+    with pytest.raises(sqlalchemy.exc.IntegrityError):  # kind 不允许 NULL（默认 unknown）
+        raw_insert(None, None, 0.8)

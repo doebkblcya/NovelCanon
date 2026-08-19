@@ -540,13 +540,21 @@ class Repository:
     def _record_verification(
         self, conn: Connection, record: EventLinkRecord, version_id: str
     ) -> None:
-        """本轮验证结论按 run 作用域记录（P0：激活隔离）。
+        """本轮验证结论按 run 作用域记录（P0：激活隔离 + 证据硬约束）。
 
         每个 run 对每条边有独立验证行；查询经 active run 的 observation
         关联该 run 的验证行——未激活 run 的验证结果不得改写 active 查询。
-        claim_status = 本轮验证结论（有 verification_method → supported，
-        否则 unverified）。
+
+        **supported ⇒ 关系证据硬约束**：只有同时携带 verification_method
+        与 verification_evidence（非空）才写 supported；调用方仅凭
+        envelope.claim_status=supported（无方法/证据）会被**降级为
+        unverified**——supported 边必须有可审计的关系证据（数据库约束
+        ck_event_link_verification_supported 兜底）。
         """
+        verified = (
+            record.verification_method is not None
+            and record.verification_evidence is not None
+        )
         conn.execute(
             text(
                 "INSERT OR REPLACE INTO event_link_verifications"
@@ -557,16 +565,9 @@ class Repository:
             {
                 "v": version_id,
                 "run": record.envelope.created_by_run_id,
-                # 有验证方法 → 本轮验证通过；无方法时以 envelope 状态为准
-                # （手工/外部写入 supported 的边保持 supported）。
-                "st": (
-                    "supported"
-                    if record.verification_method is not None
-                    or record.envelope.claim_status.value == "supported"
-                    else "unverified"
-                ),
-                "vm": record.verification_method,
-                "ve": record.verification_evidence,
+                "st": "supported" if verified else "unverified",
+                "vm": record.verification_method if verified else None,
+                "ve": record.verification_evidence if verified else None,
                 "ts": now_iso(),
             },
         )

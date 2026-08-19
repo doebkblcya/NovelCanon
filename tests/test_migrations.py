@@ -1,0 +1,156 @@
+"""迁移测试：0013 回填与 0012 约束（验收 P0/P1）。
+
+覆盖：
+- 从 0012 带多 run 复用数据升级到 head：event_link_verifications 必须为
+  每个 (link, run) 观察关系回填验证行——只按 created_by_run_id 回填会让
+  复用边的 active run 升级后丢失可见性；
+- 0012 world-valid 列约束（NOT NULL kind / 枚举 / confidence / 组合）。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import Engine, text
+
+ALEMBIC_INI = "alembic.ini"
+
+
+def _upgrade(db_path: Path, revision: str) -> None:
+    cfg = Config(ALEMBIC_INI)
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    command.upgrade(cfg, revision)
+
+
+def _seed_multi_run_links(tmp_path, engine: Engine) -> tuple[str, str]:
+    """在 0012 版本库中种子：书 + run1（创建边）+ run2（复用同一边），
+    返回 (book_id, edge_claim_version_id)。"""
+    from novelcanon.ingestion.service import import_book
+    from novelcanon.pipeline import RunManager
+    from novelcanon.schemas.envelope import ClaimEnvelope
+    from novelcanon.schemas.memory import EntityRecord
+    from novelcanon.schemas.payloads import EventPayload
+    from novelcanon.schemas.types import ClaimStatus, EntityTier, Operation
+    from novelcanon.storage.repository import Repository
+    from tests.helpers import make_fixture_epub
+
+    epub = tmp_path / "mig.epub"
+    make_fixture_epub(
+        epub,
+        [("第一章", "陆尘拜入青云宗。"), ("第二章", "陆尘闭关突破。")],
+        title="迁移",
+    )
+    book_id = import_book(engine, epub).book_id
+    repo = Repository(engine)
+    chs = repo.list_chapters(book_id)
+    run1 = RunManager(engine).create(book_id, input_hash="r1")
+    repo.upsert_entity(
+        EntityRecord(
+            canonical_id="ent_luchen", canonical_name="陆尘",
+            tier=EntityTier.CORE, created_by_run_id=run1,
+        )
+    )
+    # 两个事件 claim（source/target）
+    from novelcanon.schemas.ids import event_fact_id, event_link_fact_id
+
+    payloads = [
+        EventPayload(event_type="拜师", summary="陆尘拜入青云宗",
+                     location_entity_id=None, sequence_in_chapter=1),
+        EventPayload(event_type="突破", summary="陆尘闭关突破",
+                     location_entity_id=None, sequence_in_chapter=1),
+    ]
+    vids = []
+    for ordinal, p in enumerate(payloads):
+        fact = event_fact_id(
+            p.event_type, ["ent_luchen"], None, chs[ordinal]["chapter_id"], 1
+        )
+        wr = repo.write_claim(
+            ClaimEnvelope(
+                fact_id=fact, claim_version_id="", claim_type="event",
+                operation=Operation.ASSERT, claim_status=ClaimStatus.SUPPORTED,
+                observed_chapter_id=chs[ordinal]["chapter_id"],
+                observed_ordinal=ordinal, created_by_run_id=run1,
+                created_at="2026-01-01T00:00:00+00:00",
+            ),
+            p,
+        )
+        vids.append(wr.claim_version_id)
+    # run1 创建边（supported，带验证信息）
+    from novelcanon.schemas.types import EventLinkType
+
+    edge_fact = event_link_fact_id(vids[0], EventLinkType.CAUSES, vids[1])
+    edge_id = f"edge_{edge_fact[:20]}"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO event_links (claim_version_id, fact_id,"
+                " source_event_id, target_event_id, relation_type, confidence,"
+                " claim_status, observed_chapter_id, observed_ordinal,"
+                " created_by_run_id, world_valid_kind, world_valid_from,"
+                " world_valid_confidence, verification_method,"
+                " verification_evidence)"
+                " VALUES (:v, :f, :s, :t, 'causes', 0.8, 'supported',"
+                " :ch, 1, :run, 'chapter_proxy', 1, 1.0, 'causal-connective',"
+                " '拜师之后突破（迁移种子）')"
+            ),
+            {
+                "v": edge_id, "f": edge_fact, "s": vids[0], "t": vids[1],
+                "ch": chs[1]["chapter_id"], "run": run1,
+            },
+        )
+    # run2 复用同一边（成员关系 = observations）
+    run2 = RunManager(engine).create(book_id, input_hash="r2")
+    with engine.begin() as conn:
+        for run in (run1, run2):
+            conn.execute(
+                text(
+                    "INSERT INTO event_link_observations (claim_version_id,"
+                    " extraction_run_id, observed_at) VALUES (:v, :run, :ts)"
+                ),
+                {"v": edge_id, "run": run, "ts": "2026-01-01T00:00:00+00:00"},
+            )
+    # run2 是当前 active run（复用者）——升级后它必须有验证行
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE extraction_runs SET status = 'active' WHERE run_id = :r"),
+            {"r": run2},
+        )
+    return book_id, edge_id, vids[0]
+
+
+def test_0013_backfill_from_observations(tmp_path) -> None:
+    """验收 P0：从 0012 带多 run 数据升级到 head，验证行按
+    event_link_observations（成员关系）回填每个 (link, run)——复用边的
+    active run 升级后不丢可见性。"""
+    from novelcanon.storage.engine import create_db_engine
+
+    db = tmp_path / "mig0013.db"
+    engine = create_db_engine(db)
+    _upgrade(db, "0012_event_link_world_valid")
+    book_id, edge_id, src_event = _seed_multi_run_links(tmp_path, engine)
+
+    _upgrade(db, "head")
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT extraction_run_id, claim_status, verification_method"
+                " FROM event_link_verifications WHERE claim_version_id = :e"
+                " ORDER BY extraction_run_id"
+            ),
+            {"e": edge_id},
+        ).fetchall()
+    # 两个 run（创建者 + 复用者）都必须有验证行
+    assert len(rows) == 2, f"每个 (link, run) 观察关系都必须回填：{rows}"
+    assert all(r[1] == "supported" for r in rows), (
+        f"回填状态 = 全局 supported（带方法/证据）：{rows}"
+    )
+    assert all(r[2] == "causal-connective" for r in rows)
+
+    # active run（run2，复用者）升级后因果查询仍可见（INNER JOIN 不丢边）
+    from novelcanon.query import QueryService
+
+    q = QueryService(engine, book_id)
+    paths = q.causal_paths(src_event)
+    assert paths, "复用边的 active run 升级后必须仍可见"
