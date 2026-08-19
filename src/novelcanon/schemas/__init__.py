@@ -1,4 +1,101 @@
-"""领域 Schema：ExtractionDraftV1 / CanonicalMemoryV4 / claim envelope（阶段 02 实现）。
+"""领域 Schema：ExtractionDraftV1 / CanonicalMemoryV4 / claim envelope（阶段 02）。
 
 Pydantic 模型单一来源，自动导出 JSON Schema 供 LLM 结构化输出（ADR-0003）。
 """
+
+from novelcanon.schemas.catalog import STATE_CATALOG_V1, OntologyVersion, StateCatalogEntry
+from novelcanon.schemas.draft import ExtractionDraftV1, ProvisionalClaim, RefSourceSegment
+from novelcanon.schemas.envelope import ClaimEnvelope, ClaimObservation
+from novelcanon.schemas.ids import (
+    SCHEMA_VERSION,
+    alias_fact_id,
+    claim_version_id,
+    event_fact_id,
+    event_link_fact_id,
+    evidence_id,
+    foreshadow_fact_id,
+    new_uuid_id,
+    org_fact_id,
+    payload_hash,
+    raw_chunk_id,
+    relation_fact_id,
+    state_fact_id,
+    term_definition_fact_id,
+)
+from novelcanon.schemas.memory import (
+    AliasClaim,
+    CanonicalMemoryV4,
+    ClaimRecord,
+    EntityRecord,
+    EventLinkRecord,
+    EvidenceRecord,
+)
+from novelcanon.schemas.payloads import (
+    EventLinkPayload,
+    EventParticipant,
+    EventPayload,
+    ForeshadowPayload,
+    OrgPayload,
+    RelationPayload,
+    StatePayload,
+    TermDefinitionPayload,
+)
+from novelcanon.schemas.types import (
+    ClaimStatus,
+    ClaimType,
+    EntityTier,
+    EventLinkType,
+    EvidenceStance,
+    EvidenceType,
+    Operation,
+    RunStatus,
+    WorldValidKind,
+)
+
+__all__ = [
+    "STATE_CATALOG_V1",
+    "AliasClaim",
+    "CanonicalMemoryV4",
+    "ClaimEnvelope",
+    "ClaimObservation",
+    "ClaimRecord",
+    "ClaimStatus",
+    "ClaimType",
+    "EntityRecord",
+    "EntityTier",
+    "EventLinkPayload",
+    "EventLinkRecord",
+    "EventLinkType",
+    "EventParticipant",
+    "EventPayload",
+    "EvidenceRecord",
+    "EvidenceStance",
+    "EvidenceType",
+    "ExtractionDraftV1",
+    "ForeshadowPayload",
+    "OntologyVersion",
+    "Operation",
+    "OrgPayload",
+    "ProvisionalClaim",
+    "RefSourceSegment",
+    "RelationPayload",
+    "RunStatus",
+    "SCHEMA_VERSION",
+    "StateCatalogEntry",
+    "StatePayload",
+    "TermDefinitionPayload",
+    "WorldValidKind",
+    "alias_fact_id",
+    "claim_version_id",
+    "evidence_id",
+    "event_fact_id",
+    "event_link_fact_id",
+    "foreshadow_fact_id",
+    "new_uuid_id",
+    "org_fact_id",
+    "payload_hash",
+    "raw_chunk_id",
+    "relation_fact_id",
+    "state_fact_id",
+    "term_definition_fact_id",
+]
