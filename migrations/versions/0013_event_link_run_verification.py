@@ -57,12 +57,15 @@ def upgrade() -> None:
             "claim_status IN ('unverified','supported','contested','rejected')",
             name="ck_event_link_verification_status",
         ),
-        # supported ⇒ 关系证据硬约束：方法 + 证据必须同时**非空**
-        # （trim 后 length > 0——空字符串/纯空白视为缺失，P0）
+        # supported ⇒ 关系证据硬约束：方法 + 证据必须同时**非空**。
+        # 注意 SQLite 的 CHECK 对 NULL 表达式视为通过——length(trim(NULL))
+        # 返回 NULL，整个约束也为 NULL 而放行；必须用
+        # COALESCE(length(trim(...)), 0) > 0 兜底：NULL、空字符串、纯空白
+        # 一律视为缺失（P0）。
         sa.CheckConstraint(
             "claim_status != 'supported' OR"
-            " (length(trim(verification_method)) > 0"
-            " AND length(trim(verification_evidence)) > 0)",
+            " (COALESCE(length(trim(verification_method)), 0) > 0"
+            " AND COALESCE(length(trim(verification_evidence)), 0) > 0)",
             name="ck_event_link_verification_supported",
         ),
     )

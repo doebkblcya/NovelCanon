@@ -1206,3 +1206,50 @@ def test_event_link_verification_status_enum(tmp_path, migrated_db: Engine) -> N
             ),
             {"v": row[0], "r": row[1]},
         )
+
+
+def test_event_link_verification_null_evidence_rejected(
+    tmp_path, migrated_db: Engine
+) -> None:
+    """验收 P0：绕过 Repository 直接写 supported + NULL 证据必须被拒绝。
+
+    SQLite 的 CHECK 对 NULL 表达式视为通过（length(trim(NULL)) 为 NULL，
+    整个约束也为 NULL 而放行）——约束必须用
+    COALESCE(length(trim(...)), 0) > 0 兜底。
+    """
+    import pytest
+
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
+    _link_events(migrated_db, book_id, run_id)
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT claim_version_id, extraction_run_id FROM"
+                " event_link_verifications LIMIT 1"
+            )
+        ).fetchone()
+    assert row is not None
+
+    # supported + NULL/NULL 证据 → 拒绝
+    with pytest.raises(sqlalchemy.exc.IntegrityError), migrated_db.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT OR REPLACE INTO event_link_verifications"
+                " (claim_version_id, extraction_run_id, claim_status,"
+                "  verification_method, verification_evidence, verified_at)"
+                " VALUES (:v, :r, 'supported', NULL, NULL, '2026-01-01')"
+            ),
+            {"v": row[0], "r": row[1]},
+        )
+    # 对照：unverified + NULL 证据合法
+    with migrated_db.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT OR REPLACE INTO event_link_verifications"
+                " (claim_version_id, extraction_run_id, claim_status,"
+                "  verification_method, verification_evidence, verified_at)"
+                " VALUES (:v, :r, 'unverified', NULL, NULL, '2026-01-01')"
+            ),
+            {"v": row[0], "r": row[1]},
+        )
