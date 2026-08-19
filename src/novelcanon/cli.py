@@ -164,6 +164,14 @@ def _cli_generation_profile(concurrency: int) -> GenerationProfile:
     return profile
 
 
+def _is_real_chapter(ch: dict) -> bool:
+    """正文章判定：跳过目录页与空章/版权页等噪音条目（无实质正文）。"""
+    if ch["title"] == "（目录）":
+        return False
+    chars = (ch["char_end"] or 0) - (ch["char_start"] or 0)
+    return chars >= 50
+
+
 def _tokenizer_for(profile: GenerationProfile):
     """按 profile.tokenizer_id 构造 tokenizer（fake-v1 / tiktoken-*）。"""
     from novelcanon.retrieval.tokenizer import FakeTokenizer, TiktokenAdapter
@@ -204,11 +212,11 @@ def _run_extract(
     profile = _cli_generation_profile(concurrency)
     prompts = default_map_prompts()
     repo = Repository(engine)
-    chapters = repo.list_chapters(book_id)
+    chapters = [ch for ch in repo.list_chapters(book_id) if _is_real_chapter(ch)]
     if limit is not None:
         chapters = chapters[:limit]
     if not chapters:
-        typer.echo(f"❌ book={book_id} 没有章节，请先 novelcanon import")
+        typer.echo(f"❌ book={book_id} 没有可抽取章节，请先 novelcanon import")
         raise typer.Exit(1)
 
     tokenizer = _tokenizer_for(profile)

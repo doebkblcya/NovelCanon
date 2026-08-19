@@ -89,7 +89,7 @@ class AppSettings(BaseSettings):
     llm_base_url: str = ""
     llm_api_key: str = Field(default="", exclude=True)
     llm_context_window: int = 8192
-    llm_max_output: int = 2048
+    llm_max_output: int = 4096
     llm_mode: str = "json_object"
     llm_tokenizer: str = "fake-v1"
 

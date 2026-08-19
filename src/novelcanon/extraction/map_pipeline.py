@@ -73,10 +73,17 @@ def build_map_process_fn(
     )
 
     async def _request_segment(
-        seg: SourceSegment, ref_lines: list[str]
+        seg: SourceSegment, ref_lines: list[str], chapter_id: str, ordinal: int
     ) -> _SegmentPart:
         usage = Usage()
-        prompt = build_map_prompt(prompts, seg.content, ref_segment_lines=ref_lines)
+        prompt = build_map_prompt(
+            prompts,
+            seg.content,
+            book_id=book_id,
+            chapter_id=chapter_id,
+            chapter_ordinal=ordinal,
+            ref_segment_lines=ref_lines,
+        )
         req_hash = request_hash(prompt, model=profile.model, profile_id=profile.profile_id)
         result: GenerationResult = await client.complete(prompt)
         usage = usage + result.usage
@@ -88,6 +95,9 @@ def build_map_process_fn(
             repair_prompt = build_map_prompt(
                 prompts,
                 seg.content,
+                book_id=book_id,
+                chapter_id=chapter_id,
+                chapter_ordinal=ordinal,
                 ref_segment_lines=ref_lines,
                 repair_issues=[i.message for i in issues],
             )
@@ -136,9 +146,19 @@ def build_map_process_fn(
     async def process(task: ChapterTask) -> ProcessResult:
         segments = split_for_window(task.content, tokenizer, window_tokens)
         refs = build_ref_segments(task.chapter_id, segments)
-        ref_lines = ref_segment_prompt_lines(task.chapter_id, segments)
+        ref_line_by_seg = {
+            seg.segment_id: line
+            for seg, line in zip(
+                segments,
+                ref_segment_prompt_lines(task.chapter_id, segments),
+                strict=True,
+            )
+        }
 
-        parts = await asyncio.gather(*[_request_segment(seg, ref_lines) for seg in segments])
+        parts = await asyncio.gather(*[
+            _request_segment(seg, [ref_line_by_seg[seg.segment_id]], task.chapter_id, task.ordinal)
+            for seg in segments
+        ])
 
         total_usage = Usage()
         for part in parts:

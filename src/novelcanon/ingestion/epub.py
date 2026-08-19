@@ -405,18 +405,37 @@ def verify_chapter_range(book: ParsedBook, chapter: RawChapter) -> str:
     return book.normalized.text[chapter.char_start : chapter.char_end]
 
 
-def _is_toc_entry(entry_text: str) -> bool:
-    """条目级目录页判定：≥5 个非空行且 ≥90% 是章/卷标题或导航词。
+# 行内章标题前缀（无行首锚定，用于紧凑单行目录识别）
+_INLINE_TITLE_RE = re.compile(r"第[零〇一二两三四五六七八九十百千万0-9０-９]+[章回节卷部集]")
 
-    目录页（书首大目录、卷目录）整体作为一章（标题「（目录）」），
-    避免目录行污染正文章；条目内的零星目录行由章级清理处理。
+
+def _is_title_list(text: str) -> bool:
+    """紧凑标题列表判定：≥8 个行内章标题前缀且标题间平均跨度 < 100 字符。
+
+    覆盖 EPUB 单行/紧凑目录（所有章标题以空白分隔成一行，splitlines
+    只有 1 行，行级判定失效）；真章正文不会成片出现 8 个以上「第X章」。
+    """
+    matches = list(_INLINE_TITLE_RE.finditer(text))
+    if len(matches) < 8:
+        return False
+    avg_gap = (matches[-1].start() - matches[0].start()) / (len(matches) - 1)
+    return avg_gap < 100
+
+
+def _is_toc_entry(entry_text: str) -> bool:
+    """条目级目录页判定。
+
+    多行目录：≥5 个非空行且 ≥90% 是章/卷标题或导航词；
+    单行/紧凑目录（EPUB 常见）：行内标题列表判定。
+    目录页整体作为一章（标题「（目录）」），避免目录行污染正文章。
     """
     lines = [line.strip() for line in entry_text.splitlines() if line.strip()]
-    if len(lines) < 5:
-        return False
-    nav_words = {"目录", "正文", "楔子", "序章", "卷首语", "前言", "后记", "尾页"}
-    bad = [line for line in lines if not (TITLE_PREFIX_RE.match(line) or line in nav_words)]
-    return len(bad) / len(lines) < 0.1
+    if len(lines) >= 5:
+        nav_words = {"目录", "正文", "楔子", "序章", "卷首语", "前言", "后记", "尾页"}
+        bad = [line for line in lines if not (TITLE_PREFIX_RE.match(line) or line in nav_words)]
+        if len(bad) / len(lines) < 0.1:
+            return True
+    return _is_title_list(entry_text)
 
 
 def _postprocess_toc_lines(chapters: list[RawChapter], full_text: str) -> list[RawChapter]:

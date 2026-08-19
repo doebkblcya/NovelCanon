@@ -24,7 +24,9 @@ DEFAULT_SYSTEM_INSTRUCTION = """\
 5. 把握不准的实体提及放入 unresolved，不参与 claims。
 6. relation/event/state 的枚举值尽量标准化；无法标准化的原文短语放入 raw 字段。
 7. provisional_claims 的 ref_source_segment_id 必须引用下方「可用原文段」中给出的段 ID。
-8. 只输出 JSON 对象本身，不要任何解释或 Markdown 围栏。"""
+8. ref_source_segments 字段由系统填充，你无需生成内容（输出空数组即可）；
+   provisional_claims 的 ref_source_segment_id 引用下方「可用原文段」给出的段 ID。
+9. 只输出 JSON 对象本身，不要任何解释或 Markdown 围栏。"""
 
 
 @dataclass(frozen=True)
@@ -59,16 +61,33 @@ def build_map_prompt(
     prompts: MapPrompts,
     chapter_text: str,
     *,
+    book_id: str | None = None,
+    chapter_id: str | None = None,
+    chapter_ordinal: int | None = None,
     chapter_title: str | None = None,
     book_title: str | None = None,
     ref_segment_lines: list[str] | None = None,
     repair_issues: list[str] | None = None,
 ) -> str:
-    """固定排列：固定上下文 → 章节正文 → 可用段 → Schema → 输出指令。
+    """固定排列：固定上下文 → 元数据 → 章节正文 → 可用段 → Schema → 输出指令。
 
+    book_id / chapter_id / chapter_ordinal 为本章输入侧元数据，必须原样填入
+    输出 Draft（模型不得自行编造——06 校验层 7 业务不变量会拒绝）。
     repair_issues 非空时附加「上次输出不符合要求」段（结构修复请求，06 §4）。
     """
     parts: list[str] = [f"[系统指令]\n{prompts.system_instruction}"]
+    if book_id is not None or chapter_id is not None or chapter_ordinal is not None:
+        meta = []
+        if book_id is not None:
+            meta.append(f"book_id：{book_id}")
+        if chapter_id is not None:
+            meta.append(f"chapter_id：{chapter_id}")
+        if chapter_ordinal is not None:
+            meta.append(f"chapter_ordinal：{chapter_ordinal}")
+        parts.append(
+            "[元数据]（输出 Draft 时必须原样使用下列值，禁止自行填写或留空）\n"
+            + "\n".join(meta)
+        )
     if book_title or chapter_title:
         parts.append(
             f"[书籍/章节]\n书：{book_title or '（未知）'}；章：{chapter_title or '（未知）'}"
