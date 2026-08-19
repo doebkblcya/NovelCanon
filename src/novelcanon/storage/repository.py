@@ -545,6 +545,34 @@ class Repository:
                 {"s": status, "v": claim_version_id_value},
             )
 
+    def ensure_term(self, term_id: str, chapter_id: str, ordinal: int) -> None:
+        """确保术语存在（terms 表，term_definition claim 的 FK 前置，阶段 07）。"""
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT OR IGNORE INTO terms (term_id, canonical_name,"
+                    " first_observed_ordinal, created_at)"
+                    " VALUES (:t, :name, :ord, :ts)"
+                ),
+                {
+                    "t": term_id,
+                    "name": term_id,
+                    "ord": ordinal,
+                    "ts": now_iso(),
+                },
+            )
+
+    def set_primary_evidence(self, claim_version_id_value: str, evidence_id_value: str) -> None:
+        """设置 primary_evidence_id（只用于查询加速，07 §5）。"""
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE claims SET primary_evidence_id = :e"
+                    " WHERE claim_version_id = :v"
+                ),
+                {"e": evidence_id_value, "v": claim_version_id_value},
+            )
+
     # ── entities / aliases / mentions / merge ──────────────────
 
     def upsert_entity(self, entity: EntityRecord) -> None:
@@ -678,6 +706,94 @@ class Repository:
                     "ts": now_iso(),
                 },
             )
+
+    # ── evidence errors（阶段 07：对齐失败审计）─────────────────
+
+    def write_evidence_error(
+        self,
+        *,
+        error_id: str,
+        run_id: str,
+        book_id: str,
+        chapter_id: str,
+        claim_id: str = "",
+        ref_segment_id: str = "",
+        stage: str,
+        error_code: str,
+        message: str,
+    ) -> bool:
+        """写入一条证据对齐错误（幂等：唯一约束 + INSERT OR IGNORE）。"""
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    "INSERT OR IGNORE INTO evidence_errors (error_id, run_id, book_id,"
+                    " chapter_id, claim_id, ref_segment_id, stage, error_code, message,"
+                    " created_at) VALUES (:eid, :run, :book, :ch, :cid, :ref, :st, :code,"
+                    " :msg, :ts)"
+                ),
+                {
+                    "eid": error_id,
+                    "run": run_id,
+                    "book": book_id,
+                    "ch": chapter_id,
+                    "cid": claim_id,
+                    "ref": ref_segment_id,
+                    "st": stage,
+                    "code": error_code,
+                    "msg": message,
+                    "ts": now_iso(),
+                },
+            )
+            return result.rowcount == 1
+
+    def list_evidence_errors(self, run_id: str) -> list[dict]:
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT * FROM evidence_errors WHERE run_id = :r"
+                        " ORDER BY chapter_id, claim_id"
+                    ),
+                    {"r": run_id},
+                )
+                .mappings()
+                .fetchall()
+            )
+            return [dict(r) for r in rows]
+
+    # ── staging（阶段 07：读取 Map Draft 做证据对齐）────────────
+
+    def list_valid_map_drafts(self, run_id: str) -> list[dict]:
+        """某 run 全部 valid Draft（draft_json + 章定位）。"""
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT draft_id, run_id, book_id, chapter_id, ordinal,"
+                        " content_hash, draft_json FROM map_drafts"
+                        " WHERE run_id = :r AND status = 'valid' ORDER BY ordinal"
+                    ),
+                    {"r": run_id},
+                )
+                .mappings()
+                .fetchall()
+            )
+            return [dict(r) for r in rows]
+
+    def chapter_text_for(self, book_id: str, chapter_id: str) -> str:
+        """某章规范化正文（book 全文 + 章区间）。"""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT char_start, char_end FROM chapters WHERE chapter_id = :c"
+                    " AND book_id = :b"
+                ),
+                {"c": chapter_id, "b": book_id},
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"chapter {chapter_id} 不存在（book {book_id}）")
+        full = self.get_book_text(book_id)
+        return full[row[0] : row[1]]
 
     # ── 查询（默认只读 active run，阶段 02 视图）────────────────
 

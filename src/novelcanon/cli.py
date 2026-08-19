@@ -11,7 +11,7 @@ from typing import Annotated
 
 import structlog
 import typer
-from sqlalchemy import Engine
+from sqlalchemy import Engine, text
 
 from novelcanon import __version__
 from novelcanon.config.settings import AppSettings, GenerationProfile
@@ -317,6 +317,70 @@ def _run_extract(
         f" tokens={report['tokens'].get('total', 0)}"
     )
     typer.echo("   run 状态保持 running（阶段 07 证据验证后 activate）")
+
+
+@app.command("align")
+def align(
+    book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],
+    run_id: Annotated[str | None, typer.Option(help="要对齐的 run_id；缺省取该书最新 running run")] = None,
+) -> None:
+    """阶段 07：staging Map Draft → 证据对齐 → materialize（run 保持 running）。"""
+    _log_command_invoked("align")
+    engine = _open_db()
+    try:
+        _run_align(engine, book_id, run_id=run_id)
+    finally:
+        engine.dispose()
+
+
+def _run_align(engine: Engine, book_id: str, *, run_id: str | None = None) -> None:
+    """读取 staging valid Draft，执行证据对齐并 materialize；run 保持 running。"""
+    from novelcanon.evidence import EvidenceService
+    from novelcanon.pipeline.run import RunManager
+    from novelcanon.schemas.types import RunStatus
+    from novelcanon.storage.repository import Repository
+
+    repo = Repository(engine)
+    if run_id is None:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT run_id FROM extraction_runs WHERE book_id = :b"
+                    " AND status = 'running' ORDER BY started_at DESC LIMIT 1"
+                ),
+                {"b": book_id},
+            ).fetchone()
+        if row is None:
+            typer.echo(f"❌ book={book_id} 没有 running run，请先 novelcanon extract")
+            raise typer.Exit(1)
+        run_id = row[0]
+    run = RunManager(engine).get(run_id)
+    if run is None or run["book_id"] != book_id:
+        typer.echo(f"❌ run={run_id} 不存在或不属于 book={book_id}")
+        raise typer.Exit(1)
+    if run["status"] != RunStatus.RUNNING.value:
+        typer.echo(f"⚠️  run={run_id} 状态为 {run['status']}（期望 running），继续对齐")
+    if not repo.list_valid_map_drafts(run_id):
+        typer.echo(f"❌ run={run_id} 没有 valid staging Draft，请先 novelcanon extract")
+        raise typer.Exit(1)
+
+    service = EvidenceService(engine)
+    stats = service.align_run(run_id, book_id)
+    typer.echo(
+        f"✅ 证据对齐 run={run_id}：章节={stats.chapters}"
+        f" claims={stats.claims} evidence={stats.evidence}"
+    )
+    typer.echo(
+        "   状态分布：" + " ".join(f"{k}={v}" for k, v in sorted(stats.statuses.items()))
+    )
+    if stats.errors:
+        by_code: dict[str, int] = {}
+        for e in stats.errors:
+            by_code[e["error_code"]] = by_code.get(e["error_code"], 0) + 1
+        typer.echo(
+            "   ⚠️  证据错误：" + " ".join(f"{k}={v}" for k, v in sorted(by_code.items()))
+        )
+    typer.echo("   run 状态保持 running（阶段 09 事件链接与双时间后 activate）")
 
 
 @app.command()

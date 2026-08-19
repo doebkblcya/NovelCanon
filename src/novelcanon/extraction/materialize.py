@@ -74,6 +74,8 @@ class MaterializeStats:
 
 @dataclass(frozen=True)
 class GoldenEvidenceLike(Protocol):
+    """证据最小契约：原文 span（阶段 05 黄金路径；07 由 AlignedEvidence 满足）。"""
+
     chapter_id: str
     char_start: int
     char_end: int
@@ -87,7 +89,7 @@ class GoldenClaimLike(Protocol):
     payload: dict
     observed_chapter_id: str
     observed_ordinal: int
-    evidence: GoldenEvidenceLike
+    evidence: GoldenEvidenceLike | list  # 单条（黄金）或多段（阶段 07）
 
 
 @dataclass(frozen=True)
@@ -219,6 +221,9 @@ def materialize_draft(
         payload_dict = dict(claim.payload)
         if ctype == "state" and "subject_entity_id" not in payload_dict:
             payload_dict["subject_entity_id"] = claim.fact_fields["subject_entity_id"]
+        if ctype == "term_definition":
+            # term_id 必须存在于 terms 表（FK）；首次出现时写入术语行
+            repo.ensure_term(payload_dict["term_id"], draft.chapter_id, draft.ordinal)
         payload_model = _PAYLOAD_MODELS[ctype](**payload_dict)
         # version 键必须与 write_claim 内部一致（模型序列化含默认字段）
         canonical_payload = payload_model.model_dump(mode="json")
@@ -251,40 +256,78 @@ def materialize_draft(
                 repo.add_event_participant(version_id, str(participant))
 
         # ── 直接证据：原文切片 → span hash 校验（100% 复现）──
-        ev = claim.evidence
-        if ev.chapter_id != claim.observed_chapter_id:
-            raise AssertionError(
-                f"证据章节 {ev.chapter_id} 与 claim 章节 {claim.observed_chapter_id} 不一致"
+        # 单条（黄金）或多段（阶段 07 对齐）统一归一为列表
+        raw_evidences = (
+            list(claim.evidence) if isinstance(claim.evidence, list) else [claim.evidence]
+        )
+        evidences: list[EvidenceRecord] = []
+        for ev in raw_evidences:
+            if ev.chapter_id != claim.observed_chapter_id:
+                raise AssertionError(
+                    f"证据章节 {ev.chapter_id} 与 claim 章节"
+                    f" {claim.observed_chapter_id} 不一致"
+                )
+            if not 0 <= ev.char_start < ev.char_end <= len(chapter_text):
+                raise AssertionError(
+                    f"证据 span [{ev.char_start},{ev.char_end}) 越界"
+                    f"（章长 {len(chapter_text)}）"
+                )
+            span = chapter_text[ev.char_start : ev.char_end]
+            if sha256(span) != sha256(ev.span_text):
+                raise AssertionError(
+                    f"证据 span 无法复现：{claim.observed_chapter_id}"
+                    f" [{ev.char_start},{ev.char_end})"
+                )
+            stance = getattr(ev, "stance", EvidenceStance.SUPPORTS)
+            etype = getattr(ev, "evidence_type", EvidenceType.DIRECT)
+            rate = getattr(ev, "literal_match_rate", 1.0)
+            method = getattr(ev, "verification_method", "hash-exact")
+            evidences.append(
+                EvidenceRecord(
+                    evidence_id=evidence_id(
+                        version_id, ev.chapter_id, ev.char_start, ev.char_end, sha256(span)
+                    ),
+                    claim_version_id=version_id,
+                    evidence_stance=stance,
+                    evidence_type=etype,
+                    chapter_id=ev.chapter_id,
+                    char_start=ev.char_start,
+                    char_end=ev.char_end,
+                    span_hash=sha256(span),
+                    literal_match_rate=rate,
+                    verification_method=method,
+                )
             )
-        if not 0 <= ev.char_start < ev.char_end <= len(chapter_text):
-            raise AssertionError(
-                f"证据 span [{ev.char_start},{ev.char_end}) 越界（章长 {len(chapter_text)}）"
-            )
-        span = chapter_text[ev.char_start : ev.char_end]
-        if sha256(span) != sha256(ev.span_text):
-            raise AssertionError(
-                f"证据 span 无法复现：{claim.observed_chapter_id} [{ev.char_start},{ev.char_end})"
-            )
-        eid = evidence_id(version_id, ev.chapter_id, ev.char_start, ev.char_end, sha256(span))
-        if repo.write_evidence(
-            EvidenceRecord(
-                evidence_id=eid,
-                claim_version_id=version_id,
-                evidence_stance=EvidenceStance.SUPPORTS,
-                evidence_type=EvidenceType.DIRECT,
-                chapter_id=ev.chapter_id,
-                char_start=ev.char_start,
-                char_end=ev.char_end,
-                span_hash=sha256(span),
-                literal_match_rate=1.0,
-                verification_method="hash-exact",
-            )
-        ):
-            stats.evidence += 1
-            stats.verified_evidence += 1
 
-        # ── 聚合 claim 状态（supports → supported）────────────
-        status = aggregate_claim_status([EvidenceStance.SUPPORTS])
+        # primary_evidence_id 只用于查询加速（07 §5）：direct supports
+        # 优先，否则取第一条 supports（contextual 也具备 hash 复现能力）
+        primary_id = next(
+            (
+                e.evidence_id
+                for e in evidences
+                if e.evidence_stance == EvidenceStance.SUPPORTS
+                and e.evidence_type == EvidenceType.DIRECT
+            ),
+            next(
+                (
+                    e.evidence_id
+                    for e in evidences
+                    if e.evidence_stance == EvidenceStance.SUPPORTS
+                ),
+                None,
+            ),
+        )
+        if primary_id is not None:
+            repo.set_primary_evidence(version_id, primary_id)
+
+        for ev in evidences:
+            if repo.write_evidence(ev):
+                stats.evidence += 1
+                if ev.evidence_stance == EvidenceStance.SUPPORTS:
+                    stats.verified_evidence += 1
+
+        # ── 聚合 claim 状态（按实际 stances，四格表）────────────
+        status = aggregate_claim_status([e.evidence_stance for e in evidences])
         repo.set_claim_status(version_id, status.value)
 
     return stats
