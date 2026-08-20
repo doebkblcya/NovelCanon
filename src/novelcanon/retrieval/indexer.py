@@ -70,7 +70,7 @@ def build_index(
                 "iv": index_version_id,
                 "b": book_id,
                 "cver": cver,
-                "prof": vector_store.profile_id,
+                "prof": embedder.profile_id,
                 "ts": now_iso(),
             },
         )
@@ -214,7 +214,7 @@ def _write_chunk(
                 "tc": draft.token_count,
                 "content": draft.content,
                 "hash": draft.content_hash,
-                "prof": vector_store.profile_id,
+                "prof": embedder.profile_id,
                 "ord": draft.observed_ordinal,
             },
         )
@@ -226,7 +226,7 @@ def _write_chunk(
             {
                 "chunk": draft.raw_chunk_id,
                 "book": book_id,
-                "prof": vector_store.profile_id,
+                "prof": embedder.profile_id,
                 "iv": index_version_id,
                 "ts": now_iso(),
             },

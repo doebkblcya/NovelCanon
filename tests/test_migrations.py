@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import sqlalchemy
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import Engine, text
@@ -193,3 +194,79 @@ def test_0013_backfill_from_observations(tmp_path) -> None:
     q = QueryService(engine, book_id)
     paths = q.causal_paths(src_event)
     assert paths, "复用边的 active run 升级后必须仍可见"
+
+
+# ── 阶段 10：0014 查询缓存 / 分层摘要 / 卷分组来源 ─────────────
+
+
+def test_0014_query_cache_and_summaries_schema(tmp_path) -> None:
+    """0014 建表：query_cache 与 summary_artifacts 存在且带关键约束。"""
+    from novelcanon.storage.engine import create_db_engine
+
+    db = tmp_path / "mig0014.db"
+    engine = create_db_engine(db)
+    _upgrade(db, "head")
+    with engine.connect() as conn:
+        tables = {
+            r[0]
+            for r in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).fetchall()
+        }
+    assert "query_cache" in tables
+    assert "summary_artifacts" in tables
+    with engine.connect() as conn:
+        cols = {r[1] for r in conn.execute(text("PRAGMA table_info(summary_artifacts)"))}
+    for required in (
+        "summary_id",
+        "level",
+        "input_claim_versions",
+        "depends_on_summaries",
+        "content_hash",
+        "max_observed_ordinal",
+        "status",
+        "grouping_version",
+    ):
+        assert required in cols, f"summary_artifacts 缺列 {required}"
+    with engine.connect() as conn:
+        cols = {r[1] for r in conn.execute(text("PRAGMA table_info(query_cache)"))}
+    for required in (
+        "cache_key",
+        "active_run_signature",
+        "index_version_id",
+        "knowledge_cutoff",
+        "world_at",
+    ):
+        assert required in cols, f"query_cache 缺列 {required}"
+    # volumes 补 grouping_source 列
+    with engine.connect() as conn:
+        vcols = {r[1] for r in conn.execute(text("PRAGMA table_info(volumes)"))}
+    assert "grouping_source" in vcols
+    engine.dispose()
+
+
+def test_0014_summary_status_check(tmp_path) -> None:
+    """summary_artifacts 的 level/status 枚举约束生效。"""
+    from novelcanon.storage.engine import create_db_engine
+
+    db = tmp_path / "mig0014b.db"
+    engine = create_db_engine(db)
+    _upgrade(db, "head")
+    with engine.connect() as conn:
+        bad = conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table' AND name='x'")
+        ).fetchall()
+    assert bad == []
+    with engine.begin() as conn:
+        try:
+            conn.execute(
+                text(
+                    "INSERT INTO summary_artifacts (summary_id, book_id, level,"
+                    " content_hash, max_observed_ordinal, status, created_at)"
+                    " VALUES ('s1', 'b1', 'bad_level', 'h', 1, 'valid', 'ts')"
+                )
+            )
+            raise AssertionError("非法 level 应被 CHECK 拒绝")
+        except sqlalchemy.exc.IntegrityError:
+            pass
+    engine.dispose()

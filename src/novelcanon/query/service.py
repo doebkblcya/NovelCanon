@@ -43,6 +43,17 @@ def _world_sql(world_at: int | None) -> tuple[str, dict[str, object]]:
     )
 
 
+def _world_unknown_filter(world_at: int | None) -> str:
+    """unknown 世界时间不能表达为精确状态——仅当查询请求世界时间
+    （world_at）时才排除；普通读者查询（只看披露）返回全部 supported
+    事实（阶段 07 及更早写入的历史 claim 无 world 元数据，默认 unknown，
+    不应因双时间查询的引入而从默认查询中消失）。
+    """
+    if world_at is None:
+        return ""
+    return " AND q.world_valid_kind != 'unknown'"
+
+
 def _current_filter() -> str:
     """每 fact 最新版本（rn=1）后过滤 retract / 非 supported。"""
     return "q.rn = 1 AND q.operation != 'retract' AND q.claim_status = 'supported'"
@@ -196,10 +207,12 @@ class QueryService:
                 conn.execute(
                     text(
                         "SELECT q.claim_version_id, q.fact_id, q.observed_ordinal,"
+                        " q.claim_status, q.confidence,"
                         " q.from_entity_id, q.to_entity_id, q.relation_type, q.relation_raw"
                         " FROM ("
                         "  SELECT c.claim_version_id, c.fact_id, c.observed_ordinal,"
-                        "         c.operation, c.claim_status, c.world_valid_kind,"
+                        "         c.operation, c.claim_status, c.confidence,"
+                        "         c.world_valid_kind,"
                         "         r.from_entity_id, r.to_entity_id, r.relation_type,"
                         "         r.relation_raw,"
                         "         ROW_NUMBER() OVER (PARTITION BY c.fact_id"
@@ -212,7 +225,10 @@ class QueryService:
                         f"  {world_sql}"
                         ") q"
                         f" WHERE {_current_filter()}"
-                        "   AND q.world_valid_kind != 'unknown'"
+                        # unknown 世界时间不能表达为精确状态——仅当查询
+                        # 请求世界时间（world_at）时才排除；普通读者查询
+                        # （只看披露）返回全部 supported 关系。
+                        f"{_world_unknown_filter(world_at)}"
                         " ORDER BY q.observed_ordinal"
                     ),
                     params,
@@ -746,3 +762,299 @@ class QueryService:
                 {"v": event_claim_version_id},
             ).fetchall()
         return [r[0] for r in rows]
+
+    # ── 阶段 10：术语释义 / org 折叠 / 按章图谱 / 实体快照 ──────
+
+    def term_definition(
+        self,
+        term: str,
+        *,
+        term_id: str | None = None,
+        knowledge_cutoff: int | None = None,
+    ) -> dict | None:
+        """术语释义（10 查询路线：term_definition claim）。
+
+        term 可以是术语 canonical_name 或显式 term_id；只返回当前版本
+        （active + supported + 非 retract + 每 fact 最新）+ 证据与章节定位。
+        """
+        cutoff_sql = ""
+        params: dict[str, object] = {"book": self._book_id}
+        if knowledge_cutoff is not None:
+            cutoff_sql = "AND c.observed_ordinal <= :cutoff"
+            params["cutoff"] = knowledge_cutoff
+        if term_id is not None:
+            where = "td.term_id = :term"
+            params["term"] = term_id
+        else:
+            where = "t.canonical_name = :term"
+            params["term"] = term
+        with self._engine.connect() as conn:
+            row = (
+                conn.execute(
+                    text(
+                        "SELECT q.claim_version_id, q.fact_id, q.observed_ordinal,"
+                        " q.term_id, q.canonical_name, q.definition FROM ("
+                        "  SELECT c.claim_version_id, c.fact_id, c.observed_ordinal,"
+                        "         c.operation, c.claim_status,"
+                        "         td.term_id, t.canonical_name, td.definition,"
+                        "         ROW_NUMBER() OVER (PARTITION BY c.fact_id"
+                        "           ORDER BY c._rowid DESC) rn"
+                        "  FROM v_active_claims c"
+                        "  JOIN term_definition_claims td"
+                        "    ON td.claim_version_id = c.claim_version_id"
+                        "  JOIN terms t ON t.term_id = td.term_id"
+                        f"  WHERE {where} AND c.book_id = :book {cutoff_sql}"
+                        ") q"
+                        f" WHERE {_current_filter()}"
+                    ),
+                    params,
+                )
+                .mappings()
+                .fetchone()
+            )
+        if row is None:
+            return None
+        d = dict(row)
+        d["evidence"] = self._evidence_for(d["claim_version_id"])
+        return d
+
+    def org_membership(
+        self,
+        canonical_id: str,
+        *,
+        knowledge_cutoff: int | None = None,
+        world_at: int | None = None,
+    ) -> list[dict]:
+        """势力成员折叠（10 查询路线：org 日志折叠）。
+
+        按 (org, member) 取最新 org 动作（join/found/promote/demote 为
+        当前成员；leave/dissolve 结束成员关系）：日志折叠为当前成员列表。
+        双时间：knowledge_cutoff（读者披露）+ world_at（世界时间）组合。
+        返回每个成员的当前 role、加入动作与证据。
+        """
+        cutoff_sql, cutoff_params = _cutoff_sql(knowledge_cutoff)
+        world_sql, world_params = _world_sql(world_at)
+        scope = self.entity_scope(canonical_id)
+        org_sql, org_params = self._scope_sql(scope, prefix="g")
+        member_sql, member_params = self._scope_sql(scope, prefix="m")
+        params: dict[str, object] = {}
+        params.update(cutoff_params)
+        params.update(world_params)
+        params.update(org_params)
+        params.update(member_params)
+        params["book"] = self._book_id
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT q.claim_version_id, q.fact_id, q.observed_ordinal,"
+                        " q.claim_status, q.confidence,"
+                        " q.org_entity_id, q.member_entity_id, q.role, q.action,"
+                        " q.world_valid_kind FROM ("
+                        "  SELECT c.claim_version_id, c.fact_id, c.observed_ordinal,"
+                        "         c.operation, c.claim_status, c.confidence,"
+                        "         c.world_valid_kind,"
+                        "         o.org_entity_id, o.member_entity_id, o.role, o.action,"
+                        "         ROW_NUMBER() OVER (PARTITION BY o.org_entity_id,"
+                        "           o.member_entity_id ORDER BY c._rowid DESC) rn"
+                        "  FROM v_active_claims c"
+                        "  JOIN org_claims o ON o.claim_version_id = c.claim_version_id"
+                        "  WHERE (o.org_entity_id " + org_sql + " OR o.member_entity_id "
+                        + member_sql + ") AND c.book_id = :book"
+                        f"  {cutoff_sql}{world_sql}"
+                        ") q"
+                        f" WHERE {_current_filter()}"
+                        "   AND q.action NOT IN ('leave','dissolve')"
+                        # unknown 仅在请求世界时间时排除（同 one_hop_relations）
+                        f"{_world_unknown_filter(world_at)}"
+                        " ORDER BY q.observed_ordinal"
+                    ),
+                    params,
+                )
+                .mappings()
+                .fetchall()
+            )
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["evidence"] = self._evidence_for(d["claim_version_id"])
+            out.append(d)
+        return out
+
+    def chapter_graph(
+        self,
+        chapter_ordinal: int,
+        *,
+        knowledge_cutoff: int | None = None,
+        world_at: int | None = None,
+    ) -> list[dict]:
+        """按章图谱（10 查询路线：claim 双时间过滤）。
+
+        某章全部当前事实（state/relation/event/org/term_definition），
+        统一携带 claim_type、置信度、状态、证据与章节定位。
+        knowledge_cutoff 过滤披露（observed_ordinal <= cutoff），
+        world_at 过滤世界有效区间（双时间组合）。
+        """
+        cutoff_sql, cutoff_params = _cutoff_sql(knowledge_cutoff)
+        world_sql, world_params = _world_sql(world_at)
+        params: dict[str, object] = {
+            "book": self._book_id,
+            "chapter": chapter_ordinal,
+        }
+        params.update(cutoff_params)
+        params.update(world_params)
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT q.claim_version_id, q.fact_id, q.claim_type,"
+                        " q.confidence, q.claim_status, q.observed_ordinal,"
+                        " q.world_valid_kind, q.payload FROM ("
+                        "  SELECT c.claim_version_id, c.fact_id, c.claim_type,"
+                        "         c.confidence, c.claim_status, c.observed_ordinal,"
+                        "         c.operation, c.world_valid_kind,"
+                        "         COALESCE(s.payload, r.payload, e.payload, o.payload,"
+                        "                  td.payload, '{}') AS payload,"
+                        "         ROW_NUMBER() OVER (PARTITION BY c.fact_id"
+                        "           ORDER BY c._rowid DESC) rn"
+                        "  FROM v_active_claims c"
+                        "  LEFT JOIN ("
+                        "    SELECT claim_version_id,"
+                        "      json_object('field', field, 'value', value,"
+                        "                 'raw_value', raw_value) AS payload"
+                        "    FROM state_claims) s"
+                        "    ON s.claim_version_id = c.claim_version_id"
+                        "  LEFT JOIN ("
+                        "    SELECT claim_version_id,"
+                        "      json_object('from_entity_id', from_entity_id,"
+                        "                 'to_entity_id', to_entity_id,"
+                        "                 'relation_type', relation_type) AS payload"
+                        "    FROM relation_claims) r"
+                        "    ON r.claim_version_id = c.claim_version_id"
+                        "  LEFT JOIN ("
+                        "    SELECT claim_version_id,"
+                        "      json_object('event_type', event_type, 'summary', summary) AS payload"
+                        "    FROM event_claims) e"
+                        "    ON e.claim_version_id = c.claim_version_id"
+                        "  LEFT JOIN ("
+                        "    SELECT claim_version_id,"
+                        "      json_object('org_entity_id', org_entity_id,"
+                        "                 'member_entity_id', member_entity_id,"
+                        "                 'role', role, 'action', action) AS payload"
+                        "    FROM org_claims) o"
+                        "    ON o.claim_version_id = c.claim_version_id"
+                        "  LEFT JOIN ("
+                        "    SELECT claim_version_id,"
+                        "      json_object('term_id', term_id, 'definition', definition)"
+                        "      AS payload"
+                        "    FROM term_definition_claims) td"
+                        "    ON td.claim_version_id = c.claim_version_id"
+                        "  WHERE c.observed_ordinal = :chapter AND c.book_id = :book"
+                        f"  {cutoff_sql}{world_sql}"
+                        ") q"
+                        f" WHERE {_current_filter()}"
+                        " ORDER BY q.observed_ordinal"
+                    ),
+                    params,
+                )
+                .mappings()
+                .fetchall()
+            )
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["evidence"] = self._evidence_for(d["claim_version_id"])
+            out.append(d)
+        return out
+
+    def entity_snapshot(
+        self,
+        canonical_id: str,
+        *,
+        knowledge_cutoff: int | None = None,
+        world_at: int | None = None,
+    ) -> dict:
+        """实体统一快照（10 §1 统一返回版本/置信度/状态/证据）。
+
+        组合状态、一跳关系、势力成员、事件与展示名；全部双时间过滤。
+        """
+        return {
+            "canonical_id": canonical_id,
+            "display_name": self.display_name(
+                canonical_id, knowledge_cutoff=knowledge_cutoff
+            ),
+            "state": self.entity_state(canonical_id, knowledge_cutoff=knowledge_cutoff),
+            "relations": self.one_hop_relations(
+                canonical_id,
+                knowledge_cutoff=knowledge_cutoff,
+                world_at=world_at,
+            ),
+            "org_membership": self.org_membership(
+                canonical_id,
+                knowledge_cutoff=knowledge_cutoff,
+                world_at=world_at,
+            ),
+            "events": self.entity_events(
+                canonical_id,
+                knowledge_cutoff=knowledge_cutoff,
+                world_at=world_at,
+            ),
+        }
+
+    def entity_events(
+        self,
+        canonical_id: str,
+        *,
+        knowledge_cutoff: int | None = None,
+        world_at: int | None = None,
+    ) -> list[dict]:
+        """实体参与的事件（经 event_participants 匹配实体作用域，双时间）。"""
+        scope_sql, scope_params = self._scope_sql(self.entity_scope(canonical_id), prefix="p")
+        cutoff_sql = ""
+        params: dict[str, object] = {"book": self._book_id}
+        params.update(scope_params)
+        if knowledge_cutoff is not None:
+            cutoff_sql = "AND c.observed_ordinal <= :cutoff"
+            params["cutoff"] = knowledge_cutoff
+        world_sql = ""
+        if world_at is not None:
+            world_sql = (
+                " AND ("
+                "   (c.world_valid_kind = 'chapter_proxy'"
+                "    AND c.world_valid_from <= :world)"
+                "   OR (c.world_valid_kind = 'story_time'"
+                "    AND c.world_valid_from <= :world"
+                "    AND (c.world_valid_to IS NULL OR c.world_valid_to >= :world))"
+                " )"
+            )
+            params["world"] = world_at
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT DISTINCT c.claim_version_id, e.event_type, e.summary,"
+                        " e.sequence_in_chapter, c.observed_ordinal"
+                        " FROM event_claims e"
+                        " JOIN claims c ON c.claim_version_id = e.claim_version_id"
+                        " JOIN claim_observations o ON o.claim_version_id = c.claim_version_id"
+                        " JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
+                        " JOIN event_participants ep"
+                        "   ON ep.event_claim_version_id = c.claim_version_id"
+                        " WHERE r.status = 'active' AND r.book_id = :book"
+                        "   AND c.claim_status = 'supported'"
+                        "   AND c.operation != 'retract'"
+                        f"   AND ep.entity_id {scope_sql}"
+                        f"   {cutoff_sql}{world_sql}"
+                        " ORDER BY c.observed_ordinal, e.sequence_in_chapter"
+                    ),
+                    params,
+                )
+                .mappings()
+                .fetchall()
+            )
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["evidence"] = self._evidence_for(d["claim_version_id"])
+            out.append(d)
+        return out

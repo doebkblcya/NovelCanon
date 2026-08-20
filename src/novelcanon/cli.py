@@ -6,6 +6,7 @@ CLI 只负责参数解析与调用 application service，不直接编写 SQL 或
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Annotated
 
@@ -495,17 +496,306 @@ def _run_align(engine: Engine, book_id: str, *, run_id: str | None = None) -> No
 
 
 @app.command()
-def activate() -> None:
-    """原子激活已完成验证的 run（阶段 04 实现）。"""
+def activate(
+    book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],
+    run_id: Annotated[
+        str | None, typer.Option(help="要激活的 run_id；缺省取最新可激活 run")
+    ] = None,
+) -> None:
+    """原子激活已完成验证的 run（阶段 04 实现；激活后结构化查询可见）。"""
     _log_command_invoked("activate")
-    typer.echo("尚未实现：activate（阶段 04 可恢复流水线）")
+    engine = _open_db()
+    try:
+        _run_activate(engine, book_id, run_id=run_id)
+    finally:
+        engine.dispose()
+
+
+def _run_activate(engine: Engine, book_id: str, *, run_id: str | None = None) -> None:
+    """状态机推进到 ready_to_activate，再原子激活（旧 active → superseded）。"""
+    from novelcanon.pipeline import RunManager
+    from novelcanon.pipeline.validation import Activator
+    from novelcanon.schemas.types import RunStatus
+
+    mgr = RunManager(engine)
+    if run_id is None:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT run_id FROM extraction_runs WHERE book_id = :b"
+                    " AND status IN ('running','validating','ready_to_activate')"
+                    " ORDER BY started_at DESC LIMIT 1"
+                ),
+                {"b": book_id},
+            ).fetchone()
+        if row is None:
+            typer.echo(f"❌ book={book_id} 没有可激活 run，请先 novelcanon extract")
+            raise typer.Exit(1)
+        run_id = row[0]
+    run = mgr.get(run_id)
+    if run is None or run["book_id"] != book_id:
+        typer.echo(f"❌ run={run_id} 不存在或不属于 book={book_id}")
+        raise typer.Exit(1)
+    if run["status"] in {
+        s.value for s in (RunStatus.ACTIVE, RunStatus.SUPERSEDED, RunStatus.FAILED)
+    }:
+        typer.echo(f"❌ run={run_id} 已是终态 {run['status']}")
+        raise typer.Exit(1)
+
+    # 状态机推进：created → running → validating → ready_to_activate
+    order = (
+        RunStatus.CREATED,
+        RunStatus.RUNNING,
+        RunStatus.VALIDATING,
+        RunStatus.READY_TO_ACTIVATE,
+    )
+    current = RunStatus(run["status"])
+    for target in order:
+        if current == target:
+            continue
+        if not mgr.transition(run_id, current, target):
+            typer.echo(f"❌ 状态推进失败：{current.value} → {target.value}")
+            raise typer.Exit(1)
+        current = target
+
+    issues = Activator(engine).activate(run_id)
+    if issues:
+        typer.echo("❌ 激活失败：" + "; ".join(issues))
+        raise typer.Exit(1)
+    with engine.connect() as conn:
+        n = conn.execute(
+            text("SELECT COUNT(*) FROM v_active_claims WHERE book_id = :b"),
+            {"b": book_id},
+        ).scalar()
+    typer.echo(f"✅ run={run_id} 已激活（active）；active claims={n}，结构化查询现可访问")
 
 
 @app.command()
-def query() -> None:
-    """结构化查询 / 混合检索 / 问答（阶段 10 实现）。"""
+def query(
+    question: Annotated[str, typer.Argument(help="自然语言问题")],
+    book_id: Annotated[str, typer.Option(help="book_id（novelcanon inspect 可查）")],
+    cutoff: Annotated[
+        int | None,
+        typer.Option(help="knowledge cutoff 章节（读者披露截止）"),
+    ] = None,
+    world: Annotated[int | None, typer.Option(help="world at 章节（世界时间点）")] = None,
+    no_cache: Annotated[bool, typer.Option("--no-cache", help="跳过缓存")] = False,
+) -> None:
+    """结构化查询 / 混合检索 / 证据接地问答（阶段 10）。"""
     _log_command_invoked("query")
-    typer.echo("尚未实现：query（阶段 10 查询检索与分层摘要）")
+    engine = _open_db()
+    try:
+        _run_query(
+            engine, question, book_id, cutoff=cutoff, world=world, no_cache=no_cache
+        )
+    finally:
+        engine.dispose()
+
+
+def _run_query(
+    engine: Engine,
+    question: str,
+    book_id: str,
+    *,
+    cutoff: int | None,
+    world: int | None,
+    no_cache: bool,
+) -> None:
+    """路由 → 执行 → 合成 → 输出（含 explain 与路线统计）。"""
+    from novelcanon.query import QueryExecutor, route_question
+    from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
+
+    decision = route_question(question)
+    typer.echo(
+        f"🧭 路由：type={decision.query_type} route={decision.route}"
+        f"{'（fallback）' if decision.is_fallback else ''}"
+    )
+    typer.echo(f"   {decision.explain}")
+
+    executor = QueryExecutor(
+        engine,
+        book_id,
+        embedder=FakeEmbedder(dimension=8),
+        vector_store=BruteForceVectorStore(dimension=8),
+        use_cache=not no_cache,
+    )
+    result = executor.ask(
+        question, knowledge_cutoff=cutoff, world_at=world
+    )
+    payload = result.answer
+    if result.cached:
+        typer.echo("♻️  命中缓存（active run/index 签名一致）")
+    typer.echo("─" * 60)
+    typer.echo(f"📖 回答（route={payload['route']}）：\n{payload['answer']}")
+    typer.echo("─" * 60)
+    typer.echo(f"置信度={payload['confidence']} 上下文={payload['context_id'][:12]}…")
+    typer.echo(f"cutoff={payload['knowledge_cutoff']} world_at={payload['world_at']}")
+    if payload["caveats"]:
+        typer.echo("⚠️  " + "；".join(payload["caveats"]))
+    if payload["sources"]:
+        typer.echo(f"证据来源（{len(payload['sources'])}）：")
+        for s in payload["sources"][:10]:
+            typer.echo(
+                f"   - [{s['kind']}] 章{s['observed_ordinal']}"
+                f" 立场={s['stance']} {s['claim_version_id'][:16]}…"
+            )
+    else:
+        typer.echo("（无证据来源：证据不足，明确拒答）")
+    typer.echo("─" * 60)
+    typer.echo("按路线统计：")
+    for route, st in executor.stats().items():
+        typer.echo(
+            f"   {route}: calls={st['calls']} 延迟={st['latency_ms']}ms"
+            f" 上下文项={st['context_items']} 命中={st['hits']}"
+            f" 缓存命中={st['cache_hits']}"
+        )
+
+
+@app.command("group-volumes")
+def group_volumes(
+    book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],
+    chunk: Annotated[int, typer.Option(help="默认每 N 章一组")] = 50,
+) -> None:
+    """卷分组（阶段 10 §6）：原书卷标题优先，缺失时每 N 章默认分组。"""
+    _log_command_invoked("group-volumes")
+    engine = _open_db()
+    try:
+        from novelcanon.summaries import VolumeGrouper
+
+        result = VolumeGrouper(engine, book_id, chapters_per_volume=chunk).group()
+        typer.echo(
+            f"✅ 卷分组 book={book_id}：版本={result.grouping_version}"
+            f" 来源={result.source} 卷数={len(result.volumes)}"
+            f" 重建={result.rebuilt} 变化={result.changed}"
+        )
+        for v in result.volumes:
+            typer.echo(
+                f"   {v.ordinal}. {v.title}：第{v.start_ordinal}–{v.end_ordinal}章"
+                f"（{v.grouping_source}）"
+            )
+    finally:
+        engine.dispose()
+
+
+@app.command()
+def summarize(
+    book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],
+    cutoff: Annotated[int | None, typer.Option(help="knowledge cutoff（不泄露其后内容）")] = None,
+    deterministic: Annotated[
+        bool,
+        typer.Option(
+            "--deterministic",
+            help="用确定性提取式摘要（无模型）；缺省用 LLM（需 LLM_* 配置）",
+        ),
+    ] = False,
+) -> None:
+    """分层 Reduce：章节 → 卷 → 全书摘要（阶段 10 §7）。"""
+    _log_command_invoked("summarize")
+    engine = _open_db()
+    try:
+        _run_summarize(engine, book_id, cutoff=cutoff, deterministic=deterministic)
+    finally:
+        engine.dispose()
+
+
+def _run_summarize(
+    engine: Engine, book_id: str, *, cutoff: int | None, deterministic: bool
+) -> None:
+    from novelcanon.summaries import (
+        DeterministicSummarizer,
+        HierarchicalReducer,
+        LLMSummarizer,
+    )
+
+    if deterministic:
+        summarizer: object = DeterministicSummarizer()
+        label = "确定性提取式"
+    else:
+        profile = _cli_generation_profile(1)
+        tokenizer = _tokenizer_for(profile)
+        api_key = AppSettings().llm_api_key or None
+        if api_key is None and profile.api_key_env:
+            typer.echo(f"⚠️  未设置 {profile.api_key_env}；若 provider 需要鉴权将失败")
+        from novelcanon.generation.client import GenerationClient
+
+        client = GenerationClient(profile, tokenizer=tokenizer, api_key=api_key)
+        summarizer = LLMSummarizer(
+            client,
+            profile_id=profile.profile_id,
+            prompt_version=f"llm-summary-{profile.config_hash[:10]}",
+        )
+        label = f"LLM（{profile.model}）"
+
+    reducer = HierarchicalReducer(engine, book_id, summarizer=summarizer)  # type: ignore[arg-type]
+    result = reducer.reduce(cutoff=cutoff)
+    typer.echo(
+        f"✅ 分层摘要 book={book_id}（{label}）："
+        f"分组版本={result.grouping.grouping_version}"
+        f" 章节记忆={result.chapter_memories}"
+        f" 卷摘要={len(result.volume_summaries)}"
+        f" 全书摘要={'有' if result.book_summary else '无'}"
+        f" 新建={result.rebuilt} 复用={result.reused} 失效={result.stale}"
+    )
+    for s in result.volume_summaries:
+        typer.echo(
+            f"   卷「{s['title']}」 max_ordinal={s['max_observed_ordinal']}"
+            f" 输入claim={len(json.loads(s['input_claim_versions']))}"
+            f" 内容hash={s['content_hash'][:12]}…"
+        )
+    if result.book_summary:
+        s = result.book_summary
+        typer.echo(
+            f"   全书「{s['title']}」 max_ordinal={s['max_observed_ordinal']}"
+            f" 依赖卷摘要={len(json.loads(s['depends_on_summaries']))}"
+        )
+
+
+@app.command()
+def stats(
+    book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],
+) -> None:
+    """查询与摘要统计（10 退出标准：质量/延迟/Token 按路线统计）。"""
+    _log_command_invoked("stats")
+    engine = _open_db()
+    try:
+        _run_stats(engine, book_id)
+    finally:
+        engine.dispose()
+
+
+def _run_stats(engine: Engine, book_id: str) -> None:
+    with engine.connect() as conn:
+        cache_rows = conn.execute(
+            text(
+                "SELECT query_type, COUNT(*) AS n,"
+                " SUM(length(result)) AS bytes"
+                " FROM query_cache WHERE book_id = :b GROUP BY query_type"
+            ),
+            {"b": book_id},
+        ).fetchall()
+        summary_rows = conn.execute(
+            text(
+                "SELECT level, status, COUNT(*) AS n"
+                " FROM summary_artifacts WHERE book_id = :b"
+                " GROUP BY level, status"
+            ),
+            {"b": book_id},
+        ).fetchall()
+        volumes = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM volumes WHERE book_id = :b"
+            ),
+            {"b": book_id},
+        ).scalar()
+    typer.echo(f"📊 book={book_id} 统计：")
+    typer.echo(f"   卷行（全版本）={volumes}")
+    typer.echo("   查询缓存（按类型）：")
+    for qtype, n, _bytes in cache_rows:
+        typer.echo(f"     {qtype}: {n} 条")
+    typer.echo("   摘要产物（按级别/状态）：")
+    for level, status, n in summary_rows:
+        typer.echo(f"     {level}/{status}: {n}")
+    typer.echo("   提示：query 命令输出含按路线延迟/命中统计（QueryExecutor.stats）")
 
 
 @app.command()

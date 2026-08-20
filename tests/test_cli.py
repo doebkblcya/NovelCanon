@@ -21,16 +21,26 @@ def test_help_lists_all_commands() -> None:
 
 
 def test_unimplemented_commands_are_explicit() -> None:
-    """阶段 06 后 import/index/extract 已实现；其余命令仍显式返回「尚未实现」。"""
-    cases: dict[str, list[str]] = {
-        "activate": ["activate"],
-        "query": ["query"],
-        "inspect": ["inspect"],
-    }
-    for cmd, args in cases.items():
-        result = runner.invoke(app, args)
-        assert result.exit_code == 0, f"{cmd} 失败: {result.output}"
-        assert "尚未实现" in result.stdout
+    """阶段 10 后 import/index/extract/query/activate 已实现；inspect 仍显式「尚未实现」。"""
+    result = runner.invoke(app, ["inspect"])
+    assert result.exit_code == 0, f"inspect 失败: {result.output}"
+    assert "尚未实现" in result.stdout
+
+
+def test_activate_requires_book_argument() -> None:
+    """阶段 04/10：activate 已实现，缺 book_id 报用法错误而非「尚未实现」。"""
+    result = runner.invoke(app, ["activate"])
+    assert result.exit_code != 0
+    assert "尚未实现" not in result.stdout
+    assert "book_id" in result.stderr or "book_id" in result.stdout
+
+
+def test_query_requires_question_and_book() -> None:
+    """阶段 10：query 已实现，缺参数报用法错误而非「尚未实现」。"""
+    result = runner.invoke(app, ["query"])
+    assert result.exit_code != 0
+    assert "尚未实现" not in result.stdout
+    assert "question" in result.stderr or "question" in result.stdout
 
 
 def test_extract_requires_book_argument() -> None:
