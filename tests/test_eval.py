@@ -37,7 +37,7 @@ from novelcanon.pipeline.ledger import Usage
 from novelcanon.schemas.types import RunStatus
 from novelcanon.storage.repository import Repository
 from tests.golden_data import GOLDEN_CHAPTERS, MENTION_MAP, make_golden_drafts
-from tests.helpers import make_fixture_epub
+from tests.helpers import make_fixture_epub, seed_active_book
 
 BOOK_ID = "book_pilot"
 
@@ -790,5 +790,104 @@ def test_pilot_consumes_active_index_backend(tmp_path: Path, migrated_db: Engine
         d = report.to_dict()
         assert "structured" in d["routes"], "真实 profile 索引下 structured 必须可跑"
         assert "hybrid" in d["routes"], "真实 profile 索引下 hybrid 必须可跑"
+    finally:
+        unregister_backend("prod-embed-16")
+
+
+def test_backend_config_error_not_masked_as_no_index(
+    tmp_path: Path, migrated_db: Engine, monkeypatch
+) -> None:
+    """复审 D P2：backend_for_active_index 的配置校验 ValueError 原样传播——
+    不得被「无索引」兜底（NoActiveIndexError）静默掩盖成 fake fallback。"""
+    from novelcanon.retrieval.factory import (
+        NoActiveIndexError,
+        backend_for_active_index,
+        unregister_backend,
+    )
+    from novelcanon.retrieval.indexer import build_index
+    from novelcanon.retrieval.tokenizer import FakeTokenizer
+    from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
+
+    # 清理可能由前置测试 create_app（真实 .env 配置）注册进全局工厂的
+    # text-embedding-v4——本测试要求「未注册 → 触发配置校验」路径。
+    unregister_backend("text-embedding-v4")
+
+    # 无 active 索引 → 专用 NoActiveIndexError（调用方按此兜底）
+    with pytest.raises(NoActiveIndexError):
+        backend_for_active_index(migrated_db, "book_none")
+
+    data = seed_active_book(migrated_db, tmp_path)
+
+    def _v4() -> FakeEmbedder:
+        e = FakeEmbedder(dimension=16)
+        e.profile_id = "text-embedding-v4"  # 未注册的真实 profile
+        return e
+
+    build_index(
+        migrated_db,
+        data["book_id"],
+        tokenizer=FakeTokenizer(),
+        embedder=_v4(),
+        vector_store=BruteForceVectorStore(dimension=16),
+    )
+
+    # 真实 profile 未注册 → 触发 register_configured_backends → 配置校验失败
+    def _bad_config(settings=None):  # noqa: ANN001, ARG001
+        raise ValueError(
+            "embedding profile 'text-embedding-v4' 缺少 NOVELCANON_EMBEDDING_DIMENSION"
+        )
+
+    monkeypatch.setattr("novelcanon.retrieval.factory.register_configured_backends", _bad_config)
+    try:
+        with pytest.raises(ValueError, match="DIMENSION"):
+            backend_for_active_index(migrated_db, data["book_id"])
+    finally:
+        unregister_backend("text-embedding-v4")
+
+
+def test_pilot_closes_backend_even_on_error(
+    tmp_path: Path, migrated_db: Engine, monkeypatch
+) -> None:
+    """复审 D P2：run_pilot 中途异常（结构化 QA 抛错）也必须 close 真实
+    adapter——close 放 finally，不依赖正常返回路径。"""
+    import novelcanon.eval.pilot as pilot_mod
+    from novelcanon.retrieval.factory import register_backend, unregister_backend
+    from novelcanon.retrieval.indexer import build_index
+    from novelcanon.retrieval.tokenizer import FakeTokenizer
+    from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
+
+    book_id, chapter_ids, chapter_texts = _seed_golden_book(migrated_db, tmp_path)
+    golden = golden_set_from_chapters(book_id)
+    closed = {"n": 0}
+
+    class TrackingEmbedder(FakeEmbedder):
+        def close(self) -> None:
+            closed["n"] += 1
+
+    def _prod() -> TrackingEmbedder:
+        e = TrackingEmbedder(dimension=16)
+        e.profile_id = "prod-embed-16"
+        return e
+
+    register_backend(
+        "prod-embed-16",
+        lambda: (_prod(), BruteForceVectorStore(dimension=16)),
+    )
+    try:
+        build_index(
+            migrated_db,
+            book_id,
+            tokenizer=FakeTokenizer(),
+            embedder=_prod(),
+            vector_store=BruteForceVectorStore(dimension=16),
+        )
+
+        def _boom(*args, **kwargs):  # noqa: ANN002, ANN003, ARG001
+            raise RuntimeError("structured QA 中途失败")
+
+        monkeypatch.setattr(pilot_mod, "run_structured_qa", _boom)
+        with pytest.raises(RuntimeError):
+            run_pilot(migrated_db, book_id, golden)
+        assert closed["n"] == 1, "中途异常也必须 close 真实 adapter"
     finally:
         unregister_backend("prod-embed-16")

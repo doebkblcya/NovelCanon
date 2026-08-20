@@ -380,24 +380,26 @@ def create_app(
         注入 fake。
 
         复审 P1：backend 按 profile **缓存于应用级**（_backend_cache）——
-        不随每次查询重新 create_backend（避免每个请求新建 httpx.Client
-        连接池，泄漏连接/文件描述符且无法复用）；lifespan 关闭时统一
-        close。
+        **先查缓存、miss 才调用统一 factory**：缓存命中时零创建（此前
+        先调 backend_for_active_index 再查缓存，命中时新 backend 被丢弃
+        且不 close，每请求泄漏一个 httpx.Client 连接池）；lifespan 关闭
+        时统一 close。只捕获 NoActiveIndexError（配置校验 ValueError 原样
+        上报，不得静默回退 fake——复审 D P2）。
         """
         from novelcanon.retrieval.factory import backend_for_active_index
         from novelcanon.retrieval.indexer import get_active_index_version
 
-        try:
-            backend = backend_for_active_index(eng, book_id)
-        except ValueError:
+        index = get_active_index_version(eng, book_id)
+        if index is None:
             # 无 active 索引：结构化查询可跑；raw-detail/hybrid 由检索层
             # 报「无 active 索引」（与 CLI 一致）
             return FakeEmbedder(dimension=8), BruteForceVectorStore(dimension=8)
-        index = get_active_index_version(eng, book_id)
-        profile = (index or {}).get("embedding_profile_id") or ""
-        if profile not in _backend_cache:
-            _backend_cache[profile] = backend
-        return _backend_cache[profile]
+        profile = index.get("embedding_profile_id") or ""
+        if profile in _backend_cache:
+            return _backend_cache[profile]  # 缓存命中：零创建、零泄漏
+        backend = backend_for_active_index(eng, book_id)  # 仅 miss 时创建
+        _backend_cache[profile] = backend
+        return backend
 
     def _executor(book_id: str) -> QueryExecutor:
         return (executor_factory or _default_executor)(book_id)

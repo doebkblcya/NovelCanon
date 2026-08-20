@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import Engine
 
 from novelcanon.query import QueryExecutor
-from novelcanon.retrieval.factory import backend_for_active_index
+from novelcanon.retrieval.factory import NoActiveIndexError, backend_for_active_index
 from novelcanon.storage.backup import IntegrityReport, verify_integrity
 
 
@@ -60,11 +60,12 @@ def scan_cutoff_leakage(
     """逐问题 × 逐 cutoff：来源章节不得超过 cutoff（结构化 + 混合）。
 
     运行时后端按 active index 统一创建（复审 D P1）：真实索引必须用真实
-    adapter，否则 profile mismatch；无 active 索引时结构化查询 fake 兜底。
+    adapter，否则 profile mismatch；**仅无 active 索引**（NoActiveIndexError）
+    时结构化查询 fake 兜底——配置校验错误原样上报（复审 D P2）。
     """
     try:
         embedder, vector_store = backend_for_active_index(engine, book_id)
-    except ValueError:
+    except NoActiveIndexError:
         from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
 
         embedder, vector_store = FakeEmbedder(dimension=8), BruteForceVectorStore(dimension=8)

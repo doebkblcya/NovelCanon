@@ -52,6 +52,16 @@ class UnknownEmbeddingProfileError(RuntimeError):
     """
 
 
+class NoActiveIndexError(ValueError):
+    """book 没有 active 索引（backend_for_active_index 专用）。
+
+    独立子类（仍继承 ValueError）：调用方只捕获**无索引**这一种情形做
+    fake 兜底；`register_configured_backends` 的配置校验错误（缺
+    dimension/base_url）也是 ValueError 但属于**服务端配置错误**，必须
+    原样上报，不得被「无索引」兜底静默掩盖（复审 D P2）。
+    """
+
+
 def register_backend(profile_id: str, factory: Callable[[], tuple[Embedder, VectorStore]]) -> None:
     """注册生产后端（扩展点）：profile_id → embedder/vector store 工厂。"""
     EMBEDDER_FACTORIES[profile_id] = factory
@@ -139,14 +149,16 @@ def backend_for_active_index(
     杜绝各处硬编码 FakeEmbedder(8) 造成 profile mismatch（索引已是
     text-embedding-v4 时 fake-embed-v8 查询直接失败）。
 
-    - 无 active 索引：ValueError（结构化查询可跑，由调用方决定 fallback）；
+    - 无 active 索引：NoActiveIndexError（结构化查询可跑，调用方按此兜底）；
+    - 配置校验错误（缺 dimension/base_url）：ValueError 原样传播（服务端
+      配置错误，不得被「无索引」兜底掩盖——复审 D P2）；
     - 真实 profile 未配置：UnknownEmbeddingProfileError（服务端配置错误）。
     """
     from novelcanon.retrieval.indexer import get_active_index_version
 
     index = get_active_index_version(engine, book_id)
     if index is None:
-        raise ValueError(f"book={book_id} 没有 active 索引，请先 build_index")
+        raise NoActiveIndexError(f"book={book_id} 没有 active 索引，请先 build_index")
     profile_id = index.get("embedding_profile_id") or ""
     if profile_id not in EMBEDDER_FACTORIES and not re.match(r"^fake-embed-v\d+$", profile_id):
         register_configured_backends(settings)

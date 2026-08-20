@@ -629,7 +629,7 @@ def _run_query(
 ) -> None:
     """路由 → 执行 → 合成 → 输出（含 explain 与路线统计）。"""
     from novelcanon.query import QueryExecutor, route_question
-    from novelcanon.retrieval.factory import backend_for_active_index
+    from novelcanon.retrieval.factory import NoActiveIndexError, backend_for_active_index
 
     decision = route_question(question)
     typer.echo(
@@ -640,10 +640,12 @@ def _run_query(
 
     # 按 active index 的 embedding profile 创建运行时后端（阶段 11 复审 D
     # 统一入口）：真实索引（text-embedding-v4）必须用真实 adapter，否则
-    # profile mismatch；无 active 索引时结构化查询仍可跑（fake 兜底）。
+    # profile mismatch；**仅无 active 索引**（NoActiveIndexError）时结构化
+    # 查询 fake 兜底——配置校验错误（缺 dimension/base_url）是 ValueError，
+    # 必须原样上报，不得静默回退 fake 再产生误导性 mismatch（复审 D P2）。
     try:
         embedder, vector_store = backend_for_active_index(engine, book_id)
-    except ValueError:
+    except NoActiveIndexError:
         from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
 
         embedder, vector_store = FakeEmbedder(dimension=8), BruteForceVectorStore(dimension=8)

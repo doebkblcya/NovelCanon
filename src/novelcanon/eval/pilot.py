@@ -941,7 +941,7 @@ def run_pilot(
     抽取器测真实抽取 recall——由决策门 extraction_mode 硬前置把关）。
     """
     from novelcanon.query import QueryExecutor
-    from novelcanon.retrieval.factory import backend_for_active_index
+    from novelcanon.retrieval.factory import NoActiveIndexError, backend_for_active_index
 
     routes: dict[str, dict] = {}
     claims = _active_claims(engine, book_id, cutoff=cutoff)
@@ -975,93 +975,97 @@ def run_pilot(
     # hybrid 必然访问向量索引，固定 fake-embed-v8 会 profile mismatch。
     # 压缩路线的临时库主动建 fake 索引，仍用 FakeEmbedder（见
     # run_compressed_route/_make_reingest）。
+    # 仅 NoActiveIndexError 做 fake 兜底；配置校验 ValueError 原样上报（P2）。
     route_backend = None
     if structured or hybrid:
         try:
             route_backend = backend_for_active_index(engine, book_id)
-        except ValueError:
+        except NoActiveIndexError:
             # 无 active 索引：structured 纯结构化查询可跑（raw-detail 无向量）
             from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
 
             route_backend = (FakeEmbedder(dimension=8), BruteForceVectorStore(dimension=8))
     route_embedder, route_store = route_backend or (None, None)
 
-    if structured:
-        assert route_embedder is not None and route_store is not None
-        executor = QueryExecutor(
-            engine,
-            book_id,
-            embedder=route_embedder,
-            vector_store=route_store,
-        )
-        started = time.perf_counter()
-        answers = run_structured_qa(executor, golden, cutoff=cutoff)
-        elapsed = (time.perf_counter() - started) * 1000
-        routes["structured"] = {
-            **common,
-            "qa_chapter_accuracy": qa_chapter_accuracy(answers, golden.qas),
-            "latency_ms": round(elapsed, 1),
-            "usage": _usage_report(executor.stats(), input_chars=question_chars),
-            "answers": answers,
-        }
-    if hybrid:
-        assert route_embedder is not None and route_store is not None
-        service = RetrievalService(
-            engine,
-            book_id,
-            embedder=route_embedder,
-            vector_store=route_store,
-        )
-        started = time.perf_counter()
-        answers = run_hybrid_qa(service, golden, cutoff=cutoff)
-        elapsed = (time.perf_counter() - started) * 1000
-        routes["hybrid"] = {
-            **common,
-            "qa_chapter_accuracy": qa_chapter_accuracy(answers, golden.qas),
-            "latency_ms": round(elapsed, 1),
-            "usage": _usage_report({}, input_chars=question_chars),
-            "answers": answers,
-        }
-    if compressed:
-        chapter_texts = _chapter_texts(engine, book_id)
-        baseline = routes.get("structured") or common
-        routes["compressed"] = run_compressed_route(
-            engine,
-            book_id,
-            golden,
-            chapter_texts,
-            baseline,
-            known_surfaces=known_surfaces,
-            claim_extractor=claim_extractor,
-        )
+    try:
+        if structured:
+            assert route_embedder is not None and route_store is not None
+            executor = QueryExecutor(
+                engine,
+                book_id,
+                embedder=route_embedder,
+                vector_store=route_store,
+            )
+            started = time.perf_counter()
+            answers = run_structured_qa(executor, golden, cutoff=cutoff)
+            elapsed = (time.perf_counter() - started) * 1000
+            routes["structured"] = {
+                **common,
+                "qa_chapter_accuracy": qa_chapter_accuracy(answers, golden.qas),
+                "latency_ms": round(elapsed, 1),
+                "usage": _usage_report(executor.stats(), input_chars=question_chars),
+                "answers": answers,
+            }
+        if hybrid:
+            assert route_embedder is not None and route_store is not None
+            service = RetrievalService(
+                engine,
+                book_id,
+                embedder=route_embedder,
+                vector_store=route_store,
+            )
+            started = time.perf_counter()
+            answers = run_hybrid_qa(service, golden, cutoff=cutoff)
+            elapsed = (time.perf_counter() - started) * 1000
+            routes["hybrid"] = {
+                **common,
+                "qa_chapter_accuracy": qa_chapter_accuracy(answers, golden.qas),
+                "latency_ms": round(elapsed, 1),
+                "usage": _usage_report({}, input_chars=question_chars),
+                "answers": answers,
+            }
+        if compressed:
+            chapter_texts = _chapter_texts(engine, book_id)
+            baseline = routes.get("structured") or common
+            routes["compressed"] = run_compressed_route(
+                engine,
+                book_id,
+                golden,
+                chapter_texts,
+                baseline,
+                known_surfaces=known_surfaces,
+                claim_extractor=claim_extractor,
+            )
 
-    structured_route = routes.get("structured", {})
-    hybrid_route = routes.get("hybrid", {})
-    compressed_route = routes.get("compressed", {})
-    summary = {
-        "structured_qa_accuracy": structured_route.get("qa_chapter_accuracy", {}).get(
-            "accuracy", 0.0
-        ),
-        "hybrid_qa_accuracy": hybrid_route.get("qa_chapter_accuracy", {}).get("accuracy", 0.0),
-        "fact_f1": structured_route.get("facts", {}).get("f1", 0.0),
-        "fact_recall": structured_route.get("facts", {}).get("recall", 0.0),
-        "entity_merge_f1_all": structured_route.get("entity_merges", {})
-        .get("all", {})
-        .get("f1", 0.0),
-        "entity_merge_f1_core": structured_route.get("entity_merges", {})
-        .get("core", {})
-        .get("f1", 0.0),
-        "evidence_reproduction_rate": structured_route.get("evidence_reproduction", {}).get(
-            "reproduction_rate", 0.0
-        ),
-        "causal_precision": structured_route.get("causal_edges", {}).get("precision", 0.0),
-        "compression_enable": compressed_route.get("decision", {}).get("enable", False),
-        "compression_retention": compressed_route.get("retention", 0.0),
-        "structured_usage": structured_route.get("usage", {}),
-    }
-    # 真实 adapter 的 httpx 连接池用完释放（fake 无 close，防御 hasattr）
-    if route_embedder is not None:
-        closer = getattr(route_embedder, "close", None)
-        if closer is not None:
-            closer()
-    return PilotReport(book_id=book_id, routes=routes, summary=summary)
+        structured_route = routes.get("structured", {})
+        hybrid_route = routes.get("hybrid", {})
+        compressed_route = routes.get("compressed", {})
+        summary = {
+            "structured_qa_accuracy": structured_route.get("qa_chapter_accuracy", {}).get(
+                "accuracy", 0.0
+            ),
+            "hybrid_qa_accuracy": hybrid_route.get("qa_chapter_accuracy", {}).get("accuracy", 0.0),
+            "fact_f1": structured_route.get("facts", {}).get("f1", 0.0),
+            "fact_recall": structured_route.get("facts", {}).get("recall", 0.0),
+            "entity_merge_f1_all": structured_route.get("entity_merges", {})
+            .get("all", {})
+            .get("f1", 0.0),
+            "entity_merge_f1_core": structured_route.get("entity_merges", {})
+            .get("core", {})
+            .get("f1", 0.0),
+            "evidence_reproduction_rate": structured_route.get("evidence_reproduction", {}).get(
+                "reproduction_rate", 0.0
+            ),
+            "causal_precision": structured_route.get("causal_edges", {}).get("precision", 0.0),
+            "compression_enable": compressed_route.get("decision", {}).get("enable", False),
+            "compression_retention": compressed_route.get("retention", 0.0),
+            "structured_usage": structured_route.get("usage", {}),
+        }
+        return PilotReport(book_id=book_id, routes=routes, summary=summary)
+    finally:
+        # 真实 adapter 的 httpx 连接池用完释放（fake 无 close，防御 hasattr）
+        # finally：评测中途异常（QA/压缩路线抛错）也不泄漏（复审 D P2）
+        if route_embedder is not None:
+            closer = getattr(route_embedder, "close", None)
+            if closer is not None:
+                closer()

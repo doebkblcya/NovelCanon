@@ -751,3 +751,37 @@ def test_query_sources_carry_span_text(tmp_path: Path, migrated_db: Engine) -> N
         cs, ce = s["char_start"], s["char_end"]
         expect = full[start + cs : start + ce]
         assert s["span_text"] == expect, "span_text 必须等于原文切片"
+
+
+def test_api_backend_cache_creates_once(tmp_path: Path, migrated_db: Engine, monkeypatch) -> None:
+    """复审 D P1：连续两次查询 backend 只创建一次——缓存命中时不再创建并
+    丢弃未关闭的 httpx.Client（此前先调 backend_for_active_index 再查缓存，
+    每次请求都泄漏一个未关闭连接池）。"""
+    import novelcanon.retrieval.factory as factory_mod
+    from novelcanon.retrieval.factory import backend_for_active_index as real_fn
+    from novelcanon.retrieval.indexer import build_index
+    from novelcanon.retrieval.tokenizer import FakeTokenizer
+    from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
+
+    data = seed_active_book(migrated_db, tmp_path)
+    build_index(
+        migrated_db,
+        data["book_id"],
+        tokenizer=FakeTokenizer(),
+        embedder=FakeEmbedder(dimension=8),
+        vector_store=BruteForceVectorStore(dimension=8),
+    )
+    calls = {"n": 0}
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real_fn(*args, **kwargs)
+
+    monkeypatch.setattr(factory_mod, "backend_for_active_index", counting)
+    app = create_app(migrated_db)
+    client = make_client(app)
+    r1 = client.post("/query", json={"question": "萧炎的修为状态", "book_id": data["book_id"]})
+    assert r1.status_code == 200, r1.text
+    r2 = client.post("/query", json={"question": "萧炎的修为状态", "book_id": data["book_id"]})
+    assert r2.status_code == 200, r2.text
+    assert calls["n"] == 1, f"两次查询应只创建一次 backend：{calls['n']}"
