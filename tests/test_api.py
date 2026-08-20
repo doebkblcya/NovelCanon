@@ -652,3 +652,58 @@ def test_process_exits_with_stuck_pool_task() -> None:
     )
     assert proc.returncode == 0, proc.stderr
     assert "LIFESPAN_DONE" in proc.stdout, proc.stdout
+
+
+def test_pool_submit_shutdown_race_no_hanging_futures() -> None:
+    """复审 P1：并发 submit/shutdown 无关闭竞态——不得产生永不完成的
+    Future。
+
+    高并发下反复 submit（多线程）与 shutdown 交错：所有被 submit 接受
+    的 Future 必须全部完成（执行返回结果或被取消），绝不允许任务排在
+    退出哨兵之后悬挂。shutdown 后 submit 抛 RuntimeError 是合法拒绝。
+    """
+    import threading
+    import time
+
+    from novelcanon.api import _DaemonQueryPool
+
+    def _submitter(pool, stop, futures, unexpected) -> None:
+        while not stop.is_set():
+            try:
+                f = pool.submit(lambda: 1)
+                futures.append(f)
+            except RuntimeError:
+                pass  # shutdown 后拒绝——合法行为
+            except Exception as exc:  # noqa: BLE001 —— 其他异常视为竞态缺陷
+                unexpected.append(exc)
+
+    for _round in range(50):
+        pool = _DaemonQueryPool(max_workers=2)
+        stop = threading.Event()
+        futures: list = []
+        unexpected: list = []
+        threads = [
+            threading.Thread(target=_submitter, args=(pool, stop, futures, unexpected))
+            for _ in range(4)
+        ]
+        for t in threads:
+            t.start()
+        time.sleep(0.005)  # 让 submit 与 shutdown 高频交错
+        pool.shutdown(wait=False, cancel_futures=True)
+        stop.set()
+        for t in threads:
+            t.join()
+
+        assert not unexpected, f"round={_round} 出现异常：{unexpected}"
+        # 所有已接受的 Future 必须完成（执行返回结果或被取消）——悬挂即竞态。
+        # 注：被 shutdown 取消的 Future 状态为 CANCELLED（f.done()=True），
+        # 但 concurrent.futures.wait 只把 CANCELLED_AND_NOTIFIED/FINISHED 计入
+        # done——用 f.done() 逐个判定（与 ThreadPoolExecutor 语义一致）。
+        hanging = [f for f in futures if not f.done()]
+        assert not hanging, (
+            f"round={_round} 存在永不完成的 Future（submit/shutdown 竞态）：{len(hanging)} 个悬挂"
+        )
+        for f in futures:
+            if f.cancelled():
+                continue
+            assert f.result() == 1, f"round={_round} 执行结果异常"

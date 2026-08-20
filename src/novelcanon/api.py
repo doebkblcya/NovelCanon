@@ -98,6 +98,11 @@ class _DaemonQueryPool:
         self._max_workers = max_workers
         self._queue: queue.Queue[tuple[Future, Callable, tuple, dict] | None] = queue.Queue()
         self._shutdown = False
+        # 关闭竞态防护（复审 P1）：submit 的「检查 _shutdown + 入队」与
+        # shutdown 的「置 _shutdown + 清队列 + 哨兵入队」必须原子——否则
+        # shutdown 先清空队列并放入哨兵、submit 随后把任务排在哨兵之后，
+        # worker 全部退出后任务永不执行也永不取消（Future 悬挂）。
+        self._lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         for _ in range(max_workers):
             t = threading.Thread(target=self._run, name="dsh-query-worker", daemon=True)
@@ -105,10 +110,11 @@ class _DaemonQueryPool:
             self._threads.append(t)
 
     def submit(self, fn: Callable, /, *args: object, **kwargs: object) -> Future:
-        if self._shutdown:
-            raise RuntimeError("cannot schedule new futures after shutdown")
-        future: Future = Future()
-        self._queue.put((future, fn, args, kwargs))
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            future: Future = Future()
+            self._queue.put((future, fn, args, kwargs))
         return future
 
     def _run(self) -> None:
@@ -132,19 +138,24 @@ class _DaemonQueryPool:
     def shutdown(self, *, wait: bool = False, cancel_futures: bool = False) -> None:
         """取消排队任务并唤醒 worker 退出；运行中任务继续（daemon，不
         阻塞进程退出）。wait 参数保留以兼容 ThreadPoolExecutor 语义
-        （本池 daemon 线程无需 join）。"""
+        （本池 daemon 线程无需 join）。
+
+        与 submit 同一把锁：关闭后不再接受新任务（submit 抛
+        RuntimeError），杜绝「任务排在退出哨兵之后」的悬挂 Future。
+        """
         del wait
-        self._shutdown = True
-        if cancel_futures:
-            while True:
-                try:
-                    item = self._queue.get_nowait()
-                except queue.Empty:
-                    break
-                if item is not None:
-                    item[0].cancel()
-        for _ in range(self._max_workers):
-            self._queue.put(None)
+        with self._lock:
+            self._shutdown = True
+            if cancel_futures:
+                while True:
+                    try:
+                        item = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is not None:
+                        item[0].cancel()
+            for _ in range(self._max_workers):
+                self._queue.put(None)
 
 
 # ── 请求 / 响应模型 ───────────────────────────────────────────
