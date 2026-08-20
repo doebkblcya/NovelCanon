@@ -16,6 +16,8 @@ import json
 
 from sqlalchemy import Engine, text
 
+from novelcanon.evidence.selector import active_run_id, evidence_run_condition
+
 
 def _cutoff_sql(cutoff: int | None) -> tuple[str, dict[str, object]]:
     if cutoff is None:
@@ -74,17 +76,11 @@ class QueryService:
 
         0017 允许同 claim/span 多验证并存后，evidence 按 verification_run_id
         隔离——查询只返回 active run 的验证结果（失败 run 写入的同 claim
-        证据不得改变旧 active 查询）。"""
+        证据不得改变旧 active 查询）。复用 evidence/selector 统一入口。
+        """
         if self._active_run_cache is None:
-            with self._engine.connect() as conn:
-                row = conn.execute(
-                    text(
-                        "SELECT run_id FROM extraction_runs"
-                        " WHERE book_id = :b AND status = 'active'"
-                    ),
-                    {"b": self._book_id},
-                ).fetchone()
-            self._active_run_cache = str(row[0]) if row else False
+            found = active_run_id(self._engine, self._book_id)
+            self._active_run_cache = found or False
         cached: str | None | bool = self._active_run_cache
         if isinstance(cached, str):
             return cached
@@ -554,8 +550,9 @@ class QueryService:
                         " FROM claims c"
                         " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
                         " LEFT JOIN claim_evidence e ON e.claim_version_id = c.claim_version_id"
-                        "   AND (e.verification_run_id IS NULL OR e.verification_run_id = :vr)"
-                        " WHERE c.claim_version_id = :v AND ch.book_id = :book LIMIT 1"
+                        "   AND "
+                        + evidence_run_condition()
+                        + " WHERE c.claim_version_id = :v AND ch.book_id = :book LIMIT 1"
                     ),
                     {"v": claim_version_id_value, "book": self._book_id, "vr": active_run},
                 )
@@ -586,10 +583,10 @@ class QueryService:
                 conn.execute(
                     text(
                         "SELECT evidence_id, evidence_stance, chapter_id, char_start, char_end,"
-                        " span_hash FROM claim_evidence WHERE claim_version_id = :v"
-                        " AND (verification_run_id IS NULL OR verification_run_id = :r)"
+                        " span_hash FROM claim_evidence e WHERE e.claim_version_id = :v"
+                        " AND " + evidence_run_condition()
                     ),
-                    {"v": claim_version_id_value, "r": active_run},
+                    {"v": claim_version_id_value, "vr": active_run},
                 )
                 .mappings()
                 .fetchall()

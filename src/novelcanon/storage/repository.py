@@ -471,6 +471,10 @@ class Repository:
                 # 不改变 active 查询结果——验证结果按 run 作用域记录）；
                 # world_valid 缺省时幂等自愈（P1：图谱边必须按 world_valid
                 # 过滤）。
+                # P1（十六轮）：primary_evidence_id 是「当前 run 链接的锚定
+                # 证据」——本 run 重新 link 时必须更新为当前 run 的验证证据
+                # （_source_evidence 按 run exact-current-first 选择），否则
+                # 历史 run 的 primary 残留，link 证据隔离不可审计。
                 self._record_verification(conn, record, version_id)
                 conn.execute(
                     text(
@@ -487,6 +491,17 @@ class Repository:
                         "v": version_id,
                     },
                 )
+                if record.envelope.primary_evidence_id is not None:
+                    conn.execute(
+                        text(
+                            "UPDATE event_links SET primary_evidence_id = :pev"
+                            " WHERE claim_version_id = :v"
+                        ),
+                        {
+                            "pev": record.envelope.primary_evidence_id,
+                            "v": version_id,
+                        },
+                    )
                 self._record_event_link_observation(
                     conn, version_id, record.envelope.created_by_run_id
                 )

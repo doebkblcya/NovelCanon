@@ -22,6 +22,7 @@ from sqlalchemy import Engine, text
 from novelcanon.config.hash import stable_config_hash
 from novelcanon.events.linker import EventInfo, EventLinker, LinkCandidate
 from novelcanon.events.verifier import LinkVerification, LinkVerifier
+from novelcanon.evidence.selector import evidence_run_condition
 from novelcanon.schemas.envelope import ClaimEnvelope
 from novelcanon.schemas.ids import claim_version_id, event_link_fact_id
 from novelcanon.schemas.memory import EventLinkRecord
@@ -116,8 +117,8 @@ class EventLinkService:
             participants = self._canonicalize_participants(participants)
             if not participants:
                 continue
-            evidence_ordinals = self._evidence_ordinals(d["claim_version_id"])
-            evidence_stances = self._evidence_stances(d["claim_version_id"])
+            evidence_ordinals = self._evidence_ordinals(d["claim_version_id"], run_id)
+            evidence_stances = self._evidence_stances(d["claim_version_id"], run_id)
             events.append(
                 EventInfo(
                     claim_version_id=d["claim_version_id"],
@@ -138,11 +139,20 @@ class EventLinkService:
             )
         return events
 
-    def _evidence_stances(self, claim_version_id_value: str) -> list[str]:
+    def _evidence_stances(self, claim_version_id_value: str, run_id: str) -> list[str]:
+        """该 claim 在当前 run 下的证据 stance（exact-current-first）。
+
+        P1（十六轮）：事件证据也须按验证 run 隔离——本 run 验证记录
+        优先，仅当无本 run 记录时才回退 legacy NULL，不得混入其他 run
+        的验证结果。
+        """
         with self._engine.connect() as conn:
             rows = conn.execute(
-                text("SELECT evidence_stance FROM claim_evidence WHERE claim_version_id = :v"),
-                {"v": claim_version_id_value},
+                text(
+                    "SELECT e.evidence_stance FROM claim_evidence e"
+                    " WHERE e.claim_version_id = :v AND " + evidence_run_condition()
+                ),
+                {"v": claim_version_id_value, "vr": run_id},
             ).fetchall()
         return [r[0] for r in rows]
 
@@ -171,19 +181,21 @@ class EventLinkService:
             ).fetchall()
         return [r[0] for r in rows]
 
-    def _evidence_ordinals(self, claim_version_id_value: str) -> list[int]:
+    def _evidence_ordinals(self, claim_version_id_value: str, run_id: str) -> list[int]:
         """事件支持证据的披露章节（09 §4：observed ordinal = max 证据 ordinal）。
 
         证据锚定章节 → 该章节 ordinal（chapters.ordinal）。
+        P1（十六轮）：仅取当前 run 的验证证据（exact-current-first），
+        其他 run 的验证结果不参与本 run 链接的 ordinal 计算。
         """
         with self._engine.connect() as conn:
             rows = conn.execute(
                 text(
                     "SELECT ch.ordinal FROM claim_evidence e"
                     " JOIN chapters ch ON ch.chapter_id = e.chapter_id"
-                    " WHERE e.claim_version_id = :v"
+                    " WHERE e.claim_version_id = :v AND " + evidence_run_condition()
                 ),
-                {"v": claim_version_id_value},
+                {"v": claim_version_id_value, "vr": run_id},
             ).fetchall()
         return [r[0] for r in rows]
 
@@ -225,7 +237,7 @@ class EventLinkService:
         # 因果边不新建 claim_evidence 行（event_links 不是 claims 表事实，
         # FK 约束），而是复用原因端事件的第一个 supports 证据做锚定——
         # 仅作定位参考，不构成边的支持性判定。
-        primary_evidence = self._source_evidence(source.claim_version_id)
+        primary_evidence = self._source_evidence(source.claim_version_id, run_id)
 
         fact_id = event_link_fact_id(
             source.claim_version_id,
@@ -302,15 +314,20 @@ class EventLinkService:
             refs.append(summary)
         return refs
 
-    def _source_evidence(self, event_claim_version_id: str) -> str | None:
-        """原因端事件的第一个 supports 证据 id（边锚定用，09 §4）。"""
+    def _source_evidence(self, event_claim_version_id: str, run_id: str) -> str | None:
+        """原因端事件的第一个 supports 证据 id（边锚定用，09 §4）。
+
+        P1（十六轮）：只取当前 run 的验证证据（exact-current-first）——
+        link 的 primary_evidence_id 必须属于本 run，历史/其他 run 的
+        证据不得作为本 run 边的锚定。
+        """
         with self._engine.connect() as conn:
             row = conn.execute(
                 text(
-                    "SELECT evidence_id FROM claim_evidence"
-                    " WHERE claim_version_id = :v AND evidence_stance = 'supports'"
-                    " ORDER BY rowid LIMIT 1"
+                    "SELECT e.evidence_id FROM claim_evidence e"
+                    " WHERE e.claim_version_id = :v AND e.evidence_stance = 'supports'"
+                    " AND " + evidence_run_condition() + " ORDER BY e.rowid LIMIT 1"
                 ),
-                {"v": event_claim_version_id},
+                {"v": event_claim_version_id, "vr": run_id},
             ).fetchone()
         return row[0] if row else None

@@ -35,6 +35,12 @@ from novelcanon.eval.usage import (
     pipeline_usage_ledger,
     usage_cost_usd,
 )
+from novelcanon.evidence.selector import (
+    active_run_id as selector_active_run_id,
+)
+from novelcanon.evidence.selector import (
+    evidence_run_condition,
+)
 from novelcanon.extraction.materialize import (
     GoldenClaimLike,
     GoldenEvidenceLike,
@@ -246,15 +252,26 @@ def _entity_merge_report(golden: GoldenSet, predicted: list[tuple[str, str, str]
 
 
 def _evidence_hashes(engine: Engine, book_id: str) -> set[str]:
+    """全书证据 span_hash 集合（黄金证据复现指标用）。
+
+    P1（十六轮）：按 active run exact-current-first 过滤——0017 允许多 run
+    并存后，失败/历史 run 的 span 不得污染黄金证据复现；无 active run
+    时返回全部（兼容测试与未激活场景）。
+    """
+    run_id = selector_active_run_id(engine, book_id)
+    condition = evidence_run_condition() if run_id else ""
+    params: dict[str, object] = {"b": book_id}
+    if run_id:
+        params["vr"] = run_id
     with engine.connect() as conn:
         rows = conn.execute(
             text(
                 "SELECT DISTINCT e.span_hash FROM claim_evidence e"
                 " JOIN claims c ON c.claim_version_id = e.claim_version_id"
                 " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
-                " WHERE ch.book_id = :b"
+                f" WHERE ch.book_id = :b{' AND ' + condition if condition else ''}"
             ),
-            {"b": book_id},
+            params,
         ).fetchall()
     return {r[0] for r in rows}
 

@@ -91,10 +91,17 @@ async def _run_golden_pipeline(
     book_id: str,
     chapter_ids: dict[int, str],
     chapter_texts: dict[int, str],
+    *,
+    key_prefix: str = "",
 ) -> tuple[str, object]:
-    """固定 Draft 跑一遍流水线并激活；返回 (run_id, summary)。"""
+    """固定 Draft 跑一遍流水线并激活；返回 (run_id, summary)。
+
+    key_prefix：改变 checkpoint 键使 Map 复用失效——16 轮起每次激活的 run
+    都必须有自己的验证证据（align 重跑写本 run evidence，0017 多 run 并存），
+    幂等重跑/复用激活须重新物化（与 CLI extract 的 Map 复用 + align 重跑一致）。
+    """
     drafts = {d.ordinal: d for d in make_golden_drafts(chapter_ids, chapter_texts)}
-    tasks = _make_chapter_tasks(chapter_ids, chapter_texts, book_id)
+    tasks = _make_chapter_tasks(chapter_ids, chapter_texts, book_id, key_prefix=key_prefix)
     repo = Repository(engine)
 
     async def process(task: ChapterTask) -> ProcessResult:
@@ -246,13 +253,19 @@ def test_e2e_golden_closed_loop(tmp_path, migrated_db: Engine) -> None:
     cite = q.chapter_citation(state["claim_version_id"])
     assert cite is not None and cite["observed_chapter_id"] is not None
 
-    # ── 幂等：整条流水线重跑，事实/证据/实体数量不增加 ─────────
+    # ── 幂等：整条流水线重跑（重新物化，本 run 自己的验证证据）──
     before = _counts(migrated_db)
-    run2, _ = await_pipeline(migrated_db, book_id, chapter_ids, chapter_texts)
+    run2, _ = await_pipeline(migrated_db, book_id, chapter_ids, chapter_texts, key_prefix="rerun-")
     assert mgr.get(run2)["status"] == RunStatus.ACTIVE.value
     assert mgr.get(run1)["status"] == RunStatus.SUPERSEDED.value, "旧 active 必须被 supersede"
     after = _counts(migrated_db)
-    assert before == after, f"重跑不得增加数据：{before} → {after}"
+    # claims/entities/aliases/mentions 确定性幂等（同 claim_version_id/mention_id）；
+    # evidence 增加 = run2 自己的验证证据行（0017 多 run 并存，历史可审计）
+    assert after["claims"] == before["claims"], f"重跑不得增加 claim：{before} → {after}"
+    assert after["entities"] == before["entities"]
+    assert after["aliases"] == before["aliases"]
+    assert after["mentions"] == before["mentions"]
+    assert after["evidence"] > before["evidence"], "run2 应有自己的验证证据行（0017 并存）"
 
     # ── 验收 P0：第二次激活后所有必测查询与第一次一致 ──────────
     assert q.current_state("ent_xiaoshi", "cultivation_realm") == state, (
@@ -278,8 +291,10 @@ def test_e2e_golden_closed_loop(tmp_path, migrated_db: Engine) -> None:
     assert search_shadow(migrated_db, query="林家少主", book_id=book_id), "run2 激活后 FTS 仍可召回"
 
 
-def await_pipeline(engine, book_id, chapter_ids, chapter_texts):
-    return asyncio.run(_run_golden_pipeline(engine, book_id, chapter_ids, chapter_texts))
+def await_pipeline(engine, book_id, chapter_ids, chapter_texts, *, key_prefix: str = ""):
+    return asyncio.run(
+        _run_golden_pipeline(engine, book_id, chapter_ids, chapter_texts, key_prefix=key_prefix)
+    )
 
 
 def test_e2e_evidence_hash_reproducible(tmp_path, migrated_db: Engine) -> None:
@@ -562,8 +577,11 @@ def test_reuse_does_not_leak_failed_run_products(tmp_path, migrated_db: Engine) 
     q = QueryService(migrated_db, book_id)
     assert q.current_state("ent_xiaoshi", "failed_only") is None, "run2 未激活，staging 不可见"
 
-    # run3：用 run1 的原始键 → 全部命中 run1 checkpoint → 激活
-    run3, _ = await_pipeline(migrated_db, book_id, chapter_ids, chapter_texts)
+    # run3：重新物化（模拟 CLI extract 每次重新 align）→ 激活
+    # 16 轮语义：激活必须本 run 自己的验证证据——checkpoint 复用（reuse=True）
+    # 关联的旧 run claims 无本 run evidence，门禁拦截；真实流程每次重新抽取。
+    # 失败 run2 的 staging 产物不随重新物化进入 active（drafts 不含 leak claim）。
+    run3, _ = await_pipeline(migrated_db, book_id, chapter_ids, chapter_texts, key_prefix="rerun-")
     assert mgr.get(run3)["status"] == RunStatus.ACTIVE.value
     assert mgr.get(run1)["status"] == RunStatus.SUPERSEDED.value
     assert mgr.get(run2)["status"] == RunStatus.FAILED.value
