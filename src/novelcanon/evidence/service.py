@@ -146,12 +146,34 @@ class EvidenceService:
             evidences = self._align_claim(
                 draft, claim, refs, mention_surface, run_id, book_id, draft_id, stats
             )
-            aligned.append((_AdaptedClaim(claim, draft, evidences, ns, local_events), evidences))
+            aligned.append(
+                (
+                    _AdaptedClaim(
+                        claim,
+                        draft,
+                        evidences,
+                        ns,
+                        local_events,
+                        mention_surface=mention_surface,
+                    ),
+                    evidences,
+                )
+            )
 
         # 只有找到证据的 claim 才 materialize（找不到原文的不落库，
         # 保持 unverified 语义 + 避免无实体引用写库失败，07 退出标准）
         with_evidence = [(c, evs) for c, evs in aligned if evs]
         if with_evidence:
+            # canonical_map 需覆盖 _AlignedDraft.mentions 全部 mention
+            # （含 LLM 引用但未列入 mentions 的表面名补的 sf_ 行）。
+            # extra_surfaces 惰性填充：先触发 payload 解析再收集。
+            extra_surfaces: set[str] = set()
+            for c, _ in with_evidence:
+                _ = c.payload
+                extra_surfaces |= c.extra_surfaces
+            canonical_map = {ns(m_id): ns(m_id) for m_id in mention_surface} | {
+                ns("sf_" + s): ns("sf_" + s) for s in extra_surfaces
+            }
             materialize_draft(
                 self._engine,
                 run_id=run_id,
@@ -164,7 +186,7 @@ class EvidenceService:
                         ns,
                     ),
                 ),
-                canonical_map={ns(m_id): ns(m_id) for m_id in mention_surface},
+                canonical_map=canonical_map,
                 chapter_text=chapter_text,
                 repo=self._repo,
             )
@@ -351,7 +373,19 @@ class _AlignedDraft:
 
     @property
     def mentions(self) -> list[tuple[str, str]]:
-        return [(self._ns(m.mention_id), m.surface_name) for m in self._draft.mentions]
+        mentions = [(self._ns(m.mention_id), m.surface_name) for m in self._draft.mentions]
+        # LLM 引用但未列入 mentions 的表面名：补确定性 mention
+        # （ns("sf_" + surface)），materialize 为其创建 entity 行，
+        # 否则 claim 的实体引用 FK 失败（真实冒烟抓到）。
+        # 注意：extra_surfaces 在访问 claim.payload 时惰性填充，
+        # materialize 先遍历 mentions——必须先触发解析再收集。
+        extra: set[str] = set()
+        for c in self._claims:
+            _ = c.payload  # 触发 _ns_payload → _resolve_ref → extra_surfaces
+            extra |= c.extra_surfaces
+        for surface in sorted(extra):
+            mentions.append((self._ns("sf_" + surface), surface))
+        return mentions
 
     @property
     def claims(self) -> list[_AdaptedClaim]:
@@ -377,12 +411,40 @@ class _AdaptedClaim:
         evidences: list[AlignedEvidence],
         ns=None,
         local_events: list[dict] | None = None,
+        mention_surface: dict[str, str] | None = None,
     ) -> None:
         self._claim = claim
         self._draft = draft
         self._evidences = evidences
         self._ns = ns or (lambda mid: mid)
         self._local_events = local_events or []
+        self._mention_surface = mention_surface or {}
+        # LLM 引用但未列入本章 mentions 的表面名（组织/家族等），
+        # materialize 前需补 entity 行（见 _AlignedDraft.mentions）。
+        self._extra_surfaces: set[str] = set()
+
+    @property
+    def extra_surfaces(self) -> set[str]:
+        return self._extra_surfaces
+
+    def _resolve_ref(self, ref: str) -> str:
+        """把 claim payload 的实体引用解析为章级 namespace 主键。
+
+        LLM 输出不稳定：既可能用 mention_id（如 m3）也可能直接写表面名
+        （如「庇拉尔·特尔内拉」），甚至引用**未列入本章 mentions** 的
+        实体（如组织/家族名）。mention_id → 直接 ns；表面名 → 反查本章
+        mentions 得到 mention_id 再 ns；查不到的表面名 → 补一个确定性
+        mention（ns("sf_" + 表面名)，记入 extra_surfaces，materialize
+        为其建 entity 行，避免 FK 失败）。反查取第一个匹配（同表面名
+        多个 mention 时确定性选择）。
+        """
+        if ref in self._mention_surface:
+            return self._ns(ref)
+        for mid, surface in self._mention_surface.items():
+            if surface == ref:
+                return self._ns(mid)
+        self._extra_surfaces.add(ref)
+        return self._ns("sf_" + ref)
 
     def _ns_payload(self, payload: dict) -> dict:
         """把 payload 中的 mention 引用字段替换为章级 namespace。"""
@@ -398,14 +460,14 @@ class _AdaptedClaim:
         ):
             mid = out.get(fld)
             if isinstance(mid, str):
-                out[fld] = self._ns(mid)
+                out[fld] = self._resolve_ref(mid)
         for fld in ("related_entity_ids", "participants"):
             ids = out.get(fld)
             if isinstance(ids, list):
                 # P0 修复：循环变量是 fld，不能用 dataclasses.field（函数对象）
                 # 做字典 key——否则 dict 含非字符串 key，**kwargs 解包时抛
                 # TypeError: keywords must be strings（foreshadowing 崩溃）。
-                out[fld] = [self._ns(m) if isinstance(m, str) else m for m in ids]
+                out[fld] = [self._resolve_ref(m) if isinstance(m, str) else m for m in ids]
         return out
 
     @property

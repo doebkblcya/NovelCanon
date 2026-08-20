@@ -9,6 +9,9 @@ data/*.db-shm
 data/*.sqlite
 data/*.sqlite3
 
+# 备份产物（数据库快照 + 语料归档）
+data/backups/
+
 # Python 工程
 __pycache__/
 *.py[cod]

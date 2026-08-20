@@ -700,3 +700,80 @@ def test_align_foreshadowing_with_related_entities(tmp_path, migrated_db: Engine
             )
         ).scalar()
     assert n == 1, "foreshadowing claim 必须 materialize 落库"
+
+
+def test_align_claim_surface_name_reference(tmp_path, migrated_db: Engine) -> None:
+    """真实冒烟抓到的 bug：LLM 输出的 claim payload 实体引用可能是**表面名**
+    （如「庇拉尔·特尔内拉」）而非 mention_id——_ns_payload 无条件 ns(mid)
+    会生成 ch_xxx_表面名，而 entities 行只按 ns(mention_id) 创建 → FK 失败。
+    修复：_AdaptedClaim 反查本章 mentions，表面名 → mention_id → ns。"""
+    from novelcanon.schemas.payloads import RelationPayload
+
+    book_id, chapter_id, chapter_text = _book_and_chapter(migrated_db, tmp_path)
+    run_id = RunManager(migrated_db).create(book_id, input_hash="evidence-surface")
+    draft = build_real_draft(chapter_id, chapter_text)
+    # 把 relation claim 的实体引用改成表面名（真实 LLM 行为）
+    draft.provisional_claims[1].payload = RelationPayload(
+        from_entity_id="萧炎",
+        to_entity_id="萧战",
+        relation_type="父子",
+        relation_raw="父亲萧战",
+    )
+
+    service = EvidenceService(migrated_db)
+    stats = service.align_chapter(run_id, book_id, draft, chapter_text, "draft_1")
+    assert stats.errors == [], f"表面名引用不得报错：{stats.errors}"
+    assert stats.statuses.get("supported", 0) >= 2
+
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT from_entity_id, to_entity_id FROM relation_claims"
+                " ORDER BY rowid DESC LIMIT 1"
+            )
+        ).fetchone()
+    # 表面名必须解析为章级 namespace 主键（ns(mention_id) 形式）
+    assert row is not None
+    assert row[0].startswith(chapter_id[:12] + "_m"), (
+        f"from_entity_id 应为 ns(mention_id)：{row[0]}"
+    )
+    assert row[1].startswith(chapter_id[:12] + "_m"), f"to_entity_id 应为 ns(mention_id)：{row[1]}"
+
+
+def test_align_unlisted_surface_gets_synthetic_entity(tmp_path, migrated_db: Engine) -> None:
+    """真实冒烟抓到的 bug：LLM 可能引用**未列入本章 mentions** 的表面名
+    （如组织/家族名「布恩迪亚家族」）——反查无果时需补确定性 mention
+    （ns("sf_" + surface)）并建 entity 行，否则 materialize FK 失败。"""
+    from novelcanon.schemas.payloads import RelationPayload
+
+    book_id, chapter_id, chapter_text = _book_and_chapter(migrated_db, tmp_path)
+    run_id = RunManager(migrated_db).create(book_id, input_hash="evidence-unlisted")
+    draft = build_real_draft(chapter_id, chapter_text)
+    # to_entity_id 引用本章 mentions 中不存在的表面名（但原文存在，可锚定）
+    draft.provisional_claims[1].payload = RelationPayload(
+        from_entity_id="m1",
+        to_entity_id="测验广场",
+        relation_type="位于",
+        relation_raw="测验广场",
+    )
+
+    service = EvidenceService(migrated_db)
+    stats = service.align_chapter(run_id, book_id, draft, chapter_text, "draft_1")
+    assert stats.errors == [], f"未列出表面名不得报错：{stats.errors}"
+
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT from_entity_id, to_entity_id FROM relation_claims"
+                " ORDER BY rowid DESC LIMIT 1"
+            )
+        ).fetchone()
+    assert row is not None
+    assert row[1] == f"{chapter_id[:12]}_sf_测验广场", f"未列出表面名应补 sf_ mention：{row[1]}"
+    # entity 行必须存在（FK 完整性）
+    with migrated_db.connect() as conn:
+        ent = conn.execute(
+            text("SELECT canonical_id FROM entities WHERE canonical_id = :cid"),
+            {"cid": row[1]},
+        ).fetchone()
+    assert ent is not None, f"sf_ mention 必须有 entity 行：{row[1]}"
