@@ -15,6 +15,8 @@ from sqlalchemy import Engine
 
 from novelcanon.query import QueryCache, active_state_signature
 from novelcanon.query.cache import CacheKey
+from novelcanon.schemas.envelope import ClaimEnvelope
+from novelcanon.schemas.types import ClaimStatus, Operation
 from tests.helpers import seed_active_book
 
 
@@ -91,3 +93,61 @@ def test_cache_key_includes_query_and_profiles(tmp_path: Path, migrated_db: Engi
     assert _key(data["book_id"], migrated_db, qprofile="prod").to_key() != base.to_key()
     assert _key(data["book_id"], migrated_db, sprofile="synth-v2").to_key() != base.to_key()
     assert _key(data["book_id"], migrated_db, world=3).to_key() != base.to_key()
+
+
+def test_summary_rebuild_invalidates_plotline_cache(
+    tmp_path: Path, migrated_db: Engine
+) -> None:
+    """P1-5a：同一 active run 下摘要重建 → 签名变化 → 主线缓存不命中。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    from novelcanon.query import QueryExecutor
+    from novelcanon.retrieval import BruteForceVectorStore, FakeEmbedder
+    from novelcanon.summaries import DeterministicSummarizer, HierarchicalReducer
+
+    reducer = HierarchicalReducer(
+        migrated_db, data["book_id"], summarizer=DeterministicSummarizer()
+    )
+    reducer.reduce()
+
+    executor = QueryExecutor(
+        migrated_db,
+        data["book_id"],
+        embedder=FakeEmbedder(dimension=8),
+        vector_store=BruteForceVectorStore(dimension=8),
+    )
+    r1 = executor.ask("这本书的主线是什么")
+    assert not r1.cached
+    assert r1.answer["sources"], "应有摘要上下文"
+    r2 = executor.ask("这本书的主线是什么")
+    assert r2.cached, "摘要未变时应命中缓存"
+
+    # 新增 claim → 摘要重建（新 summary_id）→ 主线缓存失效
+    from novelcanon.schemas.ids import relation_fact_id
+    from novelcanon.schemas.payloads import RelationPayload
+    from novelcanon.storage.repository import Repository
+
+    repo = Repository(migrated_db)
+    repo.write_claim(
+        ClaimEnvelope(
+            fact_id=relation_fact_id("ent_xiaoyan", "师徒", "ent_yaolao"),
+            claim_version_id="",
+            claim_type="relation",
+            operation=Operation.ASSERT,
+            claim_status=ClaimStatus.SUPPORTED,
+            observed_chapter_id=data["chapters"][1],
+            observed_ordinal=1,
+            world_valid_kind="chapter_proxy",
+            world_valid_from=1,
+            created_by_run_id=data["run_id"],
+            created_at="2026-01-01T00:00:00+00:00",
+        ),
+        RelationPayload(
+            from_entity_id="ent_xiaoyan",
+            to_entity_id="ent_yaolao",
+            relation_type="师徒",
+            relation_raw="萧炎拜药老为师",
+        ),
+    )
+    reducer.reduce()
+    r3 = executor.ask("这本书的主线是什么")
+    assert not r3.cached, "摘要重建后旧主线缓存不得命中"

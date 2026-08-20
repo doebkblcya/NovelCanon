@@ -648,6 +648,7 @@ def _run_query(
             f"   {route}: calls={st['calls']} 延迟={st['latency_ms']}ms"
             f" 上下文项={st['context_items']} 命中={st['hits']}"
             f" 缓存命中={st['cache_hits']}"
+            f" tokens={st['input_tokens']}in/{st['output_tokens']}out"
         )
 
 
@@ -747,6 +748,12 @@ def _run_summarize(
         typer.echo(
             f"   全书「{s['title']}」 max_ordinal={s['max_observed_ordinal']}"
             f" 依赖卷摘要={len(json.loads(s['depends_on_summaries']))}"
+        )
+    if result.tokens.total() > 0:
+        typer.echo(
+            f"   token 计量：{result.tokens.input_tokens}in/"
+            f"{result.tokens.output_tokens}out"
+            f" 重试={result.tokens.retry_count}"
         )
 
 

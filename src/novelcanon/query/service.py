@@ -298,8 +298,19 @@ class QueryService:
             )
             return {"event": event, "participants": [dict(p) for p in participants]}
 
-    def claim_history(self, fact_id: str) -> list[dict]:
-        """某 fact 的完整版本历史（append-only，按写入序；限定本书）。"""
+    def claim_history(
+        self, fact_id: str, *, knowledge_cutoff: int | None = None
+    ) -> list[dict]:
+        """某 fact 的版本历史（append-only，按写入序；限定本书）。
+
+        knowledge_cutoff（P0）：只返回截止章前披露的版本——关系演变查询
+        不得把后期版本数量/内容泄露给早期 cutoff。
+        """
+        cutoff_sql = ""
+        params: dict[str, object] = {"f": fact_id, "book": self._book_id}
+        if knowledge_cutoff is not None:
+            cutoff_sql = " AND c.observed_ordinal <= :cutoff"
+            params["cutoff"] = knowledge_cutoff
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
@@ -308,9 +319,10 @@ class QueryService:
                         " c.claim_status, c.observed_ordinal, c.created_by_run_id"
                         " FROM claims c"
                         " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
-                        " WHERE c.fact_id = :f AND ch.book_id = :book ORDER BY c.rowid"
+                        " WHERE c.fact_id = :f AND ch.book_id = :book"
+                        f"{cutoff_sql} ORDER BY c.rowid"
                     ),
-                    {"f": fact_id, "book": self._book_id},
+                    params,
                 )
                 .mappings()
                 .fetchall()
@@ -752,6 +764,66 @@ class QueryService:
             out.append(d)
         return out
 
+    def all_events(
+        self,
+        *,
+        knowledge_cutoff: int | None = None,
+        world_at: int | None = None,
+        limit: int = 30,
+    ) -> list[dict]:
+        """全书关键事件（P1：无摘要回退用，不局限于第 0 章）。
+
+        cutoff 前全部 supported 事件（带参与者与证据），按披露章节排序，
+        限量返回——供「全局主线」路线在尚无分层摘要时提供结构化兜底。
+        """
+        cutoff_sql = ""
+        world_sql = ""
+        params: dict[str, object] = {"book": self._book_id, "lim": limit}
+        if knowledge_cutoff is not None:
+            cutoff_sql = "AND c.observed_ordinal <= :cutoff"
+            params["cutoff"] = knowledge_cutoff
+        if world_at is not None:
+            world_sql = (
+                " AND ("
+                "   (c.world_valid_kind = 'chapter_proxy'"
+                "    AND c.world_valid_from <= :world)"
+                "   OR (c.world_valid_kind = 'story_time'"
+                "    AND c.world_valid_from <= :world"
+                "    AND (c.world_valid_to IS NULL OR c.world_valid_to >= :world))"
+                " )"
+            )
+            params["world"] = world_at
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT c.claim_version_id, e.event_type, e.summary,"
+                        " e.sequence_in_chapter, c.observed_ordinal"
+                        " FROM event_claims e"
+                        " JOIN claims c ON c.claim_version_id = e.claim_version_id"
+                        " JOIN claim_observations o ON o.claim_version_id = c.claim_version_id"
+                        " JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
+                        " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
+                        " WHERE r.status = 'active' AND r.book_id = :book"
+                        "   AND c.claim_status = 'supported'"
+                        "   AND c.operation != 'retract'"
+                        f"   {cutoff_sql}{world_sql}"
+                        " ORDER BY c.observed_ordinal, e.sequence_in_chapter"
+                        " LIMIT :lim"
+                    ),
+                    params,
+                )
+                .mappings()
+                .fetchall()
+            )
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["evidence"] = self._evidence_for(d["claim_version_id"])
+            d["participants"] = self._event_participant_ids(d["claim_version_id"])
+            out.append(d)
+        return out
+
     def _event_participant_ids(self, event_claim_version_id: str) -> list[str]:
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -977,13 +1049,22 @@ class QueryService:
         """实体统一快照（10 §1 统一返回版本/置信度/状态/证据）。
 
         组合状态、一跳关系、势力成员、事件与展示名；全部双时间过滤。
+        world_at 传入时状态用世界时间快照（world_state_at），否则用
+        当前披露状态（entity_state，P0 双时间贯通）。
         """
+        state = (
+            self.world_state_at(
+                canonical_id, world_at, knowledge_cutoff=knowledge_cutoff
+            )
+            if world_at is not None
+            else self.entity_state(canonical_id, knowledge_cutoff=knowledge_cutoff)
+        )
         return {
             "canonical_id": canonical_id,
             "display_name": self.display_name(
                 canonical_id, knowledge_cutoff=knowledge_cutoff
             ),
-            "state": self.entity_state(canonical_id, knowledge_cutoff=knowledge_cutoff),
+            "state": state,
             "relations": self.one_hop_relations(
                 canonical_id,
                 knowledge_cutoff=knowledge_cutoff,

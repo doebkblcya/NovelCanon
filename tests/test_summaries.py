@@ -42,7 +42,7 @@ def test_reduce_hierarchy_and_max_ordinal(
     vol = result.volume_summaries[0]
     assert vol["max_observed_ordinal"] == 2  # 3 章 → ordinal 0..2
     assert vol["level"] == "volume"
-    assert vol["prompt_version"] == "deterministic-v1"
+    assert vol["prompt_version"] == "deterministic-v2"
     assert vol["content_hash"]
     versions = json.loads(vol["input_claim_versions"])
     assert versions and all(v.startswith("ver_") for v in versions)
@@ -152,3 +152,62 @@ def test_reduce_deterministic_content_stable(tmp_path: Path, migrated_db: Engine
     assert (
         r1.book_summary["content_hash"] == r2.book_summary["content_hash"]
     )
+
+
+def test_book_summary_consumes_volume_summaries(
+    tmp_path: Path, migrated_db: Engine
+) -> None:
+    """P0-1：全书摘要的生成输入是卷摘要（分层 Reduce），不再展开章节记忆。
+
+    LLM prompt 断言：book 级调用只含卷摘要内容，不含章节记忆 JSON。
+    """
+    data = seed_active_book(migrated_db, tmp_path)
+    from novelcanon.generation.client import FakeGenerationClient
+    from novelcanon.pipeline.ledger import Usage
+    from novelcanon.summaries import LLMSummarizer
+
+    fake = FakeGenerationClient(
+        {
+            "章节记忆": '{"summary":"卷摘要文本","key_events":[],"key_entities":[]}',
+            "卷摘要": '{"summary":"全书摘要文本","key_events":[],"key_entities":[]}',
+        },
+        usage=Usage(input_tokens=80, output_tokens=30, provider="fake", model="m"),
+    )
+    summarizer = LLMSummarizer(fake, profile_id="p1")
+    reducer = HierarchicalReducer(
+        migrated_db, data["book_id"], summarizer=summarizer
+    )
+    result = reducer.reduce()
+    assert result.book_summary is not None
+    # 两次调用：卷摘要（章节记忆）→ 全书摘要（卷摘要）
+    assert len(fake.calls) == 2
+    volume_prompt, book_prompt = fake.calls
+    assert "章节记忆" in volume_prompt, "卷摘要输入是章节记忆"
+    assert "章节记忆" not in book_prompt, "全书摘要不得再次展开章节记忆"
+    assert "卷摘要" in book_prompt, "全书摘要输入是卷摘要（分层 Reduce）"
+    assert "全书摘要文本" in result.book_summary["content"]
+
+
+def test_llm_reduce_usage_aggregated(tmp_path: Path, migrated_db: Engine) -> None:
+    """P1-5b：LLM Reduce 的 usage 汇总到 SummaryResult.tokens。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    from novelcanon.generation.client import FakeGenerationClient
+    from novelcanon.pipeline.ledger import Usage
+    from novelcanon.summaries import LLMSummarizer
+
+    fake = FakeGenerationClient(
+        {
+            "章节记忆": '{"summary":"卷摘要","key_events":[],"key_entities":[]}',
+            "卷摘要": '{"summary":"全书摘要","key_events":[],"key_entities":[]}',
+        },
+        usage=Usage(input_tokens=100, output_tokens=50, provider="fake", model="m"),
+    )
+    reducer = HierarchicalReducer(
+        migrated_db,
+        data["book_id"],
+        summarizer=LLMSummarizer(fake, profile_id="p1"),
+    )
+    result = reducer.reduce()
+    # 卷 + 全书两次调用
+    assert result.tokens.input_tokens == 200
+    assert result.tokens.output_tokens == 100

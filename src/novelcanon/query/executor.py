@@ -67,6 +67,8 @@ class RouteStats:
     context_items: int = 0
     hits: int = 0
     cache_hits: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     def latency_ms(self) -> float:
         return round(self.total_ms / self.calls, 1) if self.calls else 0.0
@@ -185,6 +187,9 @@ class QueryExecutor:
         stats.total_ms += elapsed_ms
         stats.context_items += len(context)
         stats.hits += len([c for c in context if c.kind == "chunk"])
+        if result.usage is not None:
+            stats.input_tokens += result.usage.input_tokens
+            stats.output_tokens += result.usage.output_tokens
 
         payload = {
             "answer": result.answer,
@@ -233,6 +238,8 @@ class QueryExecutor:
                 "context_items": s.context_items,
                 "hits": s.hits,
                 "cache_hits": s.cache_hits,
+                "input_tokens": s.input_tokens,
+                "output_tokens": s.output_tokens,
             }
             for route, s in sorted(self._stats.items())
         }
@@ -265,7 +272,7 @@ class QueryExecutor:
         knowledge_cutoff: int | None,
         world_at: int | None,
     ) -> list[ContextItem]:
-        entity = self._find_entity(normalized)
+        entity = self._find_entity(normalized, knowledge_cutoff=knowledge_cutoff)
         if entity is None:
             # 结构化问题未解析出实体：返回空上下文（合成层会拒答），
             # 同时记录诊断——不静默落到生成式检索（10 验证项）。
@@ -273,7 +280,17 @@ class QueryExecutor:
         cid, surface = entity
         items: list[ContextItem] = []
         if qtype == QueryType.ENTITY_STATE:
-            for s in self._query.entity_state(cid, knowledge_cutoff=knowledge_cutoff):
+            # 双时间（P0）：world_at 传入时用世界时间状态（world_state_at），
+            # 否则用当前披露状态（entity_state）。
+            if world_at is not None:
+                states = self._query.world_state_at(
+                    cid, world_at, knowledge_cutoff=knowledge_cutoff
+                )
+            else:
+                states = self._query.entity_state(
+                    cid, knowledge_cutoff=knowledge_cutoff
+                )
+            for s in states:
                 items.append(
                     self._claim_item(s, f"{surface} 的 {s['field']} = {s['value']}")
                 )
@@ -303,7 +320,9 @@ class QueryExecutor:
             for r in self._query.one_hop_relations(
                 cid, knowledge_cutoff=knowledge_cutoff, world_at=world_at
             ):
-                history = self._query.claim_history(r["fact_id"])
+                history = self._query.claim_history(
+                    r["fact_id"], knowledge_cutoff=knowledge_cutoff
+                )
                 items.append(
                     self._claim_item(
                         r,
@@ -383,19 +402,16 @@ class QueryExecutor:
             for r in rows
         ]
         if not items:
-            # 尚无摘要：回退关键事件（结构化，仍带证据）
-            for ev in self._query.world_events_at(0):
-                if knowledge_cutoff is None or ev["observed_ordinal"] <= knowledge_cutoff:
-                    items.append(
-                        ContextItem(
-                            kind="claim",
-                            claim_type="event",
-                            claim_version_id=ev["claim_version_id"],
-                            observed_ordinal=ev["observed_ordinal"],
-                            content=f"[{ev['event_type']}] {ev['summary']}",
-                            claim_status="supported",
-                        )
+            # 尚无摘要：回退全书关键事件（P1：不再只查第 0 章，
+            # all_events 取 cutoff 前全部 supported 事件，限量排序）
+            for ev in self._query.all_events(
+                knowledge_cutoff=knowledge_cutoff, limit=30
+            ):
+                items.append(
+                    self._claim_item(
+                        ev, content=f"[{ev['event_type']}] {ev['summary']}"
                     )
+                )
         return items
 
     def _term(
@@ -407,17 +423,10 @@ class QueryExecutor:
         d = self._query.term_definition(term, knowledge_cutoff=knowledge_cutoff)
         if d is None:
             return []
-        return [
-            ContextItem(
-                kind="claim",
-                claim_type="term_definition",
-                claim_version_id=d["claim_version_id"],
-                observed_ordinal=d["observed_ordinal"],
-                content=f"术语「{d['canonical_name']}」：{d['definition']}",
-                claim_status="supported",
-                confidence=1.0,
-            )
-        ]
+        row = dict(d)
+        row["claim_type"] = "term_definition"
+        content = f"术语「{d['canonical_name']}」：{d['definition']}"
+        return [self._claim_item(row, content)]
 
     def _chapter(
         self,
@@ -435,14 +444,8 @@ class QueryExecutor:
         ):
             payload = g.get("payload") or "{}"
             items.append(
-                ContextItem(
-                    kind="claim",
-                    claim_type=g["claim_type"],
-                    claim_version_id=g["claim_version_id"],
-                    observed_ordinal=g["observed_ordinal"],
-                    content=f"[{g['claim_type']}] {payload}",
-                    claim_status=g["claim_status"],
-                    confidence=g["confidence"],
+                self._claim_item(
+                    g, content=f"[{g['claim_type']}] {payload}"
                 )
             )
         return items
@@ -451,18 +454,30 @@ class QueryExecutor:
 
     @staticmethod
     def _claim_item(row: dict, content: str) -> ContextItem:
+        """把查询行转为上下文：保留证据的章节与原文 span 定位（P0）。
+
+        row 来自 QueryService（entity_state/one_hop_relations/org_membership
+        /chapter_graph 等），均带 evidence（claim_evidence 行）。取第一条
+        supports 证据的 chapter_id/char_start/char_end/stance，使最终
+        AnswerSource 能提供「章节定位 + evidence」（10 §4 退出标准）。
+        """
         evidence = row.get("evidence") or []
-        stance = evidence[0].get("evidence_stance", "") if evidence else ""
+        primary = next(
+            (e for e in evidence if e.get("evidence_stance") == "supports"),
+            evidence[0] if evidence else None,
+        )
         return ContextItem(
             kind="claim",
             claim_type=row.get("claim_type"),
             claim_version_id=row["claim_version_id"],
-            chapter_id=None,
+            chapter_id=primary.get("chapter_id") if primary else None,
             observed_ordinal=row.get("observed_ordinal"),
+            char_start=primary.get("char_start") if primary else None,
+            char_end=primary.get("char_end") if primary else None,
             content=content,
             claim_status=row.get("claim_status", "supported"),
             confidence=row.get("confidence"),
-            evidence_stance=stance,
+            evidence_stance=primary.get("evidence_stance", "") if primary else "",
         )
 
     @staticmethod
@@ -482,8 +497,20 @@ class QueryExecutor:
 
     # ── 实体 / 术语 / 章节解析 ──────────────────────────────────
 
-    def _find_entity(self, normalized: str) -> tuple[str, str] | None:
-        """问题中最长匹配的 active 实体表面名 → (canonical_id, surface)。"""
+    def _find_entity(
+        self, normalized: str, *, knowledge_cutoff: int | None = None
+    ) -> tuple[str, str] | None:
+        """问题中最长匹配的 active 实体表面名 → (canonical_id, surface)。
+
+        knowledge_cutoff（P0）：alias 按 observed_ordinal 截断——后期才
+        披露的身份名不得在早期 cutoff 查询中参与实体解析（alias 必须
+        按 observed_ordinal 截断的契约）。
+        """
+        cutoff_sql = ""
+        params: dict[str, object] = {"b": self._book_id}
+        if knowledge_cutoff is not None:
+            cutoff_sql = " AND a.observed_ordinal <= :cutoff"
+            params["cutoff"] = knowledge_cutoff
         with self._engine.connect() as conn:
             rows = conn.execute(
                 text(
@@ -494,9 +521,10 @@ class QueryExecutor:
                     " JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
                     " LEFT JOIN entity_resolutions er ON er.mention_id = a.canonical_id"
                     " WHERE r.status = 'active' AND r.book_id = :b AND a.operation = 'assert'"
+                    f"{cutoff_sql}"
                     " GROUP BY cid, a.surface_name"
                 ),
-                {"b": self._book_id},
+                params,
             ).fetchall()
         best: tuple[str, str] | None = None
         for cid, surface in rows:

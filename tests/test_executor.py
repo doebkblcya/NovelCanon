@@ -15,13 +15,16 @@ from pathlib import Path
 
 from sqlalchemy import Engine
 
-from novelcanon.query import QueryExecutor
+from novelcanon.query import QueryExecutor, QueryService
 from novelcanon.retrieval import (
     BruteForceVectorStore,
     FakeEmbedder,
     FakeTokenizer,
     build_index,
 )
+from novelcanon.schemas.envelope import ClaimEnvelope
+from novelcanon.schemas.types import ClaimStatus, Operation
+from novelcanon.storage.repository import Repository
 from tests.helpers import seed_active_book
 
 
@@ -131,3 +134,152 @@ def test_explain_reports_route(tmp_path: Path, migrated_db: Engine) -> None:
     assert expl["query_type"] == "relation"
     assert expl["route"] == "structured"
     assert expl["matched_keywords"]
+
+
+# ── 阶段 10 验收复审 P0/P1 回归 ────────────────────────────────
+
+
+def test_entity_state_honors_world_at(tmp_path: Path, migrated_db: Engine) -> None:
+    """P0-2：ENTITY_STATE 路线传入 world_at 时用世界时间状态。
+
+    萧炎 alive 在 ch2（ordinal 1，chapter_proxy from=1）：world_at=0 时
+    世界窗口未覆盖（不返回），world_at=1 时返回——不是当前披露状态。
+    """
+    data = seed_active_book(migrated_db, tmp_path)
+    executor = _executor(migrated_db, data)
+    r0 = _ask(executor, "萧炎的状态如何", world_at=0)
+    assert "alive" not in r0.answer["answer"], "world_at=0 不得返回 ch2 状态"
+    r1 = _ask(executor, "萧炎的状态如何", world_at=1)
+    assert "alive" in r1.answer["answer"], "world_at=1 应返回世界时间状态"
+    # 快照同步贯通
+    qs = QueryService(migrated_db, data["book_id"])
+    snap0 = qs.entity_snapshot("ent_xiaoyan", world_at=0)
+    assert snap0["state"] == []
+    snap1 = qs.entity_snapshot("ent_xiaoyan", world_at=1)
+    assert snap1["state"] and snap1["state"][0]["field"] == "alive"
+
+
+def test_late_alias_blocked_by_cutoff(tmp_path: Path, migrated_db: Engine) -> None:
+    """P0-3a：后期披露的 alias 在早期 cutoff 不参与实体解析。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    repo = Repository(migrated_db)
+    from novelcanon.schemas.ids import alias_fact_id
+    from novelcanon.schemas.memory import AliasClaim
+
+    # 萧炎后期化名「炎帝」（ch3 / ordinal 2 才披露）
+    repo.write_alias(
+        AliasClaim(
+            alias_fact_id=alias_fact_id("ent_xiaoyan", "炎帝"),
+            claim_version_id="",
+            canonical_id="ent_xiaoyan",
+            surface_name="炎帝",
+            observed_ordinal=2,
+            observed_chapter_id=data["chapters"][2],
+            created_by_run_id=data["run_id"],
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+    )
+    executor = _executor(migrated_db, data)
+    early = _ask(executor, "炎帝的状态如何", knowledge_cutoff=1)
+    assert early.answer["cannot_answer"], "cutoff=1 时「炎帝」未披露，不得解析"
+    late = _ask(executor, "炎帝的状态如何", knowledge_cutoff=2)
+    assert "alive" in late.answer["answer"], "cutoff=2 时「炎帝」已披露"
+
+
+def test_relation_evolution_respects_cutoff(tmp_path: Path, migrated_db: Engine) -> None:
+    """P0-3b：关系演变不泄露未来版本数（claim_history 截止前版本）。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    repo = Repository(migrated_db)
+    from novelcanon.schemas.ids import relation_fact_id
+    from novelcanon.schemas.payloads import RelationPayload
+
+    fact = relation_fact_id("ent_yaolao", "师徒", "ent_xiaoyan")
+    # 第 2 版：ch3（ordinal 2）关系更新为「正式收徒」
+    repo.write_claim(
+        ClaimEnvelope(
+            fact_id=fact,
+            claim_version_id="",
+            claim_type="relation",
+            operation=Operation.ASSERT,
+            claim_status=ClaimStatus.SUPPORTED,
+            observed_chapter_id=data["chapters"][2],
+            observed_ordinal=2,
+            world_valid_kind="chapter_proxy",
+            world_valid_from=2,
+            created_by_run_id=data["run_id"],
+            created_at="2026-01-01T00:00:00+00:00",
+        ),
+        RelationPayload(
+            from_entity_id="ent_yaolao",
+            to_entity_id="ent_xiaoyan",
+            relation_type="师徒",
+            relation_raw="药老正式收萧炎为徒",
+        ),
+    )
+    qs = QueryService(migrated_db, data["book_id"])
+    full = qs.claim_history(fact)
+    assert len(full) == 2, "完整历史 2 个版本"
+    early = qs.claim_history(fact, knowledge_cutoff=1)
+    assert len(early) == 1, "cutoff=1 只含第 1 版（不泄露未来版本数）"
+    # 端到端：关系演变回答中版本数受 cutoff 约束
+    executor = _executor(migrated_db, data)
+    r = _ask(executor, "药老和萧炎的关系如何变化", knowledge_cutoff=1)
+    assert "版本数=1" in r.answer["answer"], (
+        f"cutoff=1 版本数应为 1：{r.answer['answer']}"
+    )
+
+
+def test_structured_answer_carries_evidence_location(
+    tmp_path: Path, migrated_db: Engine
+) -> None:
+    """P0-4：结构化答案的 AnswerSource 带章节定位与原文 span。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    executor = _executor(migrated_db, data)
+    r = _ask(executor, "萧炎的状态如何")
+    assert r.answer["sources"], "应有证据来源"
+    for s in r.answer["sources"]:
+        assert s["chapter_id"], "证据必须带 chapter_id"
+        assert s["char_start"] is not None, "证据必须带 char_start"
+        assert s["char_end"] is not None, "证据必须带 char_end"
+        assert s["observed_ordinal"] is not None
+
+
+def test_llm_synthesis_usage_tracked(tmp_path: Path, migrated_db: Engine) -> None:
+    """P1-5b：LLM 问答的 usage 进入 RouteStats token 统计。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    from novelcanon.generation.client import FakeGenerationClient
+    from novelcanon.pipeline.ledger import Usage
+
+    fake = FakeGenerationClient(
+        {"上下文": '{"answer":"萧炎修为三段","confidence":0.9,"caveats":[]}'},
+        usage=Usage(input_tokens=120, output_tokens=60, provider="fake", model="m"),
+    )
+    executor = QueryExecutor(
+        migrated_db,
+        data["book_id"],
+        embedder=FakeEmbedder(dimension=8),
+        vector_store=BruteForceVectorStore(dimension=8),
+        synthesis_client=fake,
+        profile_id="p1",
+    )
+    _ask(executor, "萧炎的状态如何")
+    stats = executor.stats()
+    structured = stats["structured"]
+    assert structured["input_tokens"] == 120
+    assert structured["output_tokens"] == 60
+
+
+def test_plotline_fallback_uses_all_book_events(
+    tmp_path: Path, migrated_db: Engine
+) -> None:
+    """P1-5c：无摘要时主线回退覆盖全书关键事件（非仅第 0 章）。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    executor = _executor(migrated_db, data)
+    r = _ask(executor, "这本书的主线是什么")
+    assert r.decision.query_type == "plotline"
+    sources = r.answer["sources"]
+    assert sources, "无摘要时应回退关键事件"
+    ordinals = {s["observed_ordinal"] for s in sources}
+    assert len(ordinals) >= 2, (
+        f"回退应覆盖多章事件（当前只覆盖 {ordinals}）"
+    )

@@ -21,11 +21,12 @@ from dataclasses import dataclass, field
 from sqlalchemy import Engine, text
 
 from novelcanon.config.hash import stable_config_hash
+from novelcanon.pipeline.ledger import Usage
 from novelcanon.storage.repository import now_iso
 from novelcanon.summaries.volumes import GroupingResult, VolumeGrouper
 
 REDUCER_SCHEMA_VERSION = "reducer-v1"
-DETERMINISTIC_PROMPT_VERSION = "deterministic-v1"
+DETERMINISTIC_PROMPT_VERSION = "deterministic-v2"  # 分层 Reduce：全书摘要消费卷摘要
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,14 @@ class ChapterMemory:
 
 
 @dataclass(frozen=True)
+class SummaryOutput:
+    """一次摘要生成的输出：内容 + token 计量（usage 不丢弃，P1）。"""
+
+    content: str
+    usage: Usage | None = None
+
+
+@dataclass(frozen=True)
 class SummaryResult:
     book_id: str
     grouping: GroupingResult
@@ -51,20 +60,46 @@ class SummaryResult:
     stale: int = 0
     rebuilt: int = 0
     reused: int = 0
+    # 本次 Reduce 的模型 token 计量（P1：LLM Reduce 不丢弃 usage）
+    tokens: Usage = field(default_factory=Usage)
 
 
 class Summarizer:
-    """摘要生成器抽象：输入章节记忆，输出摘要文本（JSON 或纯文本）。"""
+    """摘要生成器抽象。
 
-    def summarize(self, memories: list[ChapterMemory], *, title: str) -> str:
+    - 卷摘要：memories 为卷内章节结构化记忆，volume_summaries=None；
+    - 全书摘要（分层 Reduce，P0）：memories 只用于元数据（claim 集合 /
+      max ordinal），**生成输入是 volume_summaries（卷摘要内容）**——长篇
+      不会把整本结构化记忆再塞进一次模型调用。
+    """
+
+    def summarize(
+        self,
+        memories: list[ChapterMemory],
+        *,
+        title: str,
+        volume_summaries: list[dict] | None = None,
+    ) -> SummaryOutput:
         raise NotImplementedError
 
 
 class DeterministicSummarizer(Summarizer):
-    """提取式摘要（无模型）：按 ordinal 组织关键 claim，不调用模型。"""
+    """提取式摘要（无模型）：按 ordinal 组织关键 claim / 转述卷摘要。"""
 
-    def summarize(self, memories: list[ChapterMemory], *, title: str) -> str:
+    def summarize(
+        self,
+        memories: list[ChapterMemory],
+        *,
+        title: str,
+        volume_summaries: list[dict] | None = None,
+    ) -> SummaryOutput:
         lines = [f"《{title}》结构化摘要（确定性提取，无模型推断）："]
+        if volume_summaries:
+            # 分层：全书摘要的输入是卷摘要，不再展开章节记忆
+            lines.append("（分层 Reduce：以下为各卷摘要）")
+            for vs in sorted(volume_summaries, key=lambda v: v["max_observed_ordinal"]):
+                lines.append(f"- 卷「{vs['title']}」：{vs['content']}")
+            return SummaryOutput(content="\n".join(lines))
         for m in sorted(memories, key=lambda x: x.ordinal):
             events = [c for c in m.claims if c["claim_type"] == "event"]
             others = [c for c in m.claims if c["claim_type"] != "event"]
@@ -94,11 +129,14 @@ class DeterministicSummarizer(Summarizer):
                     )
             if parts:
                 lines.append(f"第{m.ordinal}章{m.title or ''}：{'；'.join(parts)}")
-        return "\n".join(lines)
+        return SummaryOutput(content="\n".join(lines))
 
 
 class LLMSummarizer(Summarizer):
-    """模型摘要：prompt 只含章节记忆（结构化 JSON），输出 JSON。"""
+    """模型摘要：prompt 只含输入（章节记忆或卷摘要），输出 JSON。
+
+    usage 随 SummaryOutput 返回（P1：LLM Reduce 不丢弃 token 计量）。
+    """
 
     def __init__(
         self,
@@ -111,34 +149,72 @@ class LLMSummarizer(Summarizer):
         self.profile_id = profile_id or getattr(client, "profile_id", "")
         self.prompt_version = prompt_version
 
-    def summarize(self, memories: list[ChapterMemory], *, title: str) -> str:
+    def summarize(
+        self,
+        memories: list[ChapterMemory],
+        *,
+        title: str,
+        volume_summaries: list[dict] | None = None,
+    ) -> SummaryOutput:
         import asyncio
 
-        prompt = self._build_prompt(memories, title=title)
+        prompt = self._build_prompt(memories, title=title, volume_summaries=volume_summaries)
         result = asyncio.run(self._client.complete(prompt))
         raw = result.raw_text.strip()
-        return raw or "（模型未返回有效摘要）"
+        return SummaryOutput(
+            content=raw or "（模型未返回有效摘要）",
+            usage=result.usage,
+        )
 
-    def _build_prompt(self, memories: list[ChapterMemory], *, title: str) -> str:
+    def _build_prompt(
+        self,
+        memories: list[ChapterMemory],
+        *,
+        title: str,
+        volume_summaries: list[dict] | None,
+    ) -> str:
         lines = [
-            "你是 NovelCanon 分层摘要器。只依据给定的章节结构化记忆生成摘要，",
+            "你是 NovelCanon 分层摘要器。只依据给定的输入生成摘要，",
             "不得使用模型自身记忆补充小说内容。",
             f"卷/书名：{title}",
-            "章节记忆（JSON）：",
-            json.dumps(
-                [
-                    {
-                        "ordinal": m.ordinal,
-                        "title": m.title,
-                        "claims": m.claims,
-                    }
-                    for m in sorted(memories, key=lambda x: x.ordinal)
-                ],
-                ensure_ascii=False,
-            ),
-            '输出 JSON：{"summary": 摘要正文, "key_events": [关键事件], '
-            '"key_entities": [关键实体]}。',
         ]
+        if volume_summaries:
+            # 分层：全书摘要只接收卷摘要（不展开章节记忆）
+            lines.append("卷摘要（JSON）：")
+            lines.append(
+                json.dumps(
+                    [
+                        {
+                            "title": vs["title"],
+                            "summary": vs["content"],
+                            "max_observed_ordinal": vs["max_observed_ordinal"],
+                        }
+                        for vs in sorted(
+                            volume_summaries, key=lambda v: v["max_observed_ordinal"]
+                        )
+                    ],
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            lines.append("章节记忆（JSON）：")
+            lines.append(
+                json.dumps(
+                    [
+                        {
+                            "ordinal": m.ordinal,
+                            "title": m.title,
+                            "claims": m.claims,
+                        }
+                        for m in sorted(memories, key=lambda x: x.ordinal)
+                    ],
+                    ensure_ascii=False,
+                )
+            )
+        lines.append(
+            '输出 JSON：{"summary": 摘要正文, "key_events": [关键事件], '
+            '"key_entities": [关键实体]}。'
+        )
         return "\n".join(lines)
 
 
@@ -165,9 +241,14 @@ class HierarchicalReducer:
     # ── 对外 ────────────────────────────────────────────────────
 
     def reduce(self, *, cutoff: int | None = None) -> SummaryResult:
-        """分层 Reduce：分组 → 卷摘要 → 全书摘要（幂等 + 失效重建）。"""
+        """分层 Reduce：分组 → 卷摘要 → 全书摘要（幂等 + 失效重建）。
+
+        全书摘要的生成输入是卷摘要（分层 Reduce，P0）：memories 只用于
+        元数据（claim 集合 / max ordinal），不再次展开全部章节记忆。
+        """
         grouping = self._grouper.group()
         memories = self._chapter_memories(cutoff)
+        tokens = Usage()
 
         volume_summaries: list[dict] = []
         rebuilt = 0
@@ -192,6 +273,7 @@ class HierarchicalReducer:
             volume_summaries.append(out)
             rebuilt += 1 if out["rebuilt"] else 0
             reused += 1 if out["reused"] else 0
+            tokens = tokens + (out.get("usage") or Usage())
 
         book_summary: dict | None = None
         if volume_summaries:
@@ -200,12 +282,14 @@ class HierarchicalReducer:
                 volume_id=None,
                 grouping_version=None,
                 title=self._book_title(),
-                memories=memories,
+                memories=memories,  # 仅元数据：claim 集合 / max ordinal
+                volume_summaries=volume_summaries,  # 实际生成输入（分层）
                 depends_on=[s["summary_id"] for s in volume_summaries],
             )
             book_summary = book_out
             rebuilt += 1 if book_out["rebuilt"] else 0
             reused += 1 if book_out["reused"] else 0
+            tokens = tokens + (book_out.get("usage") or Usage())
 
         stale = self._stale_count()
         return SummaryResult(
@@ -217,6 +301,7 @@ class HierarchicalReducer:
             stale=stale,
             rebuilt=rebuilt,
             reused=reused,
+            tokens=tokens,
         )
 
     # ── 章节记忆 ────────────────────────────────────────────────
@@ -333,6 +418,7 @@ class HierarchicalReducer:
         title: str,
         memories: list[ChapterMemory],
         depends_on: list[str],
+        volume_summaries: list[dict] | None = None,
     ) -> dict:
         claim_versions = sorted(
             {c for m in memories for c in m.claim_version_ids()}
@@ -352,11 +438,17 @@ class HierarchicalReducer:
             and existing["depends_on_summaries"] == depends_json
             and existing["prompt_version"] == prompt_version
         ):
-            return self._row_dict(existing, rebuilt=False, reused=True)
+            d = self._row_dict(existing, rebuilt=False, reused=True)
+            d["usage"] = None
+            return d
 
-        content = self._summarizer.summarize(
-            memories, title=title or f"{level}摘要"
+        output = self._summarizer.summarize(
+            memories,
+            title=title or f"{level}摘要",
+            volume_summaries=volume_summaries,
         )
+        content = output.content
+        usage = output.usage
         content_hash = stable_config_hash({"content": content})
         summary_id = stable_config_hash(
             {
@@ -441,7 +533,9 @@ class HierarchicalReducer:
                 },
             )
         row = self._fetch_summary(summary_id)
-        return self._row_dict(row, rebuilt=rebuilt, reused=False)
+        d = self._row_dict(row, rebuilt=rebuilt, reused=False)
+        d["usage"] = usage
+        return d
 
     def _valid_summary(self, level: str, volume_id: str | None) -> dict | None:
         with self._engine.connect() as conn:

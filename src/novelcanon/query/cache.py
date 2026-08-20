@@ -27,11 +27,13 @@ CACHE_POLICY_VERSION = "cache-v1"
 
 
 def active_state_signature(engine: Engine, book_id: str) -> str:
-    """active run 集合 + active index version 的签名。
+    """active run 集合 + active index version + 有效摘要集合的签名。
 
-    任一 active run 变化（新增/换人/失效）或索引版本切换 → 签名变化
-    → 旧缓存键失效。签名只依赖不可变身份字段（run_id/status、
-    index_version_id/status），不依赖变更时间戳，保证同状态幂等。
+    任一 active run 变化（新增/换人/失效）、索引版本切换或分层摘要重建
+    → 签名变化 → 旧缓存键失效（P1：同一 active run 下摘要重建后，已缓存
+    的主线答案不得继续命中旧结果）。签名只依赖不可变身份字段
+    （run_id/status、index_version_id/status、summary_id/content_hash/status），
+    不依赖变更时间戳，保证同状态幂等。
     """
     with engine.connect() as conn:
         runs = conn.execute(
@@ -48,10 +50,19 @@ def active_state_signature(engine: Engine, book_id: str) -> str:
             ),
             {"b": book_id},
         ).fetchall()
+        summaries = conn.execute(
+            text(
+                "SELECT summary_id, level, content_hash, status"
+                " FROM summary_artifacts WHERE book_id = :b AND status = 'valid'"
+                " ORDER BY summary_id"
+            ),
+            {"b": book_id},
+        ).fetchall()
     return stable_config_hash(
         {
             "active_runs": [[r[0], r[1]] for r in runs],
             "active_indexes": [[r[0], r[1]] for r in index],
+            "valid_summaries": [[r[0], r[1], r[2], r[3]] for r in summaries],
         }
     )
 

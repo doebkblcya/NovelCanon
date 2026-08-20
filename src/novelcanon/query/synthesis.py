@@ -22,6 +22,7 @@ from typing import Any, Protocol
 from sqlalchemy import Engine, text
 
 from novelcanon.config.hash import stable_config_hash
+from novelcanon.pipeline.ledger import Usage
 
 SYNTHESIS_SCHEMA_VERSION = "synthesis-v2"
 DETERMINISTIC_PROMPT_VERSION = "deterministic-v1"
@@ -74,6 +75,7 @@ class AnswerResult:
     context_id: str = ""
     query_profile: str = ""
     profile_id: str = ""
+    usage: Usage | None = None
     knowledge_cutoff: int | None = None
     world_at: int | None = None
     synthesized: bool = False  # False = 确定性模板合成
@@ -240,6 +242,7 @@ class SynthesisService:
             context_id=context_id,
             query_profile=self._query_profile,
             profile_id=self._profile_id,
+            usage=result.usage,
             knowledge_cutoff=knowledge_cutoff,
             world_at=world_at,
             synthesized=True,
