@@ -317,22 +317,93 @@ def _assert_schema_constraints(engine: Engine, chapter_id: str, run_id: str, tag
     assert n_obs == 0, "删除 claim 必须级联删除 observation"
 
 
+def _alembic_version(engine: Engine) -> str:
+    with engine.connect() as conn:
+        return conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+
+
 def test_0017_restores_schema_constraints(tmp_path, migrated_db: Engine) -> None:
-    """0017 重建表恢复枚举 CHECK 与 ON DELETE CASCADE；downgrade 还原 v1
-    表同样保留原约束（upgrade/downgrade 双向验证）。"""
+    """0017/0018 重建表恢复枚举 CHECK 与 ON DELETE CASCADE；downgrade 还原
+    v1 表同样保留原约束（upgrade/downgrade 双向验证，每步断言版本号）。
+
+    十六轮 P1：旧实现用 command.upgrade("0016_runs_abandoned")——库已在
+    0017 时对祖先版本 upgrade 是 no-op，根本没执行 downgrade；必须用
+    command.downgrade 并核对 alembic_version 变化。
+    """
     book_id, chapter_id, chapter_text = _book_and_chapter(migrated_db, tmp_path)
     run_id = RunManager(migrated_db).create(book_id, input_hash="mig-0017")
     db_path = migrated_db.url.database
 
+    assert _alembic_version(migrated_db) == "0018_restore_evidence_constraints"
     _assert_schema_constraints(migrated_db, chapter_id, run_id, "head")
 
-    def _migrate(revision: str) -> None:
+    def _migrate(revision: str, *, downgrade: bool) -> None:
         cfg = Config(ALEMBIC_INI)
         cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
-        command.upgrade(cfg, revision)
+        if downgrade:
+            command.downgrade(cfg, revision)
+        else:
+            command.upgrade(cfg, revision)
 
-    _migrate("0016_runs_abandoned")
+    # 真正 downgrade 到 0016（经 0018.downgrade → 0017.downgrade）
+    _migrate("0016_runs_abandoned", downgrade=True)
+    assert _alembic_version(migrated_db) == "0016_runs_abandoned", "downgrade 必须实际执行"
     _assert_schema_constraints(migrated_db, chapter_id, run_id, "v1")
 
-    _migrate("head")
+    # 回到 head（经 0017.upgrade → 0018.upgrade）
+    _migrate("head", downgrade=False)
+    assert _alembic_version(migrated_db) == "0018_restore_evidence_constraints"
     _assert_schema_constraints(migrated_db, chapter_id, run_id, "head2")
+
+
+def test_0018_preserves_multiple_verifications(tmp_path, migrated_db: Engine) -> None:
+    """0018 原样迁移全部证据行：同 span 多验证（legacy + current run）不按
+    span 去重——0017 语义下 v1/v2 与跨 run 历史必须完整保留（downgrade 到
+    0017 再 upgrade 重放后仍在）。"""
+    book_id, chapter_id, chapter_text = _book_and_chapter(migrated_db, tmp_path)
+    run_id = RunManager(migrated_db).create(book_id, input_hash="mig-0018-keep")
+    db_path = migrated_db.url.database
+    vid = "ver_multi"
+    with migrated_db.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO claims (fact_id, claim_version_id, claim_type, operation,"
+                " claim_status, observed_chapter_id, observed_ordinal, created_by_run_id,"
+                " created_at) VALUES ('fact_multi', :v, 'state', 'assert', 'supported',"
+                " :ch, 1, :r, '2026-01-01T00:00:00+00:00')"
+            ),
+            {"v": vid, "ch": chapter_id, "r": run_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO claim_observations (claim_version_id, extraction_run_id,"
+                " observed_at) VALUES (:v, :r, '2026-01-01T00:00:00+00:00')"
+            ),
+            {"v": vid, "r": run_id},
+        )
+        # 同 span 两条：legacy NULL + current run（0017 并存语义）
+        for eid, run in (("ev_a", None), ("ev_b", run_id)):
+            conn.execute(
+                text(
+                    "INSERT INTO claim_evidence (evidence_id, claim_version_id, evidence_stance,"
+                    " evidence_type, chapter_id, char_start, char_end, span_hash,"
+                    " literal_match_rate, verification_method, verification_run_id)"
+                    " VALUES (:eid, :v, 'supports', 'direct', :ch, 0, 3, 'abc', 1.0,"
+                    " 'hash-exact', :r)"
+                ),
+                {"eid": eid, "v": vid, "ch": chapter_id, "r": run},
+            )
+
+    # downgrade 到 0017（只回退 0018）→ upgrade head（0018 重放）
+    cfg = Config(ALEMBIC_INI)
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    command.downgrade(cfg, "0017_evidence_run_version")
+    assert _alembic_version(migrated_db) == "0017_evidence_run_version"
+    command.upgrade(cfg, "head")
+    assert _alembic_version(migrated_db) == "0018_restore_evidence_constraints"
+    with migrated_db.connect() as conn:
+        n = conn.execute(
+            text("SELECT COUNT(*) FROM claim_evidence WHERE claim_version_id = :v"),
+            {"v": vid},
+        ).scalar()
+    assert n == 2, f"0018 不得按 span 去重（同 span 多验证须并存）：{n}"
