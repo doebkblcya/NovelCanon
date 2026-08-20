@@ -215,6 +215,83 @@ class DraftValidator:
         return issues
 
 
+class LiteralQuoteCheck:
+    """逐字引用检查（阶段 11 增强 A 第 3 项）：证据层把 summary/relation_raw
+    /raw_value/clue_anchor/definition 当作硬锚，若 Map 阶段不约束，改写句
+    会在证据物化时才被丢弃（真实语料 no_span_found 62.6%）。本检查在
+    Map 阶段即验证这些字段能在原文中逐字定位（标点/空白容差），失败项
+    作为 issue 返回，供调用方触发针对性 repair——而不是等到证据层丢弃。
+
+    不污染 DraftValidator 的核心 7 层（结构/披露/引用），由
+    map_pipeline 在 draft 校验通过后单独调用。
+    """
+
+    # (claim_type, payload 字段) 硬锚清单（与 span_candidates.extract_anchors
+    # 的 hard=True 一致；raw_value 为软锚，也纳入提示但不强制）。
+    _HARD_FIELDS: list[tuple[str, str]] = [
+        ("event", "summary"),
+        ("relation", "relation_raw"),
+        ("state", "raw_value"),
+        ("foreshadowing", "clue_anchor"),
+        ("term_definition", "definition"),
+    ]
+
+    def __init__(self, chapter_text: str, segments: dict[str, str] | None = None) -> None:
+        """chapter_text：整章正文（兜底）；segments：segment_id → 段文本。
+
+        P1（阶段 11 十三轮）：证据对齐只在 claim 的 ref_source_segment_id
+        对应段内搜索——检查器必须按同一范围校验，否则引用存在于本章其他
+        段会在 Map 阶段误通过、对齐阶段仍 no_span_found。segments 提供后
+        每条 claim 只检查自己的引用段；缺省退化到整章。
+        """
+        self._chapter_text = chapter_text
+        self._segments = segments or {}
+
+    def _scope_text(self, seg_id: str | None) -> str:
+        if seg_id and seg_id in self._segments:
+            return self._segments[seg_id]
+        return self._chapter_text
+
+    def check(self, payload: dict[str, Any]) -> list[Issue]:
+        """对一份 merged draft 检查全部 claim 的逐字字段。
+
+        returns issues（code="literal_quote"）；字段为空/非字符串跳过。
+        """
+        issues: list[Issue] = []
+        for claim in payload.get("provisional_claims") or []:
+            if not isinstance(claim, dict):
+                continue
+            ctype = str(claim.get("claim_type") or "")
+            cpayload = claim.get("payload") or {}
+            if not isinstance(cpayload, dict):
+                continue
+            scope = _strip_punct(self._scope_text(claim.get("ref_source_segment_id")))
+            for ctype_, field in self._HARD_FIELDS:
+                if ctype != ctype_:
+                    continue
+                value = cpayload.get(field)
+                if not isinstance(value, str) or len(value) < 2:
+                    continue
+                if _strip_punct(value) not in scope:
+                    issues.append(
+                        Issue(
+                            "literal_quote",
+                            f"claim {claim.get('provisional_claim_id')} 的 {field} "
+                            f"「{value[:40]}」在引用段"
+                            f" {claim.get('ref_source_segment_id')} 中无法逐字定位"
+                            "（需逐字摘录，不得改写/补主语/替换代词/删虚词）",
+                        )
+                    )
+        return issues
+
+
+def _strip_punct(text: str) -> str:
+    """删除标点/空白（与 evidence.span_candidates._normalize 同规则）。"""
+    import re
+
+    return re.sub(r"[\s,，。！？；：、．.·…—–-”“\"'‘’()（）\[\]【】<>《》]+", "", text)
+
+
 def _first_validation_error(exc: ValidationError) -> str:
     first = exc.errors()[0]
     loc = ".".join(str(x) for x in first.get("loc", ()))

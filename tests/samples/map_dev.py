@@ -259,7 +259,7 @@ def build_dev_drafts(chapter_ids: dict[int, str]) -> list[ExtractionDraftV1]:
                 mentions=_mentions(text, "阿远", "青云宗", "药老"),
                 claims=[
                     _state("c1", "阿远", "cultivation_realm", "炼气"),
-                    _event("c2", "试炼", "阿远通过青云宗试炼", ["阿远"], "青云宗"),
+                    _event("c2", "试炼", "通过试炼", ["阿远"], "青云宗"),
                 ],
                 events=[
                     LocalEventDraft(
@@ -277,7 +277,7 @@ def build_dev_drafts(chapter_ids: dict[int, str]) -> list[ExtractionDraftV1]:
                 text,
                 mentions=_mentions(text, "药老", "阿远", "陆沉", "陆家"),
                 claims=[
-                    _event("c1", "身份揭露", "药老告知阿远真名陆沉", ["药老", "阿远"]),
+                    _event("c1", "身份揭露", "他本名陆沉", ["药老", "阿远"]),
                     _relation("c2", "陆沉", "陆家", "少主", "失踪的陆家少主"),
                 ],
                 events=[
@@ -298,7 +298,7 @@ def build_dev_drafts(chapter_ids: dict[int, str]) -> list[ExtractionDraftV1]:
                 claims=[
                     _relation("c1", "陆家", "赵家", "仇敌", "陆家旧敌赵家"),
                     _relation("c2", "陆沉", "赵坤", "仇敌", "定下三年之约"),
-                    _event("c3", "约定", "陆沉与赵坤定下三年之约", ["陆沉", "赵坤"]),
+                    _event("c3", "约定", "定下三年之约", ["陆沉", "赵坤"]),
                 ],
                 events=[
                     LocalEventDraft(
@@ -353,7 +353,7 @@ def build_dev_drafts(chapter_ids: dict[int, str]) -> list[ExtractionDraftV1]:
                 ordinal,
                 text,
                 mentions=_mentions(text, "阿杏", "陆沉"),
-                claims=[_event("c1", "离别", "阿杏送陆沉离开", ["阿杏", "陆沉"])],
+                claims=[_event("c1", "离别", "阿杏送陆沉到镇口", ["阿杏", "陆沉"])],
                 events=[
                     LocalEventDraft(
                         local_event_id="e1",

@@ -73,7 +73,11 @@ def build_map_process_fn(
     )
 
     async def _request_segment(
-        seg: SourceSegment, ref_lines: list[str], chapter_id: str, ordinal: int
+        seg: SourceSegment,
+        ref_lines: list[str],
+        chapter_id: str,
+        ordinal: int,
+        repair_issues: list[str] | None = None,
     ) -> _SegmentPart:
         usage = Usage()
         prompt = build_map_prompt(
@@ -83,6 +87,7 @@ def build_map_process_fn(
             chapter_id=chapter_id,
             chapter_ordinal=ordinal,
             ref_segment_lines=ref_lines,
+            repair_issues=repair_issues,  # 阶段 11 增强 A：逐字引用修复请求
         )
         req_hash = request_hash(prompt, model=profile.model, profile_id=profile.profile_id)
         result: GenerationResult = await client.complete(prompt)
@@ -185,9 +190,84 @@ def build_map_process_fn(
             chapter_text=task.content,
         )
         draft, issues = validator.validate(merged)
+        quote_issues: list[Issue] = []
+
+        # 阶段 11 增强 A 第 3 项：draft 结构通过后，立即检查逐字字段
+        # （summary/relation_raw/raw_value/clue_anchor/definition 是否在原文
+        # 中可定位）。改写句若等到证据物化才丢弃（no_span_found 62.6%），
+        # 成本已发生且无法修复——这里在 Map 阶段触发**一次**针对性 repair，
+        # 把逐字缺失项作为 repair_issues 重发。
+        if draft is not None:
+            from novelcanon.generation.parser import LiteralQuoteCheck
+
+            # P1（十三轮）：按引用段校验（与证据对齐同范围）——多窗口章节
+            # 中引用文字若只在其他段，Map 阶段不得误通过。
+            segment_text_by_id = {seg.segment_id: seg.content for seg in segments}
+            quote_check = LiteralQuoteCheck(task.content, segment_text_by_id)
+            quote_issues = quote_check.check(merged)
+            if quote_issues and max_repair_attempts >= 1:
+                # 只重发有逐字问题的 segment（claims 按 ref_source_segment_id
+                # 归属段；无引用段的按全部段重发以兜底）。
+                affected_segs: set[str] = set()
+                for issue in quote_issues:
+                    for claim in merged.get("provisional_claims") or []:
+                        if isinstance(claim, dict) and issue.message.startswith(
+                            f"claim {claim.get('provisional_claim_id')}"
+                        ):
+                            seg_id = claim.get("ref_source_segment_id")
+                            if isinstance(seg_id, str) and seg_id:
+                                affected_segs.add(seg_id)
+                repair_segs = (
+                    [s for s in segments if s.segment_id in affected_segs]
+                    if affected_segs
+                    else segments
+                )
+                # P1（十三轮）：不得重置 total_usage——首次调用的 token/成本
+                # 必须保留，repair 响应 usage 累加其上（否则账本只记 repair，
+                # 正式 Pilot 每万字 token/重试成本偏低）。
+                repaired_usage = Usage()
+                repaired_parts = await asyncio.gather(
+                    *[
+                        _request_segment(
+                            seg,
+                            [ref_line_by_seg[seg.segment_id]],
+                            task.chapter_id,
+                            task.ordinal,
+                            repair_issues=[i.message for i in quote_issues],
+                        )
+                        for seg in repair_segs
+                    ]
+                )
+                for part in repaired_parts:
+                    repaired_usage = repaired_usage + part.usage
+                total_usage = total_usage + repaired_usage
+                if any(p.parsed is None for p in repaired_parts):
+                    issues = [i for p in repaired_parts for i in p.issues] or [
+                        Issue("parse_error", "逐字修复响应解析失败")
+                    ]
+                    return ProcessResult(
+                        payload=_invalid_payload(issues, parts),
+                        usage=total_usage,
+                        failed=True,
+                        error=f"Map 逐字修复响应解析失败：{issues[0].message}",
+                    )
+                # 替换受影响段的结果；未重发的段保留首次结果
+                repaired_by_seg = {
+                    seg.segment_id: part
+                    for seg, part in zip(repair_segs, repaired_parts, strict=True)
+                }
+                parts = [
+                    repaired_by_seg.get(seg.segment_id, part)
+                    for seg, part in zip(segments, parts, strict=True)
+                ]
+                merged = _merge(parts, refs)
+                draft, issues = validator.validate(merged)
+                if draft is not None:
+                    quote_issues = quote_check.check(merged)
+
         if draft is not None:
             return ProcessResult(
-                payload=_valid_payload(draft, parts),
+                payload=_valid_payload(draft, parts, quote_issues=quote_issues),
                 usage=total_usage,
             )
         return ProcessResult(
@@ -224,12 +304,20 @@ def _combine_raw(parts: list[_SegmentPart]) -> str:
     return "\n---\n".join(f"[{p.response_hash[:12]}…] {p.raw_text[:200]}" for p in parts)
 
 
-def _valid_payload(draft: ExtractionDraftV1, parts: list[_SegmentPart]) -> dict:
+def _valid_payload(
+    draft: ExtractionDraftV1,
+    parts: list[_SegmentPart],
+    quote_issues: list[Issue] | None = None,
+) -> dict:
+    # 阶段 11 增强 A：repair 后仍无法逐字定位的字段记录为 warning
+    # （不拒绝 draft——证据层会如实丢弃；记入审计便于统计收敛情况）。
     return {
         "draft": draft.model_dump(mode="json"),
         "request_hash": _combine_request_hashes(parts),
         "response_hash": _combine_response_hashes(parts),
-        "validation_issues": [],
+        "validation_issues": (
+            [{"code": i.code, "message": i.message} for i in quote_issues] if quote_issues else []
+        ),
         "status": "valid",
         "raw_response": _combine_raw(parts),
     }

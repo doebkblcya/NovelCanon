@@ -26,7 +26,42 @@ DEFAULT_SYSTEM_INSTRUCTION = """\
 7. provisional_claims 的 ref_source_segment_id 必须引用下方「可用原文段」中给出的段 ID。
 8. ref_source_segments 字段由系统填充，你无需生成内容（输出空数组即可）；
    provisional_claims 的 ref_source_segment_id 引用下方「可用原文段」给出的段 ID。
-9. 只输出 JSON 对象本身，不要任何解释或 Markdown 围栏。"""
+9. 只输出 JSON 对象本身，不要任何解释或 Markdown 围栏。
+
+【逐字引用要求（证据校验依赖）】以下字段必须**逐字截取**下方「可用原文段」中的
+原文，不得改写、不得补主语、不得替换代词、不得删改虚词、不得概括：
+- event.summary：直接证据验证的锚点，必须是原文中能定位的连续原句；
+- relation.relation_raw：关系表述的原文字符串；
+- state.raw_value：状态表述的原文字符串；
+- foreshadowing.clue_anchor：线索的原文字符串；
+- term_definition.definition：定义的原文原句。
+判定方法：输出前自查——把该字段复制进原文搜索，若无法逐字找到，必须改为原文中
+实际存在的连续片段；找不到任何逐字片段时，宁可省略该 claim，也不要改写。"""
+
+
+# 正反 few-shot：演示「逐字摘录」与「禁止改写」（与默认 Schema 无关，
+# 仅示范 raw/summary 类字段的取值纪律）。few_shot 为空列表时 prompt
+# 不附加示例；default_map_prompts() 使用本列表。
+DEFAULT_FEW_SHOT: list[str] = [
+    # 正例：原文「他有一次被人在咖啡里投毒，投入的马钱子碱足够毒死一匹马，
+    # 但他仍大难不死。」→ summary 必须逐字摘录连续原句（可只取核心子句，
+    # 但必须是原文连续片段，如「他有一次被人在咖啡里投毒」），不得补主语
+    # 为全名、不得改写为「奥雷里亚诺被投毒但大难不死」。
+    (
+        "原文：「他有一次被人在咖啡里投毒，投入的马钱子碱足够毒死一匹马，"
+        "但他仍大难不死。」\n"
+        "正确 summary：「他有一次被人在咖啡里投毒」\n"
+        "错误 summary：「奥雷里亚诺·布恩迪亚上校被人在咖啡里投毒，但大难不死」"
+        "（补了主语、删了插语、改了虚词）"
+    ),
+    # 反例：原文「发动过三十二场武装起义」→ raw 不得改写为「发动三十二场
+    # 武装起义」（丢「过」字即逐字失败）。
+    (
+        "原文：「奥雷里亚诺·布恩迪亚上校发动过三十二场武装起义，无一成功。」\n"
+        "正确 relation_raw：「发动过三十二场武装起义」\n"
+        "错误 relation_raw：「发动三十二场武装起义」（丢失「过」字）"
+    ),
+]
 
 
 @dataclass(frozen=True)
@@ -74,6 +109,8 @@ def build_map_prompt(
     repair_issues 非空时附加「上次输出不符合要求」段（结构修复请求，06 §4）。
     """
     parts: list[str] = [f"[系统指令]\n{prompts.system_instruction}"]
+    if prompts.few_shot:
+        parts.append("[示例（逐字引用正反例）]\n" + "\n\n".join(prompts.few_shot))
     if book_id is not None or chapter_id is not None or chapter_ordinal is not None:
         meta = []
         if book_id is not None:
@@ -100,5 +137,8 @@ def build_map_prompt(
 
 
 def default_map_prompts() -> MapPrompts:
-    """阶段 06 默认 Map prompt（few-shot 空；Schema 从 Draft 模型导出）。"""
-    return MapPrompts(schema_json=schema_for_draft())
+    """阶段 06 默认 Map prompt（正反 few-shot 演示逐字引用；Schema 从 Draft
+    模型导出）。system/few_shot/schema 任一变化都会改变 prompt_version，
+    从而失效对应 checkpoint（阶段 11：真实语料抓出 summary 改写导致
+    no_span_found 后加入逐字要求）。"""
+    return MapPrompts(few_shot=list(DEFAULT_FEW_SHOT), schema_json=schema_for_draft())

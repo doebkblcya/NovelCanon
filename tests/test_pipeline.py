@@ -142,6 +142,42 @@ def test_run_state_machine(migrated_db: Engine) -> None:
     assert mgr.get(run2)["status"] == RunStatus.ACTIVE.value
 
 
+def test_run_abandon_semantics(migrated_db: Engine) -> None:
+    """阶段 11 复审：abandon（人工放弃）与 failed 区分；active 禁止放弃。
+
+    created/running/validating → abandoned；已 abandoned 幂等；
+    active run 调用 abandon 返回 False 且状态不变。
+    """
+    _ensure_book(migrated_db)
+    mgr = RunManager(migrated_db)
+
+    # running → abandoned（真实场景：开发抽查/被新 run 取代的陈旧 run）
+    run_id = mgr.create(BOOK)
+    assert mgr.transition(run_id, RunStatus.CREATED, RunStatus.RUNNING)
+    assert mgr.abandon(run_id, "superseded test run")
+    assert mgr.get(run_id)["status"] == RunStatus.ABANDONED.value
+    assert mgr.get(run_id)["finished_at"] is not None, "abandoned 应记录 finished_at"
+    assert "abandoned" in (mgr.get(run_id)["error"] or "")
+    assert mgr.is_terminal(run_id), "abandoned 应为终结态"
+    # 已 abandoned 再 abandon：返回 False（无状态变化）
+    assert not mgr.abandon(run_id, "again")
+
+    # created → abandoned 也允许（未开始的 run 直接放弃）
+    run_created = mgr.create(BOOK)
+    assert mgr.abandon(run_created, "never started")
+
+    # active run 禁止放弃
+    from novelcanon.pipeline import Activator
+
+    run_active = mgr.create(BOOK)
+    mgr.transition(run_active, RunStatus.CREATED, RunStatus.RUNNING)
+    mgr.transition(run_active, RunStatus.RUNNING, RunStatus.VALIDATING)
+    mgr.transition(run_active, RunStatus.VALIDATING, RunStatus.READY_TO_ACTIVATE)
+    assert Activator(migrated_db).activate(run_active) is None
+    assert not mgr.abandon(run_active, "forbidden")
+    assert mgr.get(run_active)["status"] == RunStatus.ACTIVE.value
+
+
 # ── checkpoint 唯一键 ───────────────────────────────────────────
 
 

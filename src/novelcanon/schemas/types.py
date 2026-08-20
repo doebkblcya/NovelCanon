@@ -72,7 +72,9 @@ class RunStatus(StrEnum):
     """extraction run 状态机（阶段 04，docs/implementation/04）。
 
     created → running → validating → ready_to_activate → active；
-    running/validating → failed / retrying；同书新 run 激活时旧 active → superseded。
+    running/validating → failed / retrying；
+    created/running/validating → abandoned（人工放弃，与执行失败区分，11）；
+    同书新 run 激活时旧 active → superseded。
     """
 
     CREATED = "created"
@@ -83,6 +85,7 @@ class RunStatus(StrEnum):
     FAILED = "failed"
     RETRYING = "retrying"
     SUPERSEDED = "superseded"
+    ABANDONED = "abandoned"
 
 
 class EventLinkType(StrEnum):

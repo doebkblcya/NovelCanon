@@ -138,13 +138,16 @@ def extract_anchors(
             add(verb, f"org_action:{action}", hard=True, group="org_action")
 
     # payload 原文字段（硬/软按字段区分）
+    # P1（阶段 11 十三轮）：value 是规范化语义值（true/dead/married 等），
+    # 不可能逐字出现在中文原文——不得作硬锚；raw_value 才是原文逐字表述，
+    # 应为硬锚（与 prompt 逐字要求、LiteralQuoteCheck 检查一致）。
     for field, hard in (
         ("relation_raw", True),
-        ("value", True),
+        ("raw_value", True),  # P1：原文逐字状态表述，硬锚
         ("clue_anchor", True),
         ("summary", True),  # P0：event 谓词表达，硬锚
         ("definition", True),  # P0：term_definition 谓词表达，硬锚
-        ("raw_value", False),
+        ("value", False),  # P1：规范化语义值，软锚（不参与支持性判定）
     ):
         raw = payload.get(field)
         if isinstance(raw, str) and len(raw) >= 2:  # 过短短语不参与锚定

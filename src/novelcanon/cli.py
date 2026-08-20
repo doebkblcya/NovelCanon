@@ -124,6 +124,9 @@ def extract(
     book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],
     limit: Annotated[int | None, typer.Option(help="只处理前 N 章（开发用）")] = None,
     concurrency: Annotated[int, typer.Option(help="并发 worker 数")] = 4,
+    timeout: Annotated[
+        float, typer.Option("--timeout", help="单次 LLM 调用超时秒数（长章/长 prompt 需更长）")
+    ] = 90.0,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="只验证配置与章节，不调用模型")
     ] = False,
@@ -132,17 +135,27 @@ def extract(
     _log_command_invoked("extract")
     engine = _open_db()
     try:
-        _run_extract(engine, book_id, limit=limit, concurrency=concurrency, dry_run=dry_run)
+        _run_extract(
+            engine,
+            book_id,
+            limit=limit,
+            concurrency=concurrency,
+            dry_run=dry_run,
+            timeout_seconds=timeout,
+        )
     finally:
         engine.dispose()
 
 
-def _cli_generation_profile(concurrency: int) -> GenerationProfile:
+def _cli_generation_profile(concurrency: int, timeout_seconds: float = 90.0) -> GenerationProfile:
     """从 AppSettings 构造 CLI generation profile（密钥只读环境，不落库）。
 
     LLM_* / NOVELCANON_LLM_* 环境变量与 .env（gitignore 已忽略）由
     pydantic-settings 统一加载；llm_api_key 字段 exclude=True，
     不进 config_hash / 日志 / 数据库。
+
+    timeout_seconds：单次 LLM 调用超时（默认 90s——阶段 11 真实语料
+    长章 + 逐字 prompt 更长，60s 默认对 1.2 万字章不足导致超时）。
     """
     settings = AppSettings()
     profile = GenerationProfile(
@@ -156,6 +169,7 @@ def _cli_generation_profile(concurrency: int) -> GenerationProfile:
         base_url=settings.llm_base_url,
         api_key_env="LLM_API_KEY",
         concurrency_limit=max(1, concurrency),
+        timeout_seconds=timeout_seconds,
     )
     if not settings.llm_model or not settings.llm_base_url:
         raise typer.BadParameter(
@@ -191,6 +205,7 @@ def _run_extract(
     limit: int | None = None,
     concurrency: int = 4,
     dry_run: bool = False,
+    timeout_seconds: float = 90.0,
 ) -> None:
     """Map 流水线：真实 provider 按章产出 Draft 入 staging（run 保持 running）。"""
     import asyncio
@@ -210,7 +225,7 @@ def _run_extract(
     from novelcanon.schemas.types import RunStatus
     from novelcanon.storage.repository import Repository
 
-    profile = _cli_generation_profile(concurrency)
+    profile = _cli_generation_profile(concurrency, timeout_seconds=timeout_seconds)
     prompts = default_map_prompts()
     repo = Repository(engine)
     chapters = [ch for ch in repo.list_chapters(book_id) if _is_real_chapter(ch)]
@@ -1084,6 +1099,45 @@ def serve(
 
     typer.echo(f"🚀 查询 API 启动 http://{host}:{port}（阶段 11 P4）")
     uvicorn.run("novelcanon.api:app", host=host, port=port)
+
+
+@app.command()
+def run_abandon(
+    run_id: Annotated[str, typer.Argument(help="要放弃的 run_id（novelcanon inspect 可查）")],
+    reason: Annotated[str, typer.Option("--reason", help="放弃原因（写入 run.error 审计）")] = (
+        "superseded by newer run"
+    ),
+) -> None:
+    """人工放弃未激活的 run（created/running/validating → abandoned）。
+
+    与 failed（执行失败）语义区分：开发抽查、被新 run 取代的陈旧 run
+    应标记 abandoned，避免污染运维统计（阶段 11：真实语料运行遗留
+    2 个 running run 后补充）。active run 禁止放弃。
+    """
+    _log_command_invoked("run-abandon")
+    from novelcanon.pipeline import RunManager
+    from novelcanon.schemas.types import RunStatus
+
+    engine = _open_db()
+    try:
+        mgr = RunManager(engine)
+        run = mgr.get(run_id)
+        if run is None:
+            typer.echo(f"❌ run 不存在：{run_id}", err=True)
+            raise typer.Exit(code=1)
+        if run["status"] == RunStatus.ACTIVE.value:
+            typer.echo(f"❌ active run 禁止放弃：{run_id}", err=True)
+            raise typer.Exit(code=1)
+        if run["status"] == RunStatus.ABANDONED.value:
+            typer.echo(f"ℹ️  已是 abandoned：{run_id}")
+            return
+        if mgr.abandon(run_id, reason):
+            typer.echo(f"✅ run={run_id} 已标记 abandoned（原状态 {run['status']}）：{reason}")
+        else:
+            typer.echo(f"❌ 放弃失败（仅 created/running/validating 可放弃）：{run_id}", err=True)
+            raise typer.Exit(code=1)
+    finally:
+        engine.dispose()
 
 
 @app.command()

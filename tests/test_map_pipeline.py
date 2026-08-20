@@ -324,6 +324,67 @@ def test_map_repair_retries_structure_errors(tmp_path, migrated_db: Engine) -> N
     assert any("上次输出不符合要求" in call for call in client.calls)
 
 
+def test_map_literal_quote_repair_retries(tmp_path, migrated_db: Engine) -> None:
+    """阶段 11 增强 A：逐字字段（summary/relation_raw 等）在 Map 阶段即校验，
+    改写句触发一次针对性 repair（repair_issues 带 literal_quote），修复后
+    draft 保留；否则证据层才丢弃（no_span_found 62.6% 的根因）。"""
+    from tests.samples.map_dev import DEV_CHAPTERS
+
+    epub = tmp_path / "dev.epub"
+    make_fixture_epub(epub, DEV_CHAPTERS, title="开发样本")
+    book_id, chapter_ids, chapter_texts = _build_dev_book(migrated_db, epub)
+    drafts = build_dev_drafts(chapter_ids)
+    mapping = {
+        needle: json.dumps(d.model_dump(mode="json"), ensure_ascii=False)
+        for needle, d in zip(_NEEDLES, drafts, strict=True)
+    }
+    # 章节 2 的 event summary 首次输出为改写句（非逐字），repair 后恢复逐字
+    state = {"repaired": False}
+    ch2_needle = "设了拜师酒"
+    rewritten = None
+
+    def respond(prompt: str) -> str:
+        nonlocal rewritten
+        if ch2_needle in prompt and not state["repaired"]:
+            state["repaired"] = True
+            d = drafts[2].model_dump(mode="json")
+            # 改写 summary（"药老收阿远为徒" 非逐字）
+            d["provisional_claims"][0]["payload"]["summary"] = "药老收阿远为徒"
+            rewritten = json.dumps(d, ensure_ascii=False)
+            return rewritten
+        if "无法逐字定位" in prompt:
+            return json.dumps(drafts[2].model_dump(mode="json"), ensure_ascii=False)
+        return next((v for k, v in mapping.items() if k in prompt), "{}")
+
+    client = FakeGenerationClient(respond)
+    run_id, summary = asyncio.run(
+        _run_map(migrated_db, book_id, chapter_ids, chapter_texts, client)
+    )
+    assert summary.completed == 10 and summary.failed == 0
+    assert _staging_counts(migrated_db, run_id) == {"valid": 10}
+    # P2（十三轮）：默认 prompt 也含「逐字」——必须断言 repair issue 专有
+    # 文本「无法逐字定位」，且调用次数确实增加（10 章 + 1 次逐字 repair）。
+    repair_calls = [c for c in client.calls if "无法逐字定位" in c]
+    assert len(repair_calls) == 1, f"应恰好 1 次逐字 repair：{len(repair_calls)}"
+    assert len(client.calls) == 11, f"10 章 + 1 repair = 11：{len(client.calls)}"
+    # 读回 staging：repair 后 summary 已恢复为原文逐字（非改写句）
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT draft_json FROM map_drafts d JOIN chapters c ON c.chapter_id=d.chapter_id"
+                " WHERE c.book_id = :b AND c.ordinal = 2 AND d.run_id = :r AND d.status = 'valid'"
+            ),
+            {"b": book_id, "r": run_id},
+        ).fetchone()
+    assert row is not None, "章节2 应有 valid draft"
+    draft = json.loads(row[0])
+    summary_final = draft["provisional_claims"][0]["payload"]["summary"]
+    assert summary_final == "药老正式收阿远为徒", f"repair 后 summary 应为原文逐字：{summary_final}"
+    # usage 必须累计首次 + repair 两次调用（P1：repair 不得重置账本）
+    ledger_total = TokenLedger(migrated_db).summary(run_id)["total"]
+    assert ledger_total > 0, "token 账本应有值"
+
+
 def test_map_multi_segment_combines_hashes() -> None:
     """06 修复：多段请求保存全部段的聚合 hash（不只最后一组）。
 
@@ -387,3 +448,34 @@ def test_map_multi_segment_combines_hashes() -> None:
     raw = _combine_raw(parts)
     assert parts[0].response_hash[:12] in raw
     assert parts[1].response_hash[:12] in raw
+
+
+def test_literal_quote_check_scoped_to_ref_segment() -> None:
+    """P1（十三轮）：逐字校验必须按 claim 的引用段（与证据对齐同范围）——
+    引用文字存在于本章其他段时不得误通过。"""
+    from novelcanon.generation.parser import LiteralQuoteCheck
+
+    segments = {
+        "seg_0": "青石镇的老陈铁匠铺里，阿远正抡着铁锤。",
+        "seg_1": "药老正式收阿远为徒，在回春堂设了拜师酒。",
+    }
+    check = LiteralQuoteCheck("", segments)  # 整章空，仅按段校验
+    payload = {
+        "provisional_claims": [
+            {
+                "provisional_claim_id": "c1",
+                "claim_type": "event",
+                "ref_source_segment_id": "seg_0",
+                "payload": {"event_type": "拜师", "summary": "药老正式收阿远为徒"},
+            }
+        ]
+    }
+    issues = check.check(payload)
+    # summary 只存在于 seg_1，claim 引用 seg_0 → 必须报逐字失败
+    assert len(issues) == 1, f"引用段外文字不得通过：{issues}"
+    assert issues[0].code == "literal_quote"
+    assert "seg_0" in issues[0].message
+
+    # 引用段改为 seg_1 → 通过
+    payload["provisional_claims"][0]["ref_source_segment_id"] = "seg_1"
+    assert check.check(payload) == [], "引用段内逐字应通过"

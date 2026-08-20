@@ -88,7 +88,7 @@ def build_real_draft(chapter_id: str, chapter_text: str | None = None) -> Extrac
                 payload=StatePayload(
                     field="斗之气等级",
                     value="三段",
-                    raw_value="斗之气,三段",
+                    raw_value="斗之气只有三段",  # 逐字摘录原文（P1：raw_value 硬锚）
                     subject_entity_id="m1",
                 ),
                 ref_source_segment_id="seg_0",
@@ -777,3 +777,44 @@ def test_align_unlisted_surface_gets_synthetic_entity(tmp_path, migrated_db: Eng
             {"cid": row[1]},
         ).fetchone()
     assert ent is not None, f"sf_ mention 必须有 entity 行：{row[1]}"
+
+
+def test_state_raw_value_hard_anchor_value_soft() -> None:
+    """P1（十三轮）：state 锚定契约统一——value 是规范化语义值（true/dead
+    等，不可能逐字），raw_value 才是原文逐字表述。
+
+    - raw_value 逐字存在 + value 规范化 → 硬锚命中 → 支持；
+    - raw_value 是改写句（无法逐字）→ 硬锚缺失 → 拒绝（即使 value 命中）。
+    """
+    from novelcanon.evidence.span_candidates import SpanCandidateGenerator, extract_anchors
+    from novelcanon.evidence.verifiers import LiteralVerifier
+
+    text = "萧炎站在测验广场上，少年握紧了拳头。他的斗之气只有三段，周围的目光满是嘲讽。"
+    gen = SpanCandidateGenerator()
+    ver = LiteralVerifier()
+
+    def state_claim(raw: str) -> dict:
+        return {
+            "claim_type": "state",
+            "payload": {
+                "subject_entity_id": "m1",
+                "field": "x",
+                "value": "三段",
+                "raw_value": raw,
+            },
+        }
+
+    # ① raw_value 逐字 → 支持
+    anchors = extract_anchors(state_claim("斗之气只有三段"), {"m1": "萧炎"})
+    hard = {a.text for a in anchors if a.hard}
+    assert "斗之气只有三段" in hard, f"raw_value 应为硬锚：{hard}"
+    assert "三段" not in hard, f"value 规范化值不得为硬锚：{hard}"
+    cands = gen.generate("ch", 0, text, anchors)
+    assert any(ver.verify(c) is not None for c in cands), "raw_value 逐字应通过"
+
+    # ② raw_value 改写 → 拒绝（value 虽命中，但不再是硬锚）
+    anchors2 = extract_anchors(state_claim("他斗气只有三段水平"), {"m1": "萧炎"})
+    cands2 = gen.generate("ch", 0, text, anchors2)
+    assert not any(ver.verify(c) is not None for c in cands2), (
+        "raw_value 改写句必须拒绝（硬锚缺失）"
+    )

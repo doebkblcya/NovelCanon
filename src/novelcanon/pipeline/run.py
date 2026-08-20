@@ -13,7 +13,12 @@ from novelcanon.schemas.ids import SCHEMA_VERSION, new_uuid_id
 from novelcanon.schemas.types import RunStatus
 from novelcanon.storage.repository import now_iso
 
-_TERMINAL = {RunStatus.ACTIVE, RunStatus.FAILED, RunStatus.SUPERSEDED}
+_TERMINAL = {
+    RunStatus.ACTIVE,
+    RunStatus.FAILED,
+    RunStatus.SUPERSEDED,
+    RunStatus.ABANDONED,
+}
 
 
 class RunManager:
@@ -67,7 +72,8 @@ class RunManager:
             result = conn.execute(
                 text(
                     "UPDATE extraction_runs SET status = :to,"
-                    " finished_at = CASE WHEN :to IN ('active','failed','superseded')"
+                    " finished_at = CASE WHEN :to IN"
+                    " ('active','failed','superseded','abandoned')"
                     "                    THEN :ts ELSE finished_at END"
                     " WHERE run_id = :id AND status = :from"
                 ),
@@ -91,6 +97,24 @@ class RunManager:
                 ),
                 {"id": run_id, "ts": now_iso(), "e": error},
             )
+
+    def abandon(self, run_id: str, reason: str) -> bool:
+        """人工放弃未激活 run（created/running/validating）→ abandoned。
+
+        与 failed（执行失败）语义区分（阶段 11：开发抽查/被 superseded 的
+        陈旧 run 不应污染运维统计）。active run 禁止放弃。
+        returns：是否发生了转换。
+        """
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    "UPDATE extraction_runs SET status = 'abandoned', finished_at = :ts,"
+                    " error = :r WHERE run_id = :id AND status IN"
+                    " ('created','running','validating')"
+                ),
+                {"id": run_id, "ts": now_iso(), "r": f"abandoned: {reason}"},
+            )
+            return result.rowcount == 1
 
     def get(self, run_id: str) -> dict | None:
         with self._engine.connect() as conn:
