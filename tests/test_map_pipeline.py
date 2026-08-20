@@ -380,9 +380,12 @@ def test_map_literal_quote_repair_retries(tmp_path, migrated_db: Engine) -> None
     draft = json.loads(row[0])
     summary_final = draft["provisional_claims"][0]["payload"]["summary"]
     assert summary_final == "药老正式收阿远为徒", f"repair 后 summary 应为原文逐字：{summary_final}"
-    # usage 必须累计首次 + repair 两次调用（P1：repair 不得重置账本）
+    # usage 必须累计首次 + repair 两次调用（P1：repair 不得重置账本）。
+    # FakeGenerationClient 默认每次 140 tokens（100 in + 40 out）：
+    # 10 章 + 1 次逐字 repair = 11 次 → 精确 1540。若 repair 重置了
+    # 首次用量则只有 140，此断言必失败（防止旧错误实现回归）。
     ledger_total = TokenLedger(migrated_db).summary(run_id)["total"]
-    assert ledger_total > 0, "token 账本应有值"
+    assert ledger_total == 1540, f"账本应累计 11 次调用（1540 tokens）：{ledger_total}"
 
 
 def test_map_multi_segment_combines_hashes() -> None:
@@ -479,3 +482,103 @@ def test_literal_quote_check_scoped_to_ref_segment() -> None:
     # 引用段改为 seg_1 → 通过
     payload["provisional_claims"][0]["ref_source_segment_id"] = "seg_1"
     assert check.check(payload) == [], "引用段内逐字应通过"
+
+
+def test_literal_quote_missing_rejects_hollow_support() -> None:
+    """P1（十四轮）：逐字字段缺失/过短必须产生 literal_quote_missing——
+    否则 claim 失去谓词硬锚，实体共现即可伪装 direct supports
+    （state/relation/foreshadow 三类全覆盖）。"""
+    from novelcanon.generation.parser import LiteralQuoteCheck
+
+    check = LiteralQuoteCheck("甲在花园里散步。", {"seg_0": "甲在花园里散步。"})
+    cases = [
+        # (claim_type, payload 字段, 缺省值)
+        ("state", {"field": "x", "value": "dead", "raw_value": None, "subject_entity_id": "m1"}),
+        (
+            "relation",
+            {
+                "from_entity_id": "m1",
+                "to_entity_id": "m2",
+                "relation_type": "r",
+                "relation_raw": "",
+            },
+        ),
+        ("foreshadowing", {"clue_anchor": None, "related_entity_ids": ["m1"]}),
+    ]
+    for ctype, payload in cases:
+        claim = {
+            "provisional_claim_id": "c1",
+            "claim_type": ctype,
+            "ref_source_segment_id": "seg_0",
+            "payload": payload,
+        }
+        issues = check.check({"provisional_claims": [claim]})
+        assert any(i.code == "literal_quote_missing" for i in issues), (
+            f"{ctype} 空逐字字段必须拒绝：{issues}"
+        )
+
+    # 单字字段（<2 字）同样拒绝
+    claim1 = {
+        "provisional_claim_id": "c2",
+        "claim_type": "relation",
+        "ref_source_segment_id": "seg_0",
+        "payload": {
+            "from_entity_id": "m1",
+            "to_entity_id": "m2",
+            "relation_type": "r",
+            "relation_raw": "了",
+        },
+    }
+    issues1 = check.check({"provisional_claims": [claim1]})
+    assert any(i.code == "literal_quote_missing" for i in issues1), f"单字字段应拒绝：{issues1}"
+
+
+def test_literal_quote_missing_claim_dropped_from_draft(tmp_path, migrated_db: Engine) -> None:
+    """P1（十四轮）端到端：repair 后仍缺失逐字字段的 claim 必须从 draft 剔除
+    （保持 unverified，不进入字面验证）；正常 claim 不受影响。"""
+    from tests.samples.map_dev import DEV_CHAPTERS
+
+    epub = tmp_path / "dev.epub"
+    make_fixture_epub(epub, DEV_CHAPTERS, title="开发样本")
+    book_id, chapter_ids, chapter_texts = _build_dev_book(migrated_db, epub)
+    drafts = build_dev_drafts(chapter_ids)
+    mapping = {
+        needle: json.dumps(d.model_dump(mode="json"), ensure_ascii=False)
+        for needle, d in zip(_NEEDLES, drafts, strict=True)
+    }
+    # 章节 3 的 state claim（c1）raw_value 置空（缺失）——repair 两次都缺失
+    ch3_needle = "一鼓作气通过试炼"
+    missing_draft = None
+
+    def respond(prompt: str) -> str:
+        nonlocal missing_draft
+        if ch3_needle in prompt:
+            if missing_draft is None:
+                missing_draft = drafts[3].model_dump(mode="json")
+                # state c1 的 raw_value 置空（缺失）
+                missing_draft["provisional_claims"][0]["payload"]["raw_value"] = None
+            return json.dumps(missing_draft, ensure_ascii=False)
+        if "无法逐字定位" in prompt or "缺失或过短" in prompt:
+            return json.dumps(missing_draft, ensure_ascii=False)
+        return next((v for k, v in mapping.items() if k in prompt), "{}")
+
+    client = FakeGenerationClient(respond)
+    run_id, summary = asyncio.run(
+        _run_map(migrated_db, book_id, chapter_ids, chapter_texts, client)
+    )
+    assert summary.completed == 10 and summary.failed == 0
+    assert _staging_counts(migrated_db, run_id) == {"valid": 10}
+    # 章节3：state claim 被剔除，只剩 event claim
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT draft_json FROM map_drafts d JOIN chapters c ON c.chapter_id=d.chapter_id"
+                " WHERE c.book_id = :b AND c.ordinal = 3 AND d.run_id = :r AND d.status = 'valid'"
+            ),
+            {"b": book_id, "r": run_id},
+        ).fetchone()
+    assert row is not None, "章节3 应有 valid draft"
+    draft = json.loads(row[0])
+    types = [c["claim_type"] for c in draft["provisional_claims"]]
+    assert "state" not in types, f"缺失 raw_value 的 state claim 应被剔除：{types}"
+    assert "event" in types, "正常的 event claim 应保留"

@@ -227,7 +227,8 @@ class LiteralQuoteCheck:
     """
 
     # (claim_type, payload 字段) 硬锚清单（与 span_candidates.extract_anchors
-    # 的 hard=True 一致；raw_value 为软锚，也纳入提示但不强制）。
+    # 的 hard=True 一致；state.raw_value 为硬锚，value 是规范化软字段，
+    # 不作为逐字要求——十四轮统一契约）。
     _HARD_FIELDS: list[tuple[str, str]] = [
         ("event", "summary"),
         ("relation", "relation_raw"),
@@ -255,7 +256,12 @@ class LiteralQuoteCheck:
     def check(self, payload: dict[str, Any]) -> list[Issue]:
         """对一份 merged draft 检查全部 claim 的逐字字段。
 
-        returns issues（code="literal_quote"）；字段为空/非字符串跳过。
+        returns issues（code="literal_quote" / "literal_quote_missing"）：
+        - 逐字字段缺失或少于 2 字 → `literal_quote_missing`（P1：不得跳过——
+          否则 claim 失去谓词硬锚，实体共现即可通过字面验证，形成
+          「空洞直接证据」；缺失字段必须生成 issue，repair 后仍缺失的
+          claim 由调用方拒绝进入直接证据物化）；
+        - 逐字字段无法在引用段定位 → `literal_quote`。
         """
         issues: list[Issue] = []
         for claim in payload.get("provisional_claims") or []:
@@ -271,6 +277,14 @@ class LiteralQuoteCheck:
                     continue
                 value = cpayload.get(field)
                 if not isinstance(value, str) or len(value) < 2:
+                    issues.append(
+                        Issue(
+                            "literal_quote_missing",
+                            f"claim {claim.get('provisional_claim_id')} 的 {field} "
+                            "缺失或过短（<2 字）——必须提供原文逐字摘录作为谓词硬锚，"
+                            "否则实体共现即可伪装支持",
+                        )
+                    )
                     continue
                 if _strip_punct(value) not in scope:
                     issues.append(

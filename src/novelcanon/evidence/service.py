@@ -38,7 +38,11 @@ from novelcanon.schemas.draft import (
 from novelcanon.schemas.types import Operation
 from novelcanon.storage.repository import Repository
 
-_VERIFY_VERSION = "v1"
+# 证据验证版本：span 候选/字面验证的语义契约变更必须升级并重新执行 align
+# （阶段 11 十四轮 P1）：v1 → v2 因 state 锚定从「value 硬锚 / raw_value 软锚」
+# 改为「raw_value 硬锚 / value 软锚」。现有 active 数据由 v1 生成，需按 v2
+# 重新 align 下游链路，否则数据库结果与当前代码不可审计地不一致。
+_VERIFY_VERSION = "v2"
 
 # 事件 claim 的 participants 不进入 payload（materialize 从 fact_fields 读）
 _EVENT_FACT_FIELDS = (

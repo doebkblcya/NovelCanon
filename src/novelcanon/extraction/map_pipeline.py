@@ -206,17 +206,22 @@ def build_map_process_fn(
             quote_check = LiteralQuoteCheck(task.content, segment_text_by_id)
             quote_issues = quote_check.check(merged)
             if quote_issues and max_repair_attempts >= 1:
-                # 只重发有逐字问题的 segment（claims 按 ref_source_segment_id
-                # 归属段；无引用段的按全部段重发以兜底）。
-                affected_segs: set[str] = set()
+                # 只重发有逐字问题的 segment；且每条 segment 只收到属于
+                # 自己的 issues（非阻塞项：不把全章问题发给每个段）。
+                claim_id_to_seg: dict[str, str] = {}
+                for claim in merged.get("provisional_claims") or []:
+                    if not isinstance(claim, dict):
+                        continue
+                    cid = claim.get("provisional_claim_id")
+                    seg_id = claim.get("ref_source_segment_id")
+                    if isinstance(cid, str) and isinstance(seg_id, str) and seg_id:
+                        claim_id_to_seg[cid] = seg_id
+                issues_by_seg: dict[str, list[str]] = {}
                 for issue in quote_issues:
-                    for claim in merged.get("provisional_claims") or []:
-                        if isinstance(claim, dict) and issue.message.startswith(
-                            f"claim {claim.get('provisional_claim_id')}"
-                        ):
-                            seg_id = claim.get("ref_source_segment_id")
-                            if isinstance(seg_id, str) and seg_id:
-                                affected_segs.add(seg_id)
+                    for cid in claim_id_to_seg:
+                        if issue.message.startswith(f"claim {cid}"):
+                            issues_by_seg.setdefault(claim_id_to_seg[cid], []).append(issue.message)
+                affected_segs = set(issues_by_seg)
                 repair_segs = (
                     [s for s in segments if s.segment_id in affected_segs]
                     if affected_segs
@@ -233,7 +238,7 @@ def build_map_process_fn(
                             [ref_line_by_seg[seg.segment_id]],
                             task.chapter_id,
                             task.ordinal,
-                            repair_issues=[i.message for i in quote_issues],
+                            repair_issues=issues_by_seg.get(seg.segment_id, []),
                         )
                         for seg in repair_segs
                     ]
@@ -264,6 +269,36 @@ def build_map_process_fn(
                 draft, issues = validator.validate(merged)
                 if draft is not None:
                     quote_issues = quote_check.check(merged)
+
+        if draft is not None:
+            # P1（十四轮）：repair 后仍缺失逐字字段（literal_quote_missing）
+            # 的 claim 必须从 draft 剔除——保持 unverified，不得进入字面
+            # 验证（否则实体共现即可伪装 direct supports，形成空洞直接证据）。
+            missing_claim_ids = _missing_quote_claim_ids(quote_issues)
+            if missing_claim_ids:
+                merged_claims = merged.get("provisional_claims") or []
+                kept = [
+                    c
+                    for c in merged_claims
+                    if not (
+                        isinstance(c, dict) and c.get("provisional_claim_id") in missing_claim_ids
+                    )
+                ]
+                merged = dict(merged)
+                merged["provisional_claims"] = kept
+                draft, issues = validator.validate(merged)
+                quote_issues = [
+                    i
+                    for i in quote_issues
+                    if not any(i.message.startswith(f"claim {cid}") for cid in missing_claim_ids)
+                ]
+                if draft is None:
+                    return ProcessResult(
+                        payload=_invalid_payload(issues, parts),
+                        usage=total_usage,
+                        failed=True,
+                        error=f"Draft 校验失败（剔除空逐字字段 claim 后）：{issues[0].message}",
+                    )
 
         if draft is not None:
             return ProcessResult(
@@ -302,6 +337,23 @@ def _combine_response_hashes(parts: list[_SegmentPart]) -> str:
 def _combine_raw(parts: list[_SegmentPart]) -> str:
     """多段响应摘要（完整原文过大，保存每段 hash + 前 200 字符）。"""
     return "\n---\n".join(f"[{p.response_hash[:12]}…] {p.raw_text[:200]}" for p in parts)
+
+
+def _missing_quote_claim_ids(quote_issues: list[Issue]) -> set[str]:
+    """从逐字检查 issues 中提取「逐字字段缺失」的 claim id。
+
+    P1（十四轮）：literal_quote_missing 的 claim 无谓词硬锚，实体共现即可
+    伪装 direct supports——必须从 draft 剔除（保持 unverified）。
+    """
+    missing: set[str] = set()
+    for issue in quote_issues:
+        if issue.code != "literal_quote_missing":
+            continue
+        # message 形如 "claim c1 的 summary 缺失或过短…"
+        parts = issue.message.split(" ", 2)
+        if len(parts) >= 2 and parts[0] == "claim":
+            missing.add(parts[1])
+    return missing
 
 
 def _valid_payload(
