@@ -402,6 +402,65 @@ def test_map_extractor_converts_provisional_claims(tmp_path: Path, migrated_db: 
     # surface → canonical 消歧（黄金 entity_merges 只用于消歧，不注入内容）
     assert spec.payload["from_entity_id"] == "ent_xiaoshi"
     assert spec.payload["to_entity_id"] == "ent_tiejian"
+
+
+def test_map_extractor_resolves_mention_ids(tmp_path: Path, migrated_db: Engine) -> None:
+    """真实冒烟抓到的 bug：LLM 输出的实体引用是 mention_id（如 m1）而非
+    表面名——resolve 必须先经本章 draft.mentions 映射到表面名，再做
+    surface→canonical 消歧；否则 m1 原样透传 → 重入库 FK 失败。"""
+    from novelcanon.compression import CompressionService
+    from novelcanon.eval.extractor import MapClaimExtractor
+    from novelcanon.pipeline import ProcessResult
+    from novelcanon.pipeline.ledger import Usage
+
+    book_id, chapter_ids, chapter_texts = _seed_golden_book(migrated_db, tmp_path)
+    golden = golden_set_from_chapters(book_id)
+    ch0_text = chapter_texts[0]
+    comp = CompressionService().compress_book([("0", ch0_text)])[0]
+
+    async def fake_process(task):
+        # 模拟真实 LLM：mentions 数组 + claims 以 mention_id 引用实体
+        draft = {
+            "book_id": book_id,
+            "chapter_id": task.chapter_id,
+            "chapter_ordinal": task.ordinal,
+            "mentions": [
+                {"mention_id": "m1", "surface_name": "小石", "char_start": 0, "char_end": 2},
+                {"mention_id": "m2", "surface_name": "铁匠", "char_start": 0, "char_end": 2},
+            ],
+            "local_events": [],
+            "provisional_claims": [
+                {
+                    "provisional_claim_id": "c1",
+                    "claim_type": "relation",
+                    "operation": "assert",
+                    "payload": {
+                        "from_entity_id": "m1",
+                        "to_entity_id": "m2",
+                        "relation_type": "学徒",
+                        "relation_raw": "是镇上铁匠的学徒",
+                    },
+                }
+            ],
+            "ref_source_segments": [],
+            "local_causes": [],
+            "cause_candidates": [],
+            "unresolved": [],
+        }
+        return ProcessResult(
+            payload={"draft": draft},
+            usage=Usage(input_tokens=50, output_tokens=20, provider="fake", model="m"),
+        )
+
+    extractor = MapClaimExtractor(fake_process)  # type: ignore[arg-type]
+    specs, usage = extractor({0: comp}, golden)
+    assert len(specs) == 1, "mention_id 引用应经 mentions 映射后正常锚定"
+    spec = specs[0]
+    assert spec.payload["from_entity_id"] == "ent_xiaoshi", (
+        f"m1 应先映射为表面名'小石'再消歧为 canonical：{spec.payload}"
+    )
+    assert spec.payload["to_entity_id"] == "ent_tiejian"
+    assert spec.fact_fields["from_entity_id"] == "ent_xiaoshi"
     assert spec.fact_fields["relation_type"] == "学徒"
     assert spec.observed_ordinal == 0
     assert usage.total() == 70, "usage 必须累计各章各段调用"
@@ -653,3 +712,46 @@ def test_compressed_route_empty_evidence_spans_no_zerodivision(
     assert ev["reproduction_rate"] == 0.0, f"空集不得除零：{ev}"
     baseline_ev = report.routes["structured"]["evidence_reproduction"]
     assert baseline_ev["golden_count"] == 0 and baseline_ev["reproduction_rate"] == 0.0
+
+
+def test_build_map_extractor_uses_schema_prompts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """真实冒烟抓到的 bug：build_map_extractor 曾用 MapPrompts()（schema_json
+    为空）→ prompt 无输出 Schema → LLM 自由发挥字段名（如 entity_name），
+    与 Draft Schema（surface_name）不符 → 整份 draft 被拒 → 压缩评测
+    recall 恒 0。回归：必须携带完整 Draft JSON Schema（含 surface_name）。"""
+    from novelcanon.config.settings import AppSettings
+    from novelcanon.eval.extractor import build_map_extractor
+
+    captured: dict = {}
+
+    def fake_build_map_process_fn(**kwargs):
+        captured["prompts"] = kwargs["prompts"]
+        captured["book_id"] = kwargs["book_id"]
+
+        async def fake_fn(task):  # pragma: no cover - 仅构造，不调用
+            raise AssertionError("process_fn 不应在构造测试中被调用")
+
+        return fake_fn
+
+    monkeypatch.setattr(
+        "novelcanon.extraction.map_pipeline.build_map_process_fn", fake_build_map_process_fn
+    )
+    settings = AppSettings(
+        llm_model="test-model",
+        llm_base_url="http://localhost:9/v1",
+        llm_api_key="test-key",
+        llm_provider="openai-compatible",
+        llm_mode="json_object",
+        llm_tokenizer="fake-v1",
+        llm_context_window=8192,
+        llm_max_output=1024,
+    )
+    extractor = build_map_extractor(settings)
+    assert extractor.profile_id == "eval-llm-map"
+    prompts = captured["prompts"]
+    assert len(prompts.schema_json) > 1000, (
+        f"prompt 必须携带完整 Draft JSON Schema：len={len(prompts.schema_json)}"
+    )
+    assert "surface_name" in prompts.schema_json, (
+        "Schema 必须含 surface_name（LLM 输出 entity_name 会被 Draft 校验拒绝）"
+    )

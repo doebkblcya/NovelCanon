@@ -72,8 +72,12 @@ class MapClaimExtractor:
         results = asyncio.run(self._run(tasks))
         surface_map = {s: m.canonical for m in golden.entity_merges for s in m.surfaces}
 
-        def resolve(surface: str) -> str:
-            return surface_map.get(surface, surface)
+        def resolve(surface: str, mention_map: dict[str, str]) -> str:
+            # LLM 输出的实体引用是 mention_id（如 m1），先经本章
+            # mentions 映射到表面名，再做 surface → canonical 消歧；
+            # 未消歧的按原样透传（由下游决定）。
+            name = mention_map.get(surface, surface)
+            return surface_map.get(name, name)
 
         specs: list[GoldenClaimSpec] = []
         total = Usage()
@@ -82,8 +86,17 @@ class MapClaimExtractor:
             draft = (res.payload or {}).get("draft")
             if not draft:
                 continue
+            mention_map = {
+                m.get("mention_id", ""): m.get("surface_name", "")
+                for m in draft.get("mentions", [])
+                if m.get("mention_id")
+            }
+
+            def resolve_for_chapter(surface: str, _mm: dict[str, str] = mention_map) -> str:
+                return resolve(surface, _mm)
+
             for claim in draft.get("provisional_claims", []):
-                spec = _provisional_to_spec(claim, task.ordinal, task.content, resolve)
+                spec = _provisional_to_spec(claim, task.ordinal, task.content, resolve_for_chapter)
                 if spec is not None:
                     specs.append(spec)
         return specs, total
@@ -242,7 +255,7 @@ def build_map_extractor(settings: AppSettings | None = None) -> MapClaimExtracto
     """
     from novelcanon.extraction.map_pipeline import build_map_process_fn
     from novelcanon.generation.client import GenerationClient
-    from novelcanon.generation.prompts import MapPrompts
+    from novelcanon.generation.prompts import default_map_prompts
     from novelcanon.retrieval.tokenizer import FakeTokenizer
 
     settings = settings or AppSettings()
@@ -273,7 +286,11 @@ def build_map_extractor(settings: AppSettings | None = None) -> MapClaimExtracto
     process_fn = build_map_process_fn(
         book_id="<compression-eval>",
         profile=profile,
-        prompts=MapPrompts(),
+        # 必须用 default_map_prompts()：schema_json 携带完整 Draft JSON Schema
+        # （MapPrompts() 的 schema_json 为空 → prompt 无 Schema → LLM 自由发挥
+        # 字段名（如 entity_name），与 Draft Schema 不符 → 整份 draft 被拒 →
+        # 压缩评测 recall 恒 0。真实冒烟抓到的 bug）。
+        prompts=default_map_prompts(),
         tokenizer=tokenizer,
         client=client,
     )

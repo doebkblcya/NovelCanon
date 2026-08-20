@@ -633,12 +633,15 @@ def _reingest_compressed_book(
             # ── mentions（alias 供实体解析 + entities 行满足 FK）──
             # 从 entity_merges 的表面名 + claims 中出现的全部 canonical
             # 生成 mention（未出现在 merges 的 canonical 以 id 占位）。
+            # 注意：实体 ID 集合必须包含**真实重抽取输出**（anchored）中
+            # 的实体——LLM 可能抽取黄金集之外的实体（如「青云宗的弟子」），
+            # 缺失其 mention 行会导致 materialize 时 FK 失败（真实冒烟抓到）。
             mentions: list[tuple[str, str]] = []
             canonical_map: dict[str, str] = {}
 
             def _claim_entity_ids() -> set[str]:
                 out: set[str] = set()
-                for spec in golden.claims:
+                for spec in [*golden.claims, *anchored]:
                     for src in (spec.payload, spec.fact_fields):
                         for k, v in src.items():
                             if k.endswith("_entity_id") and isinstance(v, str) and v:
