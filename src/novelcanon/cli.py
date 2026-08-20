@@ -88,24 +88,39 @@ def index(
 ) -> None:
     """构建/重建原文索引（raw chunk、FTS、向量；阶段 03）。"""
     _log_command_invoked("index")
+    from novelcanon.retrieval.factory import create_backend, register_configured_backends
     from novelcanon.retrieval.indexer import build_index
     from novelcanon.retrieval.tokenizer import FakeTokenizer
     from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
 
+    settings = AppSettings()
     engine = _open_db()
+    embedder = None
     try:
+        if settings.embedding_profile_id:
+            # 生产 embedding（NOVELCANON_EMBEDDING_* 配置，阶段 11 复审 D）：
+            # 经 factory 注册表创建真实 adapter，索引 profile 与查询后端一致
+            register_configured_backends(settings)
+            embedder, vector_store = create_backend(settings.embedding_profile_id)
+            label = settings.embedding_profile_id
+        else:
+            embedder, vector_store = FakeEmbedder(dimension=8), BruteForceVectorStore(dimension=8)
+            label = "fake-embed-v8"
         result = build_index(
             engine,
             book_id,
             tokenizer=FakeTokenizer(),
-            embedder=FakeEmbedder(dimension=8),
-            vector_store=BruteForceVectorStore(dimension=8),
+            embedder=embedder,
+            vector_store=vector_store,
         )
     finally:
+        if embedder is not None and hasattr(embedder, "close"):
+            embedder.close()
         engine.dispose()
     typer.echo(
-        f"✅ 已建索引 index={result.index_version_id} chunks={result.chunk_count}"
-        f" chunking={result.chunking_version[:12]}… 状态={result.status}"
+        f"✅ 已建索引 index={result.index_version_id} embed={label}"
+        f" chunks={result.chunk_count} chunking={result.chunking_version[:12]}…"
+        f" 状态={result.status}"
     )
 
 
