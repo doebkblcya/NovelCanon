@@ -211,3 +211,91 @@ def test_llm_reduce_usage_aggregated(tmp_path: Path, migrated_db: Engine) -> Non
     # 卷 + 全书两次调用
     assert result.tokens.input_tokens == 200
     assert result.tokens.output_tokens == 100
+
+
+def test_reducer_reuse_compares_profile_and_schema(
+    tmp_path: Path, migrated_db: Engine
+) -> None:
+    """P1（复审）：幂等复用判定比较 generation profile 与 schema 版本。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    from novelcanon.generation.client import FakeGenerationClient
+    from novelcanon.pipeline.ledger import Usage
+    from novelcanon.summaries import LLMSummarizer
+
+    fake = FakeGenerationClient(
+        {
+            "章节记忆": '{"summary":"卷A","key_events":[],"key_entities":[]}',
+            "卷摘要": '{"summary":"书B","key_events":[],"key_entities":[]}',
+        },
+        usage=Usage(input_tokens=10, output_tokens=5, provider="fake", model="m"),
+    )
+    r1 = HierarchicalReducer(
+        migrated_db,
+        data["book_id"],
+        summarizer=LLMSummarizer(fake, profile_id="p-v1", prompt_version="pv1"),
+    ).reduce()
+    assert r1.rebuilt >= 2
+    # 同 profile/schema → 复用
+    r2 = HierarchicalReducer(
+        migrated_db,
+        data["book_id"],
+        summarizer=LLMSummarizer(fake, profile_id="p-v1", prompt_version="pv1"),
+    ).reduce()
+    assert r2.reused >= 2, "同 profile/schema 应复用"
+    # profile/prompt 变化：内容相同 → 同 summary_id → 恢复分支更新配置
+    # （不误复用旧配置；p-v2 配置必须写入 valid 行）
+    HierarchicalReducer(
+        migrated_db,
+        data["book_id"],
+        summarizer=LLMSummarizer(fake, profile_id="p-v2", prompt_version="pv2"),
+    ).reduce()
+    with migrated_db.connect() as conn:
+        from sqlalchemy import text
+
+        row = conn.execute(
+            text(
+                "SELECT generation_profile_id, prompt_version FROM summary_artifacts"
+                " WHERE book_id = :b AND status = 'valid'"
+            ),
+            {"b": data["book_id"]},
+        ).fetchall()
+    assert ("p-v2", "pv2") in row, (
+        f"profile/prompt 变化后不得保留旧配置：{row}"
+    )
+
+
+def test_reducer_restore_updates_metadata(
+    tmp_path: Path, migrated_db: Engine
+) -> None:
+    """P1（复审）：恢复内容相同的历史摘要时补全 max ordinal/profile/schema。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    reducer = HierarchicalReducer(
+        migrated_db, data["book_id"], summarizer=DeterministicSummarizer()
+    )
+    r1 = reducer.reduce()
+    vol_id = r1.volume_summaries[0]["summary_id"]
+    # 篡改元数据后强制重建 → 恢复分支应补全
+    from sqlalchemy import text
+
+    with migrated_db.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE summary_artifacts SET max_observed_ordinal = 999,"
+                " generation_profile_id = 'stale-prof', schema_version = 'old'"
+                " WHERE summary_id = :id"
+            ),
+            {"id": vol_id},
+        )
+    r2 = reducer.reduce()
+    assert r2.reused >= 1, "输入未变应复用（不重跑）"
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT max_observed_ordinal, generation_profile_id, schema_version"
+                " FROM summary_artifacts WHERE summary_id = :id"
+            ),
+            {"id": vol_id},
+        ).fetchone()
+    assert row[0] == 2, f"max ordinal 应恢复为真实值：{row}"
+    assert row[1] is None, "确定性模式 profile 应为 NULL"
+    assert row[2] == "reducer-v1"

@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import json
+
 from sqlalchemy import Engine, text
 
 
@@ -305,6 +307,8 @@ class QueryService:
 
         knowledge_cutoff（P0）：只返回截止章前披露的版本——关系演变查询
         不得把后期版本数量/内容泄露给早期 cutoff。
+        仅限 active run 观察过的版本（P0）：经 claim_observations 关联
+        active extraction_runs——失败/已失效 run 写入的版本不计数。
         """
         cutoff_sql = ""
         params: dict[str, object] = {"f": fact_id, "book": self._book_id}
@@ -315,11 +319,15 @@ class QueryService:
             rows = (
                 conn.execute(
                     text(
-                        "SELECT c.claim_version_id, c.operation, c.supersedes_version_id,"
-                        " c.claim_status, c.observed_ordinal, c.created_by_run_id"
+                        "SELECT DISTINCT c.claim_version_id, c.operation,"
+                        " c.supersedes_version_id, c.claim_status, c.observed_ordinal,"
+                        " c.created_by_run_id"
                         " FROM claims c"
                         " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
+                        " JOIN claim_observations o ON o.claim_version_id = c.claim_version_id"
+                        " JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
                         " WHERE c.fact_id = :f AND ch.book_id = :book"
+                        "   AND r.status = 'active'"
                         f"{cutoff_sql} ORDER BY c.rowid"
                     ),
                     params,
@@ -328,6 +336,51 @@ class QueryService:
                 .fetchall()
             )
         return [dict(r) for r in rows]
+
+    def relation_evolution(
+        self, fact_id: str, *, knowledge_cutoff: int | None = None
+    ) -> list[dict]:
+        """关系版本时间序列（P0：claim 版本时间序列路线）。
+
+        某 relation fact 的完整版本演进：按写入序返回每个版本的
+        operation/claim_status/observed 章节/relation payload 与证据——
+        关系演变回答逐版本呈现 assert/update/retract 的实际变化，而非
+        只显示版本计数。仅限 active run 观察过的版本，cutoff 截断披露。
+        """
+        cutoff_sql = ""
+        params: dict[str, object] = {"f": fact_id, "book": self._book_id}
+        if knowledge_cutoff is not None:
+            cutoff_sql = " AND c.observed_ordinal <= :cutoff"
+            params["cutoff"] = knowledge_cutoff
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT DISTINCT c.claim_version_id, c.operation,"
+                        " c.supersedes_version_id, c.claim_status, c.observed_ordinal,"
+                        " c.observed_chapter_id, c.confidence,"
+                        " r.from_entity_id, r.to_entity_id, r.relation_type,"
+                        " r.relation_raw"
+                        " FROM claims c"
+                        " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
+                        " JOIN claim_observations o ON o.claim_version_id = c.claim_version_id"
+                        " JOIN extraction_runs x ON x.run_id = o.extraction_run_id"
+                        " JOIN relation_claims r ON r.claim_version_id = c.claim_version_id"
+                        " WHERE c.fact_id = :f AND ch.book_id = :book"
+                        "   AND x.status = 'active'"
+                        f"{cutoff_sql} ORDER BY c.rowid"
+                    ),
+                    params,
+                )
+                .mappings()
+                .fetchall()
+            )
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["evidence"] = self._evidence_for(d["claim_version_id"])
+            out.append(d)
+        return out
 
     def chapter_citation(self, claim_version_id_value: str) -> dict | None:
         """回答附带的章节定位（chapter_id/ordinal/source span，05 验证项）。"""
@@ -411,11 +464,13 @@ class QueryService:
             rows = (
                 conn.execute(
                     text(
-                        "WITH RECURSIVE causal(src, tgt, path, depth, conf, visited) AS ("
+                        "WITH RECURSIVE causal(src, tgt, path, depth, conf, visited,"
+                        " edges) AS ("
                         "  SELECT l.source_event_id, l.target_event_id,"
                         "         l.source_event_id || '>' || l.target_event_id,"
                         "         1, l.confidence,"
-                        "         '[' || l.source_event_id || ',' || l.target_event_id || ']'"
+                        "         '[' || l.source_event_id || ',' || l.target_event_id || ']',"
+                        "         l.claim_version_id"
                         "  FROM event_links l"
                         "  JOIN event_link_observations o"
                         "    ON o.claim_version_id = l.claim_version_id"
@@ -430,7 +485,8 @@ class QueryService:
                         "  SELECT c.src, l.target_event_id,"
                         "         c.path || '>' || l.target_event_id,"
                         "         c.depth + 1, c.conf * l.confidence,"
-                        "         c.visited || ',' || l.target_event_id"
+                        "         c.visited || ',' || l.target_event_id,"
+                        "         c.edges || ',' || l.claim_version_id"
                         "  FROM causal c"
                         "  JOIN event_links l ON l.source_event_id = c.tgt"
                         "  JOIN event_link_observations o"
@@ -445,7 +501,7 @@ class QueryService:
                         "    AND c.depth < :depth"
                         "    AND instr(c.visited, l.target_event_id) = 0"
                         ")"
-                        " SELECT src, tgt, path, depth, conf"
+                        " SELECT src, tgt, path, depth, conf, edges"
                         " FROM causal ORDER BY conf DESC"
                     ),
                     params,
@@ -457,8 +513,81 @@ class QueryService:
         for r in rows:
             d = dict(r)
             d["event"] = self._event_summary(d["tgt"])
+            # 路径各边的真实证据定位（P0：因果回答来源 = 因果边版本 +
+            # 验证证据的章节/span，不是起始事件或路径深度）
+            edge_ids = [e for e in (d.get("edges") or "").split(",") if e]
+            d["edge_evidence"] = self._link_evidence_map(edge_ids)
             out.append(d)
         return out
+
+    def _link_evidence_map(self, edge_ids: list[str]) -> list[dict]:
+        """因果边版本 → 验证证据定位（event_link_verifications，P0）。
+
+        只取 active run 作用域且 supported 的验证行；verification_evidence
+        为 JSON（{chapter_id, char_start, char_end, span_text, ...}），
+        补出章节 ordinal。返回按边传入顺序的定位列表。
+        """
+        if not edge_ids:
+            return []
+        placeholders = ", ".join(f":e{n}" for n in range(len(edge_ids)))
+        params: dict[str, object] = {
+            f"e{n}": e for n, e in enumerate(edge_ids)
+        }
+        params["book"] = self._book_id
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT v.claim_version_id, v.verification_evidence"
+                    " FROM event_link_verifications v"
+                    " JOIN event_link_observations o"
+                    "   ON o.claim_version_id = v.claim_version_id"
+                    " JOIN extraction_runs r ON r.run_id = v.extraction_run_id"
+                    "  AND r.status = 'active' AND r.book_id = :book"
+                    f" WHERE v.claim_version_id IN ({placeholders})"
+                    "   AND v.claim_status = 'supported'"
+                    " GROUP BY v.claim_version_id"
+                ),
+                params,
+            ).fetchall()
+        by_id: dict[str, dict] = {}
+        chapter_ids: set[str] = set()
+        for vid, evidence_json in rows:
+            loc: dict[str, object] = {
+                "claim_version_id": vid,
+                "stance": "supported",
+            }
+            if evidence_json:
+                try:
+                    ev = json.loads(evidence_json)
+                except (json.JSONDecodeError, TypeError):
+                    ev = {}
+                loc["chapter_id"] = ev.get("chapter_id")
+                loc["char_start"] = ev.get("char_start")
+                loc["char_end"] = ev.get("char_end")
+                loc["span_text"] = ev.get("span_text")
+                loc["matched_ref"] = ev.get("matched_ref")
+                if loc["chapter_id"]:
+                    chapter_ids.add(str(loc["chapter_id"]))
+            by_id[vid] = loc
+        # 补章节 ordinal（Python 侧解析，避免 json_extract 对非法 JSON 抛错）
+        if chapter_ids:
+            ch_ph = ", ".join(f":c{n}" for n in range(len(chapter_ids)))
+            ch_params: dict[str, object] = {
+                f"c{n}": c for n, c in enumerate(sorted(chapter_ids))
+            }
+            with self._engine.connect() as conn:
+                ord_rows = conn.execute(
+                    text(
+                        "SELECT chapter_id, ordinal FROM chapters"
+                        f" WHERE chapter_id IN ({ch_ph})"
+                    ),
+                    ch_params,
+                ).fetchall()
+            ordinal_by_id = {r[0]: r[1] for r in ord_rows}
+            for loc in by_id.values():
+                cid = loc.get("chapter_id")
+                loc["observed_ordinal"] = ordinal_by_id.get(cid) if cid else None
+        return [by_id[e] for e in edge_ids if e in by_id]
 
     def _event_summary(self, event_claim_version_id: str) -> dict | None:
         with self._engine.connect() as conn:
@@ -526,11 +655,13 @@ class QueryService:
             rows = (
                 conn.execute(
                     text(
-                        "WITH RECURSIVE causes(src, tgt, path, depth, conf, visited) AS ("
+                        "WITH RECURSIVE causes(src, tgt, path, depth, conf, visited,"
+                        " edges) AS ("
                         "  SELECT l.source_event_id, l.target_event_id,"
                         "         l.source_event_id || '<' || l.target_event_id,"
                         "         1, l.confidence,"
-                        "         '[' || l.source_event_id || ',' || l.target_event_id || ']'"
+                        "         '[' || l.source_event_id || ',' || l.target_event_id || ']',"
+                        "         l.claim_version_id"
                         "  FROM event_links l"
                         "  JOIN event_link_observations o"
                         "    ON o.claim_version_id = l.claim_version_id"
@@ -546,7 +677,8 @@ class QueryService:
                         "  SELECT l.source_event_id, c.tgt,"
                         "         l.source_event_id || '<' || c.path,"
                         "         c.depth + 1, c.conf * l.confidence,"
-                        "         l.source_event_id || ',' || c.visited"
+                        "         l.source_event_id || ',' || c.visited,"
+                        "         l.claim_version_id || ',' || c.edges"
                         "  FROM causes c"
                         "  JOIN event_links l ON l.target_event_id = c.src"
                         "  JOIN event_link_observations o"
@@ -562,7 +694,7 @@ class QueryService:
                         "    AND c.depth < :depth"
                         "    AND instr(c.visited, l.source_event_id) = 0"
                         ")"
-                        " SELECT src, tgt, path, depth, conf"
+                        " SELECT src, tgt, path, depth, conf, edges"
                         " FROM causes ORDER BY conf DESC"
                     ),
                     params,
@@ -574,6 +706,8 @@ class QueryService:
         for r in rows:
             d = dict(r)
             d["event"] = self._event_summary(d["src"])
+            edge_ids = [e for e in (d.get("edges") or "").split(",") if e]
+            d["edge_evidence"] = self._link_evidence_map(edge_ids)
             out.append(d)
         return out
 
@@ -797,18 +931,24 @@ class QueryService:
             rows = (
                 conn.execute(
                     text(
-                        "SELECT c.claim_version_id, e.event_type, e.summary,"
-                        " e.sequence_in_chapter, c.observed_ordinal"
-                        " FROM event_claims e"
-                        " JOIN claims c ON c.claim_version_id = e.claim_version_id"
-                        " JOIN claim_observations o ON o.claim_version_id = c.claim_version_id"
-                        " JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
-                        " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
-                        " WHERE r.status = 'active' AND r.book_id = :book"
-                        "   AND c.claim_status = 'supported'"
-                        "   AND c.operation != 'retract'"
-                        f"   {cutoff_sql}{world_sql}"
-                        " ORDER BY c.observed_ordinal, e.sequence_in_chapter"
+                        "SELECT q.claim_version_id, q.event_type, q.summary,"
+                        " q.sequence_in_chapter, q.observed_ordinal FROM ("
+                        "  SELECT c.claim_version_id, e.event_type, e.summary,"
+                        "         e.sequence_in_chapter, c.observed_ordinal,"
+                        "         c.operation, c.claim_status,"
+                        "         ROW_NUMBER() OVER (PARTITION BY c.fact_id"
+                        "           ORDER BY c.rowid DESC) rn"
+                        "  FROM event_claims e"
+                        "  JOIN claims c ON c.claim_version_id = e.claim_version_id"
+                        "  JOIN claim_observations o ON o.claim_version_id = c.claim_version_id"
+                        "  JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
+                        "  JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
+                        "  WHERE r.status = 'active' AND r.book_id = :book"
+                        "    AND c.claim_status = 'supported'"
+                        f"    {cutoff_sql}{world_sql}"
+                        ") q"
+                        " WHERE q.rn = 1 AND q.operation != 'retract'"
+                        " ORDER BY q.observed_ordinal, q.sequence_in_chapter"
                         " LIMIT :lim"
                     ),
                     params,
@@ -1113,20 +1253,26 @@ class QueryService:
             rows = (
                 conn.execute(
                     text(
-                        "SELECT DISTINCT c.claim_version_id, e.event_type, e.summary,"
-                        " e.sequence_in_chapter, c.observed_ordinal"
-                        " FROM event_claims e"
-                        " JOIN claims c ON c.claim_version_id = e.claim_version_id"
-                        " JOIN claim_observations o ON o.claim_version_id = c.claim_version_id"
-                        " JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
-                        " JOIN event_participants ep"
+                        "SELECT q.claim_version_id, q.event_type, q.summary,"
+                        " q.sequence_in_chapter, q.observed_ordinal FROM ("
+                        "  SELECT c.claim_version_id, e.event_type, e.summary,"
+                        "         e.sequence_in_chapter, c.observed_ordinal,"
+                        "         c.operation, c.claim_status,"
+                        "         ROW_NUMBER() OVER (PARTITION BY c.fact_id"
+                        "           ORDER BY c.rowid DESC) rn"
+                        "  FROM event_claims e"
+                        "  JOIN claims c ON c.claim_version_id = e.claim_version_id"
+                        "  JOIN claim_observations o ON o.claim_version_id = c.claim_version_id"
+                        "  JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
+                        "  JOIN event_participants ep"
                         "   ON ep.event_claim_version_id = c.claim_version_id"
-                        " WHERE r.status = 'active' AND r.book_id = :book"
-                        "   AND c.claim_status = 'supported'"
-                        "   AND c.operation != 'retract'"
-                        f"   AND ep.entity_id {scope_sql}"
-                        f"   {cutoff_sql}{world_sql}"
-                        " ORDER BY c.observed_ordinal, e.sequence_in_chapter"
+                        "  WHERE r.status = 'active' AND r.book_id = :book"
+                        "    AND c.claim_status = 'supported'"
+                        f"    AND ep.entity_id {scope_sql}"
+                        f"    {cutoff_sql}{world_sql}"
+                        ") q"
+                        " WHERE q.rn = 1 AND q.operation != 'retract'"
+                        " ORDER BY q.observed_ordinal, q.sequence_in_chapter"
                     ),
                     params,
                 )

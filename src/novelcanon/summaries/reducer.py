@@ -430,13 +430,17 @@ class HierarchicalReducer:
         prompt_version = self._prompt_version()
         scope = volume_id if volume_id is not None else level
 
-        # 幂等：同 scope 已有 valid 且输入集合一致 → 复用（不重跑）
+        # 幂等：同 scope 已有 valid 且输入集合一致 → 复用（不重跑）。
+        # P1：复用判定同时比较 generation profile 与 schema 版本——
+        # profile/schema 变化时不得复用旧配置生成的摘要。
         existing = self._valid_summary(level, volume_id)
         if (
             existing is not None
             and existing["input_claim_versions"] == input_claim_versions_json
             and existing["depends_on_summaries"] == depends_json
             and existing["prompt_version"] == prompt_version
+            and (existing["generation_profile_id"] or None) == self._profile_id()
+            and existing["schema_version"] == self._schema_version
         ):
             d = self._row_dict(existing, rebuilt=False, reused=True)
             d["usage"] = None
@@ -472,6 +476,10 @@ class HierarchicalReducer:
                         "UPDATE summary_artifacts SET status = 'valid',"
                         " input_claim_versions = :inp, depends_on_summaries = :dep,"
                         " prompt_version = :pv, grouping_version = :gv, title = :title,"
+                        # P1：恢复「内容相同」的历史摘要时补全全部元数据——
+                        # max ordinal / profile / schema 可能与生成时不同
+                        " content_hash = :chash, max_observed_ordinal = :maxord,"
+                        " generation_profile_id = :prof, schema_version = :sv,"
                         " created_at = :ts"
                         " WHERE summary_id = :id"
                     ),
@@ -482,6 +490,10 @@ class HierarchicalReducer:
                         "gv": grouping_version,
                         "title": title,
                         "id": summary_id,
+                        "chash": content_hash,
+                        "maxord": max_ordinal,
+                        "prof": self._profile_id(),
+                        "sv": self._schema_version,
                         "ts": now_iso(),
                     },
                 )

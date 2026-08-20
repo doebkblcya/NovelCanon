@@ -1253,3 +1253,28 @@ def test_event_link_verification_null_evidence_rejected(
             ),
             {"v": row[0], "r": row[1]},
         )
+
+
+def test_causal_paths_carry_edge_evidence(tmp_path, migrated_db: Engine) -> None:
+    """P0（复审）：causal_paths 每条路径返回边的 claim_version_id 与
+    verification_evidence 定位（章节/span），因果回答来源不是起始事件。"""
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
+    _link_events(migrated_db, book_id, run_id)
+    q = QueryService(migrated_db, book_id)
+    paths = q.causal_paths(version_ids[0])  # 拜师 → …
+    supported_paths = [p for p in paths if p.get("edge_evidence")]
+    assert supported_paths, "supported 边路径必须携带 edge_evidence"
+    for p in supported_paths:
+        edges = p["edge_evidence"]
+        assert edges, "路径至少一条边证据"
+        e0 = edges[0]
+        assert e0["claim_version_id"].startswith("ver_"), (
+            f"来源必须是因果边版本，而非起始事件：{e0['claim_version_id']}"
+        )
+        assert e0["claim_version_id"] != version_ids[0], "不得指向起始事件"
+        assert e0["chapter_id"], "边证据必须带 chapter_id"
+        assert e0["char_start"] is not None and e0["char_end"] is not None
+        assert e0["span_text"], "边证据必须带原文 span"
+        assert e0["stance"] == "supported"
+        assert e0["observed_ordinal"] is not None, "边证据必须带章节 ordinal"

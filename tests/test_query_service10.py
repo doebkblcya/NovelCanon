@@ -161,3 +161,93 @@ def test_unknown_world_visible_in_plain_query_hidden_in_world_query(
     assert all(r["relation_type"] != "盟友" for r in world), (
         "世界时间查询必须排除 unknown 世界时间（不能表达为精确状态）"
     )
+
+
+def test_claim_history_limited_to_active_runs(
+    tmp_path: Path, migrated_db: Engine
+) -> None:
+    """P0（复审）：claim_history 经 observation 限定 active run——
+    失败/失效 run 的版本不计入。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    from novelcanon.pipeline import RunManager
+    from novelcanon.schemas.ids import relation_fact_id
+    from novelcanon.schemas.payloads import RelationPayload
+    from novelcanon.schemas.types import RunStatus
+
+    fact = relation_fact_id("ent_yaolao", "师徒", "ent_xiaoyan")
+    # 第二个 run：写入第 2 版后标记 failed（不激活）
+    repo = Repository(migrated_db)
+    mgr = RunManager(migrated_db)
+    run2 = mgr.create(data["book_id"], input_hash="failed-run")
+    assert mgr.transition(run2, RunStatus.CREATED, RunStatus.RUNNING)
+    repo.write_claim(
+        ClaimEnvelope(
+            fact_id=fact,
+            claim_version_id="",
+            claim_type="relation",
+            operation=Operation.ASSERT,
+            claim_status=ClaimStatus.SUPPORTED,
+            observed_chapter_id=data["chapters"][2],
+            observed_ordinal=2,
+            world_valid_kind="chapter_proxy",
+            world_valid_from=2,
+            created_by_run_id=run2,
+            created_at="2026-01-01T00:00:00+00:00",
+        ),
+        RelationPayload(
+            from_entity_id="ent_yaolao",
+            to_entity_id="ent_xiaoyan",
+            relation_type="师徒",
+            relation_raw="药老正式收萧炎为徒",
+        ),
+    )
+    mgr.fail(run2, "验证失败")
+    qs = QueryService(migrated_db, data["book_id"])
+    history = qs.claim_history(fact)
+    assert len(history) == 1, (
+        f"failed run 的版本不得计入（实际 {len(history)}）："
+        f"{[h['observed_ordinal'] for h in history]}"
+    )
+    assert history[0]["observed_ordinal"] == 1
+
+
+def test_all_events_current_version_only(tmp_path: Path, migrated_db: Engine) -> None:
+    """P1（复审）：all_events 按 fact 取当前版本——supersede 的旧事件不返回。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    # 对林风拜师事件写第 2 版（update）→ 旧版被 supersede
+    from novelcanon.schemas.ids import event_fact_id
+    from novelcanon.schemas.payloads import EventPayload
+
+    fact = event_fact_id(
+        "拜师", ["ent_linfeng", "ent_qingyunzong"],
+        "ent_qingyunzong", data["chapters"][0], 1,
+    )
+    repo = Repository(migrated_db)
+    new_v = repo.write_claim(
+        ClaimEnvelope(
+            fact_id=fact,
+            claim_version_id="",
+            claim_type="event",
+            operation=Operation.ASSERT,
+            claim_status=ClaimStatus.SUPPORTED,
+            observed_chapter_id=data["chapters"][0],
+            observed_ordinal=0,
+            world_valid_kind="chapter_proxy",
+            world_valid_from=0,
+            created_by_run_id=data["run_id"],
+            created_at="2026-01-01T00:00:00+00:00",
+        ),
+        EventPayload(
+            event_type="拜师",
+            summary="林风正式拜入青云宗成为内门弟子",
+            location_entity_id="ent_qingyunzong",
+            sequence_in_chapter=1,
+        ),
+    ).claim_version_id
+    qs = QueryService(migrated_db, data["book_id"])
+    events = qs.all_events()
+    summaries = [e["summary"] for e in events]
+    assert "林风拜入青云宗" not in summaries, "被 supersede 的旧事件不得返回"
+    assert any("内门弟子" in s for s in summaries), "应返回当前版本"
+    assert all(e["claim_version_id"] != data["claims"]["event_linfeng"] for e in events)
+    assert new_v in {e["claim_version_id"] for e in events}

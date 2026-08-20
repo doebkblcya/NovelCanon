@@ -68,7 +68,11 @@ class RouteStats:
     hits: int = 0
     cache_hits: int = 0
     input_tokens: int = 0
+    cached_input_tokens: int = 0
+    reasoning_tokens: int = 0
     output_tokens: int = 0
+    retry_count: int = 0
+    discarded_tokens: int = 0
 
     def latency_ms(self) -> float:
         return round(self.total_ms / self.calls, 1) if self.calls else 0.0
@@ -189,7 +193,12 @@ class QueryExecutor:
         stats.hits += len([c for c in context if c.kind == "chunk"])
         if result.usage is not None:
             stats.input_tokens += result.usage.input_tokens
+            stats.cached_input_tokens += result.usage.cached_input_tokens
+            stats.reasoning_tokens += result.usage.reasoning_tokens
             stats.output_tokens += result.usage.output_tokens
+            stats.retry_count += result.usage.retry_count
+            stats.discarded_tokens += result.usage.discarded_tokens
+            self._record_ledger(result.usage, stats)
 
         payload = {
             "answer": result.answer,
@@ -239,7 +248,11 @@ class QueryExecutor:
                 "hits": s.hits,
                 "cache_hits": s.cache_hits,
                 "input_tokens": s.input_tokens,
+                "cached_input_tokens": s.cached_input_tokens,
+                "reasoning_tokens": s.reasoning_tokens,
                 "output_tokens": s.output_tokens,
+                "retry_count": s.retry_count,
+                "discarded_tokens": s.discarded_tokens,
             }
             for route, s in sorted(self._stats.items())
         }
@@ -317,20 +330,24 @@ class QueryExecutor:
                     )
                 )
         elif qtype == QueryType.RELATION_EVOLUTION:
+            # 版本时间序列（P0）：逐版本返回 assert/update/retract 的实际
+            # 变化（payload/章节/状态/证据），而非只显示版本计数。
             for r in self._query.one_hop_relations(
                 cid, knowledge_cutoff=knowledge_cutoff, world_at=world_at
             ):
-                history = self._query.claim_history(
+                versions = self._query.relation_evolution(
                     r["fact_id"], knowledge_cutoff=knowledge_cutoff
                 )
-                items.append(
-                    self._claim_item(
-                        r,
-                        f"{r['from_entity_id']} —[{r['relation_type']}]→ "
-                        f"{r['to_entity_id']}（版本数={len(history)}，"
-                        f"最新章={r['observed_ordinal']}）",
+                for v in versions:
+                    items.append(
+                        self._claim_item(
+                            v,
+                            f"[版本 {v['operation']}] 章{v['observed_ordinal']} "
+                            f"{v['from_entity_id']} —[{v['relation_type']}]→ "
+                            f"{v['to_entity_id']}（原文：{v['relation_raw']}）"
+                            f" 状态={v['claim_status']}",
+                        )
                     )
-                )
         elif qtype == QueryType.CAUSAL_CHAIN:
             for ev in self._query.entity_events(
                 cid, knowledge_cutoff=knowledge_cutoff, world_at=world_at
@@ -342,17 +359,32 @@ class QueryExecutor:
                 )
                 for p in paths[:5]:
                     tgt = p.get("event") or {}
+                    # 来源 = 形成路径的因果边（event_link 版本）+ 验证证据
+                    # 定位（P0：不再是起始事件或路径深度）
+                    edges = p.get("edge_evidence") or []
+                    primary = edges[0] if edges else None
                     items.append(
                         ContextItem(
                             kind="claim",
                             claim_type="causal_path",
-                            claim_version_id=ev["claim_version_id"],
-                            observed_ordinal=p.get("depth"),
+                            claim_version_id=(
+                                primary["claim_version_id"] if primary else p["path"]
+                            ),
+                            chapter_id=primary.get("chapter_id") if primary else None,
+                            observed_ordinal=(
+                                primary.get("observed_ordinal") if primary else None
+                            ),
+                            char_start=primary.get("char_start") if primary else None,
+                            char_end=primary.get("char_end") if primary else None,
                             content=(
                                 f"因果链(置信度{p['conf']:.2f})：{ev['summary']}"
                                 f" → {tgt.get('summary', p['tgt'])}"
+                                f"（{len(edges)} 条已验证因果边）"
                             ),
                             claim_status="supported",
+                            evidence_stance=(
+                                primary.get("stance", "") if primary else ""
+                            ),
                         )
                     )
         else:
@@ -551,6 +583,23 @@ class QueryExecutor:
         return index["index_version_id"] if index else None
 
     # ── 诊断辅助 ────────────────────────────────────────────────
+
+    def _record_ledger(self, usage, stats: RouteStats) -> None:
+        """LLM 问答 token 入持久化账本（P1：不只在内存汇总）。
+
+        stage='query'，run_id 可空（0015）；book_id 必填。
+        """
+        from novelcanon.pipeline.ledger import LedgerEntry, TokenLedger
+
+        TokenLedger(self._engine).record(
+            LedgerEntry(
+                run_id=None,
+                book_id=self._book_id,
+                chapter_id=None,
+                stage="query",
+                usage=usage,
+            )
+        )
 
     def explain(self, question: str) -> dict:
         """路由 explain（10 §1：验证实际命中路线）。"""

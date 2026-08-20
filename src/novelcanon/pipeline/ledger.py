@@ -54,7 +54,7 @@ class Usage:
 
 @dataclass(frozen=True)
 class LedgerEntry:
-    run_id: str
+    run_id: str | None  # 查询/摘要记账无 run 归属（0015 run_id 可空）
     book_id: str
     chapter_id: str | None
     stage: str

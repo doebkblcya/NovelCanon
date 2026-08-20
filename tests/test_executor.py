@@ -221,12 +221,15 @@ def test_relation_evolution_respects_cutoff(tmp_path: Path, migrated_db: Engine)
     assert len(full) == 2, "完整历史 2 个版本"
     early = qs.claim_history(fact, knowledge_cutoff=1)
     assert len(early) == 1, "cutoff=1 只含第 1 版（不泄露未来版本数）"
-    # 端到端：关系演变回答中版本数受 cutoff 约束
+    # 端到端：关系演变逐版本输出（版本时间序列），cutoff 不泄露第 2 版
     executor = _executor(migrated_db, data)
     r = _ask(executor, "药老和萧炎的关系如何变化", knowledge_cutoff=1)
-    assert "版本数=1" in r.answer["answer"], (
-        f"cutoff=1 版本数应为 1：{r.answer['answer']}"
+    assert "[版本 assert]" in r.answer["answer"]
+    assert "正式收徒" not in r.answer["answer"], (
+        f"cutoff=1 不得泄露第 2 版（正式收徒）：{r.answer['answer']}"
     )
+    r_full = _ask(executor, "药老和萧炎的关系如何变化")
+    assert "正式收萧炎为徒" in r_full.answer["answer"], "完整查询应含全部版本"
 
 
 def test_structured_answer_carries_evidence_location(
@@ -283,3 +286,100 @@ def test_plotline_fallback_uses_all_book_events(
     assert len(ordinals) >= 2, (
         f"回退应覆盖多章事件（当前只覆盖 {ordinals}）"
     )
+
+
+def test_causal_route_sources_are_edge_evidence(
+    tmp_path: Path, migrated_db: Engine
+) -> None:
+    """P0（复审）：因果路线的 AnswerSource 用因果边版本与验证证据定位。"""
+    from tests.test_events import (
+        _book_and_chapters,
+        _link_events,
+        _seed_events,
+    )
+
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
+    # test_events 数据无 alias：补陆尘 alias 供实体解析
+    from novelcanon.schemas.ids import alias_fact_id
+    from novelcanon.schemas.memory import AliasClaim
+    from novelcanon.storage.repository import Repository
+
+    Repository(migrated_db).write_alias(
+        AliasClaim(
+            alias_fact_id=alias_fact_id("ent_luchen", "陆尘"),
+            claim_version_id="",
+            canonical_id="ent_luchen",
+            surface_name="陆尘",
+            observed_ordinal=0,
+            observed_chapter_id=ids[0],
+            created_by_run_id=run_id,
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+    )
+    _link_events(migrated_db, book_id, run_id)
+    from novelcanon.query import QueryExecutor
+
+    executor = QueryExecutor(migrated_db, book_id)
+    r = executor.ask("陆尘为什么立誓报仇")
+    assert r.decision.query_type == "causal_chain"
+    sources = r.answer["sources"]
+    causal = [s for s in sources if s["kind"] == "claim"]
+    assert causal, "因果路线应有来源"
+    for s in causal:
+        assert s["chapter_id"], "因果来源必须带章节定位"
+        assert s["char_start"] is not None and s["char_end"] is not None
+        assert s["observed_ordinal"] is not None
+    # 来源是因果边版本（ver_ 前缀，非起始事件）
+    assert causal[0]["claim_version_id"].startswith("ver_")
+
+
+def test_llm_usage_persisted_to_ledger(tmp_path: Path, migrated_db: Engine) -> None:
+    """P1（复审）：LLM 问答 token 持久化到 token_ledger（stage='query'）。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    from novelcanon.generation.client import FakeGenerationClient
+    from novelcanon.pipeline.ledger import Usage
+
+    fake = FakeGenerationClient(
+        {"上下文": '{"answer":"萧炎状态三段","confidence":0.9,"caveats":[]}'},
+        usage=Usage(
+            input_tokens=50,
+            cached_input_tokens=10,
+            reasoning_tokens=5,
+            output_tokens=20,
+            retry_count=1,
+            discarded_tokens=3,
+            provider="fake",
+            model="m",
+        ),
+    )
+    executor = QueryExecutor(
+        migrated_db,
+        data["book_id"],
+        embedder=FakeEmbedder(dimension=8),
+        vector_store=BruteForceVectorStore(dimension=8),
+        synthesis_client=fake,
+        profile_id="p1",
+    )
+    _ask(executor, "萧炎的状态如何")
+    from sqlalchemy import text
+
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT book_id, stage, input_tokens, cached_input_tokens,"
+                " reasoning_tokens, output_tokens, retry_count, discarded_tokens"
+                " FROM token_ledger WHERE stage = 'query'"
+            )
+        ).fetchone()
+    assert row is not None, "查询 token 应写入 token_ledger"
+    assert row[0] == data["book_id"]
+    assert row[1] == "query"
+    assert row[2] == 50 and row[3] == 10 and row[4] == 5
+    assert row[5] == 20 and row[6] == 1 and row[7] == 3
+    # RouteStats 全字段（P1）
+    stats = executor.stats()["structured"]
+    assert stats["cached_input_tokens"] == 10
+    assert stats["reasoning_tokens"] == 5
+    assert stats["retry_count"] == 1
+    assert stats["discarded_tokens"] == 3
