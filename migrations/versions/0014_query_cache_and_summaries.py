@@ -97,9 +97,7 @@ def upgrade() -> None:
         ),
         sa.Column("created_at", sa.Text, nullable=False),
     )
-    op.create_index(
-        "ix_summaries_book_level", "summary_artifacts", ["book_id", "level", "status"]
-    )
+    op.create_index("ix_summaries_book_level", "summary_artifacts", ["book_id", "level", "status"])
     op.create_index("ix_summaries_volume", "summary_artifacts", ["volume_id"])
 
     # ── 卷分组来源（10 §6）：原书卷标题 vs 每 50 章默认分组 ──────

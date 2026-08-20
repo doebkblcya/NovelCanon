@@ -229,9 +229,11 @@ class SynthesisService:
             caveats = ["模型输出不可解析，明确拒答"]
             cannot_answer = True
         else:
-            caveats = [
-                str(c) for c in (payload.get("caveats") or [])
-            ] if isinstance(payload.get("caveats"), list) else []
+            caveats = (
+                [str(c) for c in (payload.get("caveats") or [])]
+                if isinstance(payload.get("caveats"), list)
+                else []
+            )
             caveats.append("区分：claim 内容为原文事实，模型推断另作标注")
             cannot_answer = False
         try:
@@ -284,13 +286,11 @@ class SynthesisService:
                 else ""
             )
             stance = f" 证据立场={c.evidence_stance}" if c.evidence_stance else ""
-            lines.append(
-                f"{i}. [{c.source_label()} @ {loc}{stance}] {c.content}"
-            )
+            lines.append(f"{i}. [{c.source_label()} @ {loc}{stance}] {c.content}")
         lines.append(
-            "输出 JSON：{\"answer\": 答案正文, \"confidence\": 0-1,"
-            " \"caveats\": [不确定/推断项列表]}。"
-            "引用上下文编号；上下文没有的信息回答\"证据不足\"。"
+            '输出 JSON：{"answer": 答案正文, "confidence": 0-1,'
+            ' "caveats": [不确定/推断项列表]}。'
+            '引用上下文编号；上下文没有的信息回答"证据不足"。'
         )
         return "\n".join(lines)
 
@@ -331,10 +331,7 @@ class SynthesisService:
             cannot_answer = True
         else:
             answer = "\n".join(parts)
-            answer += (
-                "\n\n（确定性合成：仅转述过滤后的结构化事实/原文片段，"
-                "不含模型推断。）"
-            )
+            answer += "\n\n（确定性合成：仅转述过滤后的结构化事实/原文片段，不含模型推断。）"
             cannot_answer = False
         return AnswerResult(
             answer=answer,
@@ -395,9 +392,7 @@ class SynthesisService:
     def chapter_title(self, chapter_id: str) -> str | None:
         with self._engine.connect() as conn:
             row = conn.execute(
-                text(
-                    "SELECT title FROM chapters WHERE chapter_id = :c AND book_id = :b"
-                ),
+                text("SELECT title FROM chapters WHERE chapter_id = :c AND book_id = :b"),
                 {"c": chapter_id, "b": self._book_id},
             ).fetchone()
         return row[0] if row else None

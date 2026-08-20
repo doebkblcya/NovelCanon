@@ -118,9 +118,7 @@ class DeterministicSummarizer(Summarizer):
                         f"{payload.get('to_entity_id', '')}"
                     )
                 elif o["claim_type"] == "state":
-                    parts.append(
-                        f"状态:{payload.get('field', '')}={payload.get('value', '')}"
-                    )
+                    parts.append(f"状态:{payload.get('field', '')}={payload.get('value', '')}")
                 elif o["claim_type"] == "org":
                     parts.append(
                         f"势力:{payload.get('member_entity_id', '')}"
@@ -189,9 +187,7 @@ class LLMSummarizer(Summarizer):
                             "summary": vs["content"],
                             "max_observed_ordinal": vs["max_observed_ordinal"],
                         }
-                        for vs in sorted(
-                            volume_summaries, key=lambda v: v["max_observed_ordinal"]
-                        )
+                        for vs in sorted(volume_summaries, key=lambda v: v["max_observed_ordinal"])
                     ],
                     ensure_ascii=False,
                 )
@@ -233,9 +229,7 @@ class HierarchicalReducer:
         self._engine = engine
         self._book_id = book_id
         self._summarizer = summarizer or DeterministicSummarizer()
-        self._grouper = VolumeGrouper(
-            engine, book_id, chapters_per_volume=chapters_per_volume
-        )
+        self._grouper = VolumeGrouper(engine, book_id, chapters_per_volume=chapters_per_volume)
         self._schema_version = schema_version
 
     # ── 对外 ────────────────────────────────────────────────────
@@ -375,10 +369,7 @@ class HierarchicalReducer:
             titles = {
                 r[0]: r[1]
                 for r in conn.execute(
-                    text(
-                        "SELECT chapter_id, title FROM chapters"
-                        " WHERE book_id = :b"
-                    ),
+                    text("SELECT chapter_id, title FROM chapters WHERE book_id = :b"),
                     {"b": self._book_id},
                 ).fetchall()
             }
@@ -420,9 +411,7 @@ class HierarchicalReducer:
         depends_on: list[str],
         volume_summaries: list[dict] | None = None,
     ) -> dict:
-        claim_versions = sorted(
-            {c for m in memories for c in m.claim_version_ids()}
-        )
+        claim_versions = sorted({c for m in memories for c in m.claim_version_ids()})
         max_ordinal = max((m.ordinal for m in memories), default=0)
         # 输入标识：claim 版本集合 + 依赖 + 标题 + prompt 版本（10 §7 输入集合）
         input_claim_versions_json = json.dumps(claim_versions, ensure_ascii=False)
@@ -479,9 +468,7 @@ class HierarchicalReducer:
         with self._engine.begin() as conn:
             # 同 id 已存在（历史同内容）→ 恢复 valid 并更新输入信息
             prev = conn.execute(
-                text(
-                    "SELECT summary_id FROM summary_artifacts WHERE summary_id = :id"
-                ),
+                text("SELECT summary_id FROM summary_artifacts WHERE summary_id = :id"),
                 {"id": summary_id},
             ).fetchone()
             if prev is not None:
@@ -584,9 +571,7 @@ class HierarchicalReducer:
         with self._engine.connect() as conn:
             row = (
                 conn.execute(
-                    text(
-                        "SELECT * FROM summary_artifacts WHERE summary_id = :id"
-                    ),
+                    text("SELECT * FROM summary_artifacts WHERE summary_id = :id"),
                     {"id": summary_id},
                 )
                 .mappings()
@@ -605,13 +590,16 @@ class HierarchicalReducer:
 
     def _stale_count(self) -> int:
         with self._engine.connect() as conn:
-            return conn.execute(
-                text(
-                    "SELECT COUNT(*) FROM summary_artifacts"
-                    " WHERE book_id = :b AND status = 'stale'"
-                ),
-                {"b": self._book_id},
-            ).scalar() or 0
+            return (
+                conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM summary_artifacts"
+                        " WHERE book_id = :b AND status = 'stale'"
+                    ),
+                    {"b": self._book_id},
+                ).scalar()
+                or 0
+            )
 
     def _book_title(self) -> str:
         with self._engine.connect() as conn:

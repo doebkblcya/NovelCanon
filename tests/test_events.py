@@ -51,9 +51,7 @@ EVENT_CHAPTERS: list[tuple[str, str]] = [
 ]
 
 
-def _book_and_chapters(
-    migrated_db: Engine, tmp_path
-) -> tuple[str, dict[int, str], dict[int, str]]:
+def _book_and_chapters(migrated_db: Engine, tmp_path) -> tuple[str, dict[int, str], dict[int, str]]:
     epub = tmp_path / "events.epub"
     make_fixture_epub(epub, EVENT_CHAPTERS, title="事件测试")
     result = import_book(migrated_db, epub, book_id=BOOK_ID)
@@ -166,9 +164,7 @@ def _seed_events(
     return run_id, version_ids
 
 
-def _link_events(
-    migrated_db: Engine, book_id: str, run_id: str
-) -> object:
+def _link_events(migrated_db: Engine, book_id: str, run_id: str) -> object:
     """生成候选 → LinkVerifier 关系证据验证 → 落库跨章链接（先激活 run）。
 
     LinkVerifier 检查目标章原文「原因引用 + 因果连接词」：验证通过的边
@@ -199,9 +195,7 @@ def test_event_linker_participant_intersection(tmp_path, migrated_db: Engine) ->
     assert stats.links > 0
     # 陆尘参与的事件应链成一条链（拜师→突破→遇险→获救→立誓）
     with migrated_db.connect() as conn:
-        n = conn.execute(
-            text("SELECT count(*) FROM event_links")
-        ).scalar()
+        n = conn.execute(text("SELECT count(*) FROM event_links")).scalar()
     assert n == stats.links
 
 
@@ -421,9 +415,7 @@ def test_world_state_at_respects_world_valid(tmp_path, migrated_db: Engine) -> N
 
     q = QueryService(migrated_db, book_id)
     early = {s["field"]: s["value"] for s in q.world_state_at("ent_x", 0)}
-    assert "f_story" not in early, (
-        f"story_time from=5 在 world_at=0 不得返回：{early}"
-    )
+    assert "f_story" not in early, f"story_time from=5 在 world_at=0 不得返回：{early}"
     assert early.get("f_proxy") == "早", "chapter_proxy from=0 在 world_at=0 可见"
     assert "f_unknown" not in early, "unknown 不得表达为精确状态"
 
@@ -519,9 +511,7 @@ def test_world_state_at_combines_cutoff(tmp_path, migrated_db: Engine) -> None:
     # world_at=5：世界时间窗口通过（from=1 <= 5），但 cutoff=5 读者未到
     # 第 10 章的回忆披露 → 未来知识不得出现
     early = {s["field"] for s in q.world_state_at("ent_y", 5, knowledge_cutoff=5)}
-    assert "f_secret" not in early, (
-        f"cutoff=5 时第 10 章才披露的事实不得可见：{early}"
-    )
+    assert "f_secret" not in early, f"cutoff=5 时第 10 章才披露的事实不得可见：{early}"
     assert "f_early" in early, "第 1 章即披露的事实 cutoff=5 可见"
     # cutoff=10：回忆已披露 → 可见
     late = {s["field"] for s in q.world_state_at("ent_y", 5, knowledge_cutoff=10)}
@@ -550,8 +540,10 @@ def test_relations_and_org_world_valid(tmp_path, migrated_db: Engine) -> None:
     for cid, name in (("ent_x", "X"), ("ent_y", "Y"), ("ent_org", "青云门")):
         repo.upsert_entity(
             EntityRecord(
-                canonical_id=cid, canonical_name=name,
-                tier=EntityTier.MINOR, created_by_run_id=run_id,
+                canonical_id=cid,
+                canonical_name=name,
+                tier=EntityTier.MINOR,
+                created_by_run_id=run_id,
             )
         )
 
@@ -579,16 +571,24 @@ def test_relations_and_org_world_valid(tmp_path, migrated_db: Engine) -> None:
     # 关系：X 是 Y 的师父——世界时间从第 4 章起（story_time from=3），
     # 但第 1 章即披露（ordinal=0）
     write(
-        RelationPayload(from_entity_id="ent_x", to_entity_id="ent_y",
-                        relation_type="师徒", relation_raw="X是Y的师父"),
+        RelationPayload(
+            from_entity_id="ent_x",
+            to_entity_id="ent_y",
+            relation_type="师徒",
+            relation_raw="X是Y的师父",
+        ),
         relation_fact_id("ent_x", "师徒", "ent_y"),
-        WorldValidKind.STORY_TIME, 3, 0,
+        WorldValidKind.STORY_TIME,
+        3,
+        0,
     )
     # org：X 加入 青云门——chapter_proxy from=2（第 3 章起），披露 ordinal=0
     write(
         OrgPayload(org_entity_id="ent_org", member_entity_id="ent_x", role="弟子", action="join"),
         org_fact_id("ent_org", "ent_x", "弟子"),
-        WorldValidKind.CHAPTER_PROXY, 2, 0,
+        WorldValidKind.CHAPTER_PROXY,
+        2,
+        0,
     )
 
     mgr = RunManager(migrated_db)
@@ -677,15 +677,11 @@ def test_causal_results_excludes_enables(tmp_path, migrated_db: Engine) -> None:
     results = q.causal_results(version_ids[3])
     sources = {p["event"]["claim_version_id"] for p in results}
     assert version_ids[2] in sources, "causes 反向必须包含直接原因 遇险"
-    assert version_ids[1] not in sources, (
-        f"enables 边不得混入 causes 反向结果：{sources}"
-    )
+    assert version_ids[1] not in sources, f"enables 边不得混入 causes 反向结果：{sources}"
     # 递归分支同样受限：遇险的 causes 来源没有（突破→遇险 是 enables）
     results2 = q.causal_results(version_ids[2])
     sources2 = {p["event"]["claim_version_id"] for p in results2}
-    assert sources2 == set(), (
-        f"递归分支不得经 enables 回溯到 突破：{sources2}"
-    )
+    assert sources2 == set(), f"递归分支不得经 enables 回溯到 突破：{sources2}"
 
 
 def test_results_reverse_of_causes(tmp_path, migrated_db: Engine) -> None:
@@ -711,9 +707,7 @@ def test_results_reverse_of_causes(tmp_path, migrated_db: Engine) -> None:
     for src, tgt in forward:
         reverse_paths = q.causal_results(tgt)
         sources = {p["event"]["claim_version_id"] for p in reverse_paths}
-        assert src in sources, (
-            f"causes 边 {src}→{tgt} 的反向 results 必须包含 {src}：{sources}"
-        )
+        assert src in sources, f"causes 边 {src}→{tgt} 的反向 results 必须包含 {src}：{sources}"
     # 无 causes 边的目标（如获救，只有 enables 入边）：results 为空或仅 enables 来源
     with migrated_db.connect() as conn:
         has_causes = conn.execute(
@@ -750,32 +744,56 @@ def test_candidate_recall_rate(tmp_path, migrated_db: Engine) -> None:
     # 手工构造黄金事件（模拟 _seed_events 的真实形态）
     events = [
         EventInfo(
-            claim_version_id="e1", fact_id="f1", event_type="拜师",
-            summary="陆尘拜入青云宗", participants=["ent_luchen"],
-            location_entity_id="ent_qingyunzong", observed_ordinal=0,
-            observed_chapter_id="ch0", sequence_in_chapter=1,
-            evidence_ordinals=[0], evidence_stances=["supports"],
+            claim_version_id="e1",
+            fact_id="f1",
+            event_type="拜师",
+            summary="陆尘拜入青云宗",
+            participants=["ent_luchen"],
+            location_entity_id="ent_qingyunzong",
+            observed_ordinal=0,
+            observed_chapter_id="ch0",
+            sequence_in_chapter=1,
+            evidence_ordinals=[0],
+            evidence_stances=["supports"],
         ),
         EventInfo(
-            claim_version_id="e2", fact_id="f2", event_type="突破",
-            summary="陆尘突破至筑基期", participants=["ent_luchen"],
-            location_entity_id="ent_qingyunzong", observed_ordinal=1,
-            observed_chapter_id="ch1", sequence_in_chapter=1,
-            evidence_ordinals=[1], evidence_stances=["supports"],
+            claim_version_id="e2",
+            fact_id="f2",
+            event_type="突破",
+            summary="陆尘突破至筑基期",
+            participants=["ent_luchen"],
+            location_entity_id="ent_qingyunzong",
+            observed_ordinal=1,
+            observed_chapter_id="ch1",
+            sequence_in_chapter=1,
+            evidence_ordinals=[1],
+            evidence_stances=["supports"],
         ),
         EventInfo(
-            claim_version_id="e3", fact_id="f3", event_type="遇险",
-            summary="陆尘遭妖兽围攻", participants=["ent_luchen"],
-            location_entity_id=None, observed_ordinal=2,
-            observed_chapter_id="ch2", sequence_in_chapter=1,
-            evidence_ordinals=[2], evidence_stances=["supports"],
+            claim_version_id="e3",
+            fact_id="f3",
+            event_type="遇险",
+            summary="陆尘遭妖兽围攻",
+            participants=["ent_luchen"],
+            location_entity_id=None,
+            observed_ordinal=2,
+            observed_chapter_id="ch2",
+            sequence_in_chapter=1,
+            evidence_ordinals=[2],
+            evidence_stances=["supports"],
         ),
         EventInfo(
-            claim_version_id="e4", fact_id="f4", event_type="获救",
-            summary="药老救下陆尘", participants=["ent_luchen", "ent_yaolao"],
-            location_entity_id=None, observed_ordinal=3,
-            observed_chapter_id="ch3", sequence_in_chapter=1,
-            evidence_ordinals=[3], evidence_stances=["supports"],
+            claim_version_id="e4",
+            fact_id="f4",
+            event_type="获救",
+            summary="药老救下陆尘",
+            participants=["ent_luchen", "ent_yaolao"],
+            location_entity_id=None,
+            observed_ordinal=3,
+            observed_chapter_id="ch3",
+            sequence_in_chapter=1,
+            evidence_ordinals=[3],
+            evidence_stances=["supports"],
         ),
     ]
     # 黄金期望链接（人工标注）
@@ -784,8 +802,7 @@ def test_candidate_recall_rate(tmp_path, migrated_db: Engine) -> None:
     generated = {(c.source.fact_id, c.target.fact_id) for c in candidates}
     recall = len(golden & generated) / len(golden)
     assert recall >= 0.5, (
-        f"候选召回率 {recall} 过低（黄金 {len(golden)} 条，命中"
-        f" {len(golden & generated)}）"
+        f"候选召回率 {recall} 过低（黄金 {len(golden)} 条，命中 {len(golden & generated)}）"
     )
     # 拜师→突破 同地点 → causes（强因果）
     causes = {
@@ -810,20 +827,34 @@ def test_rejected_events_produce_no_supported_link(tmp_path, migrated_db: Engine
     book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
     # 直接构造两个 rejected 事件（模拟验收场景）
     ev1 = EventInfo(
-        claim_version_id="v1", fact_id="f1", event_type="遭遇",
-        summary="甲在乙面前遇险", participants=["ent_a", "ent_b"],
-        location_entity_id=None, observed_ordinal=0,
-        observed_chapter_id=ids[0], sequence_in_chapter=1,
-        evidence_ordinals=[0], evidence_stances=["refutes"],
-        claim_status="rejected", operation="assert",
+        claim_version_id="v1",
+        fact_id="f1",
+        event_type="遭遇",
+        summary="甲在乙面前遇险",
+        participants=["ent_a", "ent_b"],
+        location_entity_id=None,
+        observed_ordinal=0,
+        observed_chapter_id=ids[0],
+        sequence_in_chapter=1,
+        evidence_ordinals=[0],
+        evidence_stances=["refutes"],
+        claim_status="rejected",
+        operation="assert",
     )
     ev2 = EventInfo(
-        claim_version_id="v2", fact_id="f2", event_type="救援",
-        summary="乙出手相救", participants=["ent_a", "ent_b"],
-        location_entity_id=None, observed_ordinal=1,
-        observed_chapter_id=ids[1], sequence_in_chapter=1,
-        evidence_ordinals=[1], evidence_stances=["refutes"],
-        claim_status="rejected", operation="assert",
+        claim_version_id="v2",
+        fact_id="f2",
+        event_type="救援",
+        summary="乙出手相救",
+        participants=["ent_a", "ent_b"],
+        location_entity_id=None,
+        observed_ordinal=1,
+        observed_chapter_id=ids[1],
+        sequence_in_chapter=1,
+        evidence_ordinals=[1],
+        evidence_stances=["refutes"],
+        claim_status="rejected",
+        operation="assert",
     )
     # linker 层面：rejected 事件不产生候选
     candidates = EventLinker().generate_candidates([ev1, ev2])
@@ -835,9 +866,7 @@ def test_rejected_events_produce_no_supported_link(tmp_path, migrated_db: Engine
 # ── P0 回归：规则层只生成 candidate，未经关系证据验证不得 supported ──
 
 
-def test_rule_links_without_evidence_stay_unverified(
-    tmp_path, migrated_db: Engine
-) -> None:
+def test_rule_links_without_evidence_stay_unverified(tmp_path, migrated_db: Engine) -> None:
     """验收 P0：规则候选必须经关系证据验证才 supported。
 
     - 突破→遇险（目标章第 3 章无因果表述）→ 保持 unverified，不进默认
@@ -855,9 +884,7 @@ def test_rule_links_without_evidence_stay_unverified(
     assert stats.unverified > 0, "无关系证据的候选必须保持 unverified"
     with migrated_db.connect() as conn:
         rows = conn.execute(
-            text(
-                "SELECT claim_status, count(*) FROM event_links GROUP BY claim_status"
-            )
+            text("SELECT claim_status, count(*) FROM event_links GROUP BY claim_status")
         ).fetchall()
     statuses = dict(rows)
     assert "supported" in statuses and "unverified" in statuses
@@ -871,9 +898,7 @@ def test_rule_links_without_evidence_stay_unverified(
             ),
             {"s": version_ids[1], "t": version_ids[2]},
         ).fetchone()
-    assert row is not None and row[0] == "unverified", (
-        f"突破→遇险 必须 unverified：{row}"
-    )
+    assert row is not None and row[0] == "unverified", f"突破→遇险 必须 unverified：{row}"
     q = QueryService(migrated_db, book_id)
     paths = q.causal_paths(version_ids[1])
     assert version_ids[2] not in {p["event"]["claim_version_id"] for p in paths}, (
@@ -885,9 +910,7 @@ def test_rule_links_without_evidence_stay_unverified(
     }, "验证通过的边必须进入因果回答"
 
 
-def test_link_verifier_promotes_evidence_edges(
-    tmp_path, migrated_db: Engine
-) -> None:
+def test_link_verifier_promotes_evidence_edges(tmp_path, migrated_db: Engine) -> None:
     """验收 P0：LinkVerifier 把「证据充分」的边提升为 supported，并落库
     验证方法（causal-connective）与原文证据 span（可审计）。"""
     book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
@@ -904,14 +927,10 @@ def test_link_verifier_promotes_evidence_edges(
     assert row is not None
     assert row[0] == "supported", "拜师→突破 必须有关系证据 → supported"
     assert row[1] == "causal-connective", f"验证方法应记录：{row[1]}"
-    assert row[2] is not None and "拜师之后" in row[2], (
-        f"验证证据 span 必须落库：{row[2]}"
-    )
+    assert row[2] is not None and "拜师之后" in row[2], f"验证证据 span 必须落库：{row[2]}"
 
 
-def test_supported_requires_verification_evidence(
-    tmp_path, migrated_db: Engine
-) -> None:
+def test_supported_requires_verification_evidence(tmp_path, migrated_db: Engine) -> None:
     """验收 P0：supported 必须有关系证据（method + evidence 非空）——
     仅凭 envelope.claim_status=supported 写入的边被降级为 unverified，
     不得进入默认因果回答。"""
@@ -938,7 +957,8 @@ def test_supported_requires_verification_evidence(
                 created_at="2026-01-01T00:00:00+00:00",
             ),
             payload=EventLinkPayload(
-                source_event_id=src, target_event_id=tgt,
+                source_event_id=src,
+                target_event_id=tgt,
                 relation_type=EventLinkType.CAUSES,
             ),
         )
@@ -954,9 +974,7 @@ def test_supported_requires_verification_evidence(
             ),
             {"s": src, "t": tgt, "r": run_id},
         ).fetchone()
-    assert row is not None and row[0] == "unverified", (
-        f"无证据的 supported 必须被降级：{row}"
-    )
+    assert row is not None and row[0] == "unverified", f"无证据的 supported 必须被降级：{row}"
     # 空字符串/纯空白的方法与证据同样视为缺失（P0：不得绕过硬约束）
     for method, evidence in (("", "证据"), ("  ", "   ")):
         repo.write_event_link(
@@ -973,7 +991,8 @@ def test_supported_requires_verification_evidence(
                     created_at="2026-01-01T00:00:00+00:00",
                 ),
                 payload=EventLinkPayload(
-                    source_event_id=src, target_event_id=tgt,
+                    source_event_id=src,
+                    target_event_id=tgt,
                     relation_type=EventLinkType.CAUSES,
                 ),
                 verification_method=method,
@@ -1017,9 +1036,7 @@ def test_link_verifier_requires_action_anchor_and_strong_connective() -> None:
     # 源事件锚点 = event_type + summary（不含参与者）
     refs = ["吃早饭", "甲吃早饭"]
     # 纯时间推进词不是因果充分条件
-    assert v.verify("ch2", "甲吃早饭，随后甲中了彩票。", refs) is None, (
-        "纯时间词不得支持因果"
-    )
+    assert v.verify("ch2", "甲吃早饭，随后甲中了彩票。", refs) is None, "纯时间词不得支持因果"
     # 强连接词但无源事件动作锚点（连接词可能指向章内另一件事）
     assert v.verify("ch2", "甲中了彩票，因此他请大家吃饭。", refs) is None, (
         "无源事件动作锚点不得支持因果"
@@ -1052,9 +1069,7 @@ def test_event_link_world_valid_round_trip(tmp_path, migrated_db: Engine) -> Non
 
     q = QueryService(migrated_db, book_id)
     # world_at=0（第 1 章）：边在 ordinal 1 成立 → 不可见
-    assert q.causal_paths(version_ids[0], world_at=0) == [], (
-        "world_at=0 时 ordinal 1 的边不可见"
-    )
+    assert q.causal_paths(version_ids[0], world_at=0) == [], "world_at=0 时 ordinal 1 的边不可见"
     # world_at=1：可见
     paths = q.causal_paths(version_ids[0], world_at=1)
     assert paths, "world_at=1 时边可见"
@@ -1064,9 +1079,7 @@ def test_event_link_world_valid_round_trip(tmp_path, migrated_db: Engine) -> Non
     )
 
 
-def test_unactivated_run_does_not_change_active_causal_view(
-    tmp_path, migrated_db: Engine
-) -> None:
+def test_unactivated_run_does_not_change_active_causal_view(tmp_path, migrated_db: Engine) -> None:
     """验收 P0：未激活 run 重新链接并验证失败时，不得改写旧 active run
     同一边的状态——激活前 active 查询结果不变（验证结果按 run 作用域记录）。"""
     from novelcanon.events.verifier import LinkVerifier
@@ -1102,9 +1115,7 @@ def test_unactivated_run_does_not_change_active_causal_view(
             ),
             {"s": version_ids[0], "t": version_ids[1]},
         ).fetchone()
-    assert st is not None and st[0] == "supported", (
-        f"全局行状态不得被未激活 run 改写：{st}"
-    )
+    assert st is not None and st[0] == "supported", f"全局行状态不得被未激活 run 改写：{st}"
     # run2 自己的验证行是 unverified（run 作用域隔离）
     with migrated_db.connect() as conn:
         v2 = conn.execute(
@@ -1116,14 +1127,10 @@ def test_unactivated_run_does_not_change_active_causal_view(
             ),
             {"s": version_ids[0], "t": version_ids[1], "r": run2},
         ).fetchone()
-    assert v2 is not None and v2[0] == "unverified", (
-        f"run2 的验证行应为 unverified：{v2}"
-    )
+    assert v2 is not None and v2[0] == "unverified", f"run2 的验证行应为 unverified：{v2}"
 
 
-def test_event_link_world_valid_column_constraints(
-    tmp_path, migrated_db: Engine
-) -> None:
+def test_event_link_world_valid_column_constraints(tmp_path, migrated_db: Engine) -> None:
     """验收 P1：event_links.world_valid 列由 SQLite CHECK 兜底——非法 kind、
     越界 confidence、kind 非 unknown 且缺 from 均被拒绝（新增事实字段
     的约束不弱于 claims 表）。"""
@@ -1179,10 +1186,7 @@ def test_event_link_verification_status_enum(tmp_path, migrated_db: Engine) -> N
     with migrated_db.connect() as conn:
         # 找到一条已存在的验证行做模板
         row = conn.execute(
-            text(
-                "SELECT claim_version_id, extraction_run_id FROM"
-                " event_link_verifications LIMIT 1"
-            )
+            text("SELECT claim_version_id, extraction_run_id FROM event_link_verifications LIMIT 1")
         ).fetchone()
     assert row is not None
     with pytest.raises(sqlalchemy.exc.IntegrityError), migrated_db.begin() as conn:
@@ -1208,9 +1212,7 @@ def test_event_link_verification_status_enum(tmp_path, migrated_db: Engine) -> N
         )
 
 
-def test_event_link_verification_null_evidence_rejected(
-    tmp_path, migrated_db: Engine
-) -> None:
+def test_event_link_verification_null_evidence_rejected(tmp_path, migrated_db: Engine) -> None:
     """验收 P0：绕过 Repository 直接写 supported + NULL 证据必须被拒绝。
 
     SQLite 的 CHECK 对 NULL 表达式视为通过（length(trim(NULL)) 为 NULL，
@@ -1224,10 +1226,7 @@ def test_event_link_verification_null_evidence_rejected(
     _link_events(migrated_db, book_id, run_id)
     with migrated_db.connect() as conn:
         row = conn.execute(
-            text(
-                "SELECT claim_version_id, extraction_run_id FROM"
-                " event_link_verifications LIMIT 1"
-            )
+            text("SELECT claim_version_id, extraction_run_id FROM event_link_verifications LIMIT 1")
         ).fetchone()
     assert row is not None
 
@@ -1291,9 +1290,7 @@ def test_causal_paths_exclude_prevents(tmp_path, migrated_db: Engine) -> None:
     # 手工插入一条 supported 的 prevents 边：突破(1) prevents 遇险(2)
     src, tgt = version_ids[1], version_ids[2]
     fact = event_link_fact_id(src, EventLinkType.PREVENTS, tgt)
-    ver = claim_version_id(
-        fact, stable_config_hash({"op": "assert", "payload": {"t": "prevents"}})
-    )
+    ver = claim_version_id(fact, stable_config_hash({"op": "assert", "payload": {"t": "prevents"}}))
     import json as _json
 
     evidence = _json.dumps(

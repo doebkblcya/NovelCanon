@@ -23,6 +23,7 @@ from novelcanon.retrieval.rrf import RRF_PARAMS_VERSION, fts_query_candidates, r
 from novelcanon.retrieval.vectorstore import Embedder, VectorStore
 
 _TOP_K_MULTIPLIER = 4  # 候选放宽系数：融合前各路线取 top_k×N 再 RRF
+_MAX_VEC_WINDOW = 256  # 向量候选窗口上限（P1 迭代扩候选的安全上限）
 
 
 @dataclass(frozen=True)
@@ -88,8 +89,7 @@ class RetrievalService:
                 )
             if row is None:
                 raise ValueError(
-                    f"index_version {self._index_version_id} 不存在或不属于"
-                    f" book={self._book_id}"
+                    f"index_version {self._index_version_id} 不存在或不属于 book={self._book_id}"
                 )
             return dict(row)
         index = get_active_index_version(self._engine, self._book_id)
@@ -158,21 +158,25 @@ class RetrievalService:
     def search_fts(
         self, query: str, *, limit: int = 20, cutoff: int | None = None
     ) -> list[RetrievalHit]:
-        """FTS 检索：影子列 + trigram 合并（cutoff 在 SQL 内过滤）。"""
-        shadow = [
-            h
-            for h in search_shadow(
-                self._engine, query=query, book_id=self._book_id, limit=limit
-            )
-            if cutoff is None or h["observed_ordinal"] <= cutoff
-        ]
-        trigram = [
-            h
-            for h in search_trigram(
-                self._engine, query=query, book_id=self._book_id, limit=limit
-            )
-            if cutoff is None or h["observed_ordinal"] <= cutoff
-        ]
+        """FTS 检索：影子列 + trigram 合并。
+
+        cutoff（P1）：在 SQL LIMIT 前过滤 ordinal——后期高排名候选不会
+        挤占截止点前的相关结果（避免候选窗口截断后假性无结果）。
+        """
+        shadow = search_shadow(
+            self._engine,
+            query=query,
+            book_id=self._book_id,
+            limit=limit,
+            cutoff=cutoff,
+        )
+        trigram = search_trigram(
+            self._engine,
+            query=query,
+            book_id=self._book_id,
+            limit=limit,
+            cutoff=cutoff,
+        )
         ordered = fts_query_candidates(shadow, trigram)
         scores: dict[str, float] = {}
         for h in shadow:
@@ -190,16 +194,16 @@ class RetrievalService:
     ) -> HybridResult:
         """FTS + 向量 RRF 融合（融合前应用 book/cutoff 过滤，10 §3）。
 
-        - 向量候选在融合前按元数据 ordinal 过滤 cutoff（vec0 无法在
-          SQL 内过滤 ordinal）；
+        - FTS：cutoff 在 SQL LIMIT 前过滤（P1）；
+        - 向量：vec0 无法在 SQL 内过滤 ordinal——候选窗口不足时**迭代
+          扩候选**（P1）直到 cutoff 过滤后足量有效结果或达上限，
+          避免高排名候选全来自后期章节时的假性无结果；
         - 各路线候选放宽到 top_k×4，RRF 融合后取 top_k；
         - 返回各路线贡献（命中数）与诊断（候选规模）。
         """
         index = self.active_index()
         fts_hits = self.search_fts(query, limit=top_k * _TOP_K_MULTIPLIER, cutoff=cutoff)
-        vec_hits = self.search_vectors(query, top_k=top_k * _TOP_K_MULTIPLIER)
-        if cutoff is not None:
-            vec_hits = [h for h in vec_hits if h.observed_ordinal <= cutoff]
+        vec_hits = self._vector_hits_with_cutoff(query, top_k=top_k, cutoff=cutoff)
 
         fused = rrf_fuse(
             {
@@ -226,6 +230,25 @@ class RetrievalService:
         )
 
     # ── 元数据回读（普通表，稳定 raw chunk）────────────────────
+
+    def _vector_hits_with_cutoff(
+        self, query: str, *, top_k: int, cutoff: int | None
+    ) -> list[RetrievalHit]:
+        """向量候选 + cutoff：窗口不足时迭代扩候选（P1）。
+
+        vec0 无法在 SQL 内过滤 ordinal；若 top_k×4 窗口过滤后不足 top_k
+        条有效结果，翻倍扩窗口重试（上限 _MAX_VEC_WINDOW），确保截止点
+        前的相关结果不被后期高排名候选挤出窗口。
+        """
+        if cutoff is None:
+            return self.search_vectors(query, top_k=top_k * _TOP_K_MULTIPLIER)
+        window = top_k * _TOP_K_MULTIPLIER
+        while True:
+            candidates = self.search_vectors(query, top_k=window)
+            valid = [h for h in candidates if h.observed_ordinal <= cutoff]
+            if len(valid) >= top_k or window >= _MAX_VEC_WINDOW:
+                return valid
+            window *= 2
 
     def _hydrate(
         self,

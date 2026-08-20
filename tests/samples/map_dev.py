@@ -137,9 +137,7 @@ def _state(
         provisional_claim_id=pid,
         claim_type="state",
         operation=operation,
-        payload=StatePayload(
-            field=field, value=value, raw_value=value, subject_entity_id=subject
-        ),
+        payload=StatePayload(field=field, value=value, raw_value=value, subject_entity_id=subject),
         ref_source_segment_id="seg_0",
     )
 
@@ -319,7 +317,10 @@ def build_dev_drafts(chapter_ids: dict[int, str]) -> list[ExtractionDraftV1]:
                 mentions=_mentions(text, "陆沉", "回春堂", "药老"),
                 claims=[
                     _state(
-                        "c1", "陆沉", "cultivation_realm", "筑基",
+                        "c1",
+                        "陆沉",
+                        "cultivation_realm",
+                        "筑基",
                         operation=Operation.UPDATE,  # 炼气 → 筑基：update 语义
                     )
                 ],

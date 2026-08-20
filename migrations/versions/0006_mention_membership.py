@@ -48,9 +48,7 @@ def upgrade() -> None:
         sa.Column("observed_at", sa.Text, nullable=False),
         sa.PrimaryKeyConstraint("mention_id", "extraction_run_id", name="pk_mention_observations"),
     )
-    op.create_index(
-        "ix_mention_observations_run", "mention_observations", ["extraction_run_id"]
-    )
+    op.create_index("ix_mention_observations_run", "mention_observations", ["extraction_run_id"])
     op.execute(
         "INSERT OR IGNORE INTO mention_observations (mention_id, extraction_run_id,"
         " observed_at)"

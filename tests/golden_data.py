@@ -225,6 +225,28 @@ def make_golden_drafts(
                     evidence=GoldenEvidence(chapter_id, s, e, text[s:e]),
                 )
             )
+            # 境界突破事件：因果边「拜师 → 突破」的 target（黄金因果边人工标注）
+            s, e = _span(text, "境界直接突破至金丹期")
+            claims.append(
+                GoldenClaim(
+                    claim_type="event",
+                    payload={
+                        "event_type": "境界突破",
+                        "summary": "境界直接突破至金丹期",
+                        "location_entity_id": None,
+                    },
+                    fact_fields={
+                        "event_type": "境界突破",
+                        "participants": ["ent_xiaoshi"],
+                        "location_entity_id": None,
+                        "chapter_id": chapter_id,
+                        "sequence_in_chapter": 2,
+                    },
+                    observed_chapter_id=chapter_id,
+                    observed_ordinal=ordinal,
+                    evidence=GoldenEvidence(chapter_id, s, e, text[s:e]),
+                )
+            )
         elif ordinal == 3:
             s, e = _span(text, "小石真名林风")
             claims.append(

@@ -148,9 +148,7 @@ def test_ref_mapper_hash_reproducible() -> None:
 
 def test_ref_mapper_rejects_bad_hash() -> None:
     """hash 不匹配 → RefMappingError(ref_hash_mismatch)，不得猜测修复。"""
-    ref = RefSourceSegment(
-        segment_id="seg_0", char_offset=0, segment_content_hash="deadbeef"
-    )
+    ref = RefSourceSegment(segment_id="seg_0", char_offset=0, segment_content_hash="deadbeef")
     try:
         RefMapper("ch_1", CHAPTER_TEXT).map([ref])
     except RefMappingError as exc:
@@ -161,9 +159,7 @@ def test_ref_mapper_rejects_bad_hash() -> None:
 
 def test_ref_mapper_rejects_out_of_range() -> None:
     """char_offset 越界 → RefMappingError(ref_out_of_range)。"""
-    ref = RefSourceSegment(
-        segment_id="seg_0", char_offset=99999, segment_content_hash="x"
-    )
+    ref = RefSourceSegment(segment_id="seg_0", char_offset=99999, segment_content_hash="x")
     try:
         RefMapper("ch_1", CHAPTER_TEXT).map([ref])
     except RefMappingError as exc:
@@ -254,9 +250,7 @@ def test_status_aggregation_all_combinations() -> None:
     assert agg.aggregate([ev(EvidenceStance.UNCLEAR)]).claim_status == ClaimStatus.UNVERIFIED
     assert agg.aggregate([ev(EvidenceStance.SUPPORTS)]).claim_status == ClaimStatus.SUPPORTED
     assert (
-        agg.aggregate(
-            [ev(EvidenceStance.SUPPORTS), ev(EvidenceStance.REFUTES)]
-        ).claim_status
+        agg.aggregate([ev(EvidenceStance.SUPPORTS), ev(EvidenceStance.REFUTES)]).claim_status
         == ClaimStatus.CONTESTED
     )
     assert agg.aggregate([ev(EvidenceStance.REFUTES)]).claim_status == ClaimStatus.REJECTED
@@ -268,12 +262,20 @@ def test_primary_evidence_is_direct_supports() -> None:
     result = agg.aggregate(
         [
             AlignedEvidence(
-                "ch", 0, 1, "a",
-                stance=EvidenceStance.SUPPORTS, evidence_type=EvidenceType.CONTEXTUAL,
+                "ch",
+                0,
+                1,
+                "a",
+                stance=EvidenceStance.SUPPORTS,
+                evidence_type=EvidenceType.CONTEXTUAL,
             ),
             AlignedEvidence(
-                "ch", 1, 2, "b",
-                stance=EvidenceStance.SUPPORTS, evidence_type=EvidenceType.DIRECT,
+                "ch",
+                1,
+                2,
+                "b",
+                stance=EvidenceStance.SUPPORTS,
+                evidence_type=EvidenceType.DIRECT,
             ),
         ]
     )
@@ -306,12 +308,16 @@ def test_align_materializes_evidence_and_status(tmp_path, migrated_db: Engine) -
 
     # primary evidence 属于对应 claim version（ver_* 前缀 + 有 evidence 行）
     with migrated_db.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT c.claim_version_id, c.primary_evidence_id, c.claim_status,"
-                " c.fact_id FROM claims c ORDER BY c.rowid"
+        rows = (
+            conn.execute(
+                text(
+                    "SELECT c.claim_version_id, c.primary_evidence_id, c.claim_status,"
+                    " c.fact_id FROM claims c ORDER BY c.rowid"
+                )
             )
-        ).mappings().fetchall()
+            .mappings()
+            .fetchall()
+        )
     assert len(rows) == 2
     for row in rows:
         assert row["claim_status"] == "supported"
@@ -400,9 +406,7 @@ def test_align_no_anchor_writes_error(tmp_path, migrated_db: Engine) -> None:
 
     # 无证据 claim 不落库（找不到原文的不激活）
     with migrated_db.connect() as conn:
-        row = conn.execute(
-            text("SELECT count(*) FROM state_claims WHERE field = 'x'")
-        ).fetchone()
+        row = conn.execute(text("SELECT count(*) FROM state_claims WHERE field = 'x'")).fetchone()
     assert row[0] == 0, "无锚文本 claim 不得写库"
     # 有证据的 claim 正常落库
     with migrated_db.connect() as conn:
@@ -503,12 +507,8 @@ def test_literal_cooccurrence_not_support(tmp_path, migrated_db: Engine) -> None
     ]
     candidates = SpanCandidateGenerator().generate("ch_1", 0, text, anchors)
     verifier = LiteralVerifier()
-    verified = [
-        v for c in candidates if (v := verifier.verify(c)) is not None
-    ]
-    assert verified == [], (
-        f"「甲与乙并肩而立」不得支持「甲杀死乙」：{verified}"
-    )
+    verified = [v for c in candidates if (v := verifier.verify(c)) is not None]
+    assert verified == [], f"「甲与乙并肩而立」不得支持「甲杀死乙」：{verified}"
 
 
 def test_literal_full_hard_anchor_supports(tmp_path, migrated_db: Engine) -> None:
@@ -527,9 +527,7 @@ def test_literal_full_hard_anchor_supports(tmp_path, migrated_db: Engine) -> Non
     ]
     candidates = SpanCandidateGenerator().generate("ch_1", 0, text, anchors)
     verifier = LiteralVerifier()
-    verified = [
-        v for c in candidates if (v := verifier.verify(c)) is not None
-    ]
+    verified = [v for c in candidates if (v := verifier.verify(c)) is not None]
     assert verified, "硬锚全命中必须产生 supports"
     assert verified[0].stance == EvidenceStance.SUPPORTS
     assert verified[0].evidence_type == EvidenceType.DIRECT
@@ -551,9 +549,7 @@ def test_event_predicate_summary_must_be_in_text() -> None:
     from novelcanon.evidence.verifiers import LiteralVerifier
 
     mentions = {"m1": "甲", "m2": "乙"}
-    local_events = [
-        {"event_type": "杀死", "sequence_in_chapter": 1, "participants": ["m1", "m2"]}
-    ]
+    local_events = [{"event_type": "杀死", "sequence_in_chapter": 1, "participants": ["m1", "m2"]}]
     claim = {
         "claim_type": "event",
         "payload": {
@@ -569,9 +565,7 @@ def test_event_predicate_summary_must_be_in_text() -> None:
     )
     text = "甲与乙并肩而立，众人围观。"
     candidates = SpanCandidateGenerator().generate("ch_1", 0, text, anchors)
-    verified = [
-        v for c in candidates if (v := LiteralVerifier().verify(c)) is not None
-    ]
+    verified = [v for c in candidates if (v := LiteralVerifier().verify(c)) is not None]
     assert verified == [], f"共现不得支持事件（谓词未被原文证明）：{verified}"
 
     # 对照：summary 逐字引用原文（模型引用原文写法）→ 支持
@@ -587,9 +581,7 @@ def test_event_predicate_summary_must_be_in_text() -> None:
     anchors2 = extract_anchors(claim2, mentions, local_events=local_events)
     text2 = "甲杀死了乙，血溅当场。"
     candidates2 = SpanCandidateGenerator().generate("ch_1", 0, text2, anchors2)
-    verified2 = [
-        v for c in candidates2 if (v := LiteralVerifier().verify(c)) is not None
-    ]
+    verified2 = [v for c in candidates2 if (v := LiteralVerifier().verify(c)) is not None]
     assert verified2, "summary 逐字出现在原文必须支持"
     assert verified2[0].stance == EvidenceStance.SUPPORTS
 
@@ -618,16 +610,12 @@ def test_org_action_verb_required() -> None:
     assert any(a.group == "org_action" for a in anchors), "org action 动词组必须生成"
     text = "甲与乙并肩而立，众人围观。"
     candidates = SpanCandidateGenerator().generate("ch_1", 0, text, anchors)
-    verified = [
-        v for c in candidates if (v := LiteralVerifier().verify(c)) is not None
-    ]
+    verified = [v for c in candidates if (v := LiteralVerifier().verify(c)) is not None]
     assert verified == [], f"成员共现不得支持 org claim：{verified}"
     # 对照：加入动词出现 → 支持
     text2 = "乙加入甲的门派，成为外门弟子。"
     candidates2 = SpanCandidateGenerator().generate("ch_1", 0, text2, anchors)
-    verified2 = [
-        v for c in candidates2 if (v := LiteralVerifier().verify(c)) is not None
-    ]
+    verified2 = [v for c in candidates2 if (v := LiteralVerifier().verify(c)) is not None]
     assert verified2, "action 动词命中必须支持 org claim"
     assert verified2[0].stance == EvidenceStance.SUPPORTS
 
@@ -650,16 +638,12 @@ def test_term_definition_requires_definition_in_text() -> None:
     # 术语出现但定义句未出现 → 无候选 → unverified
     text = "萧炎修炼斗之气已有三年。"
     candidates = SpanCandidateGenerator().generate("ch_1", 0, text, anchors)
-    verified = [
-        v for c in candidates if (v := LiteralVerifier().verify(c)) is not None
-    ]
+    verified = [v for c in candidates if (v := LiteralVerifier().verify(c)) is not None]
     assert verified == [], "术语出现不得支持定义（定义未在原文）"
     # 对照：定义句逐字出现 → 支持
     text2 = "斗之气是一种修炼境界，分为十段。"
     candidates2 = SpanCandidateGenerator().generate("ch_1", 0, text2, anchors)
-    verified2 = [
-        v for c in candidates2 if (v := LiteralVerifier().verify(c)) is not None
-    ]
+    verified2 = [v for c in candidates2 if (v := LiteralVerifier().verify(c)) is not None]
     assert verified2, "definition 出现在原文必须支持"
     assert verified2[0].stance == EvidenceStance.SUPPORTS
 
@@ -667,9 +651,7 @@ def test_term_definition_requires_definition_in_text() -> None:
 # ── P0 回归：foreshadowing 含 related_entity_ids 不得崩溃 ──────
 
 
-def test_align_foreshadowing_with_related_entities(
-    tmp_path, migrated_db: Engine
-) -> None:
+def test_align_foreshadowing_with_related_entities(tmp_path, migrated_db: Engine) -> None:
     """验收 P0：含 related_entity_ids 且证据有效的 foreshadowing claim
     必须能完成 align + materialize（此前 _ns_payload 用 dataclasses.field
     函数对象做字典 key → **kwargs 解包抛 TypeError: keywords must be

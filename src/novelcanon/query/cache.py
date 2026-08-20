@@ -107,16 +107,10 @@ class QueryCache:
 
     def get(self, key: CacheKey) -> dict | None:
         with self._engine.connect() as conn:
-            row = (
-                conn.execute(
-                    text(
-                        "SELECT result FROM query_cache"
-                        " WHERE cache_key = :k AND book_id = :b"
-                    ),
-                    {"k": key.to_key(), "b": self._book_id},
-                )
-                .fetchone()
-            )
+            row = conn.execute(
+                text("SELECT result FROM query_cache WHERE cache_key = :k AND book_id = :b"),
+                {"k": key.to_key(), "b": self._book_id},
+            ).fetchone()
         if row is None:
             return None
         try:

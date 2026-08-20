@@ -52,9 +52,7 @@ def upgrade() -> None:
             "claim_version_id", "extraction_run_id", name="pk_alias_observations"
         ),
     )
-    op.create_index(
-        "ix_alias_observations_run", "alias_observations", ["extraction_run_id"]
-    )
+    op.create_index("ix_alias_observations_run", "alias_observations", ["extraction_run_id"])
 
     # ── 回填成员关系（迁移前数据按首次创建 run 可见）──────────
     op.execute(

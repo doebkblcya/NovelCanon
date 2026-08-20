@@ -62,9 +62,7 @@ def rrf_fuse(
     return fused
 
 
-def fts_query_candidates(
-    shadow_hits: list[dict], trigram_hits: list[dict]
-) -> list[str]:
+def fts_query_candidates(shadow_hits: list[dict], trigram_hits: list[dict]) -> list[str]:
     """FTS 影子列 + trigram 两路候选按 raw_chunk_id 去重合并。
 
     保留两路各自的相对序：影子列优先（主召回），trigram 补漏——

@@ -480,8 +480,11 @@ class Repository:
                         " WHERE claim_version_id = :v AND world_valid_kind IS NULL"
                     ),
                     {
-                        "wk": wv_kind, "wf": wv_from, "wt": wv_to,
-                        "wc": wv_conf, "v": version_id,
+                        "wk": wv_kind,
+                        "wf": wv_from,
+                        "wt": wv_to,
+                        "wc": wv_conf,
+                        "v": version_id,
                     },
                 )
                 self._record_event_link_observation(
@@ -532,9 +535,7 @@ class Repository:
                 },
             )
             self._record_verification(conn, record, version_id)
-            self._record_event_link_observation(
-                conn, version_id, record.envelope.created_by_run_id
-            )
+            self._record_event_link_observation(conn, version_id, record.envelope.created_by_run_id)
             return WriteResult(claim_version_id=version_id, is_new=True)
 
     def _record_verification(
@@ -551,9 +552,9 @@ class Repository:
         会被**降级为 unverified**——supported 边必须有可审计的关系证据
         （数据库约束 ck_event_link_verification_supported 兜底）。
         """
-        verified = bool(
-            (record.verification_method or "").strip()
-        ) and bool((record.verification_evidence or "").strip())
+        verified = bool((record.verification_method or "").strip()) and bool(
+            (record.verification_evidence or "").strip()
+        )
         conn.execute(
             text(
                 "INSERT OR REPLACE INTO event_link_verifications"
@@ -653,10 +654,7 @@ class Repository:
         """设置 primary_evidence_id（只用于查询加速，07 §5）。"""
         with self._engine.begin() as conn:
             conn.execute(
-                text(
-                    "UPDATE claims SET primary_evidence_id = :e"
-                    " WHERE claim_version_id = :v"
-                ),
+                text("UPDATE claims SET primary_evidence_id = :e WHERE claim_version_id = :v"),
                 {"e": evidence_id_value, "v": claim_version_id_value},
             )
 

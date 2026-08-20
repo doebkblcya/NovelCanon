@@ -339,9 +339,7 @@ class PipelineRunner:
                             conn, self._run_id, task.checkpoint_fields, result.payload
                         )
                         if self._staging is not None:
-                            self._staging.write(
-                                conn, self._run_id, task, result.payload
-                            )
+                            self._staging.write(conn, self._run_id, task, result.payload)
                         self._ledger.record_with(
                             conn,
                             LedgerEntry(

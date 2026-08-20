@@ -127,8 +127,7 @@ class EntityResolver:
         的可信 alias 全集，_seeded 即该书唯一真相。
         """
         self._seeded = {
-            normalize_surface(surface): canonical
-            for surface, canonical in known_aliases.items()
+            normalize_surface(surface): canonical for surface, canonical in known_aliases.items()
         }
 
     def resolve(
@@ -219,15 +218,10 @@ class EntityResolver:
         - 任一章节出现 ≥2 次 → 章内复现 = 强连续性。
         否则（跨章孤立出现、章节序不连续）→ 无法判断 → 不合并。
         """
-        chapters = {
-            m.get("chapter_id") for m in group if m.get("chapter_id") is not None
-        }
+        chapters = {m.get("chapter_id") for m in group if m.get("chapter_id") is not None}
         if len(chapters) <= 1:
             return True
-        if any(
-            sum(1 for m in group if m.get("chapter_id") == ch) > 1
-            for ch in chapters
-        ):
+        if any(sum(1 for m in group if m.get("chapter_id") == ch) > 1 for ch in chapters):
             return True  # 某章内出现多次 → 同一人物延续
         ordinals: list[int] = []
         for m in group:
@@ -253,9 +247,7 @@ class EntityResolver:
             group,
             key=lambda m: (
                 m.get("ordinal") if isinstance(m.get("ordinal"), int) else 1 << 30,
-                m.get("char_start")
-                if isinstance(m.get("char_start"), int)
-                else 1 << 30,
+                m.get("char_start") if isinstance(m.get("char_start"), int) else 1 << 30,
                 m.get("mention_id", ""),
             ),
         )
@@ -269,6 +261,4 @@ class EntityResolver:
             )
         else:
             anchor = (chapter, first.get("mention_id", ""))
-        return "ent_" + stable_config_hash(
-            {"book": book_id, "anchor": anchor}
-        )[:16]
+        return "ent_" + stable_config_hash({"book": book_id, "anchor": anchor})[:16]

@@ -93,6 +93,18 @@ class AppSettings(BaseSettings):
     llm_mode: str = "json_object"
     llm_tokenizer: str = "fake-v1"
 
+    # ── embedding provider（阶段 11 复审 P1：生产检索后端）────────
+    # 启用生产 embedding 时设置 embedding_profile_id（如
+    # openai-text-embedding-3-small），API 启动时经
+    # retrieval.factory.register_configured_backends 注册真实 adapter；
+    # 密钥字段 exclude=True，绝不进入 config_hash / 日志 / 数据库。
+    embedding_profile_id: str = ""
+    embedding_provider: str = "openai-compatible"
+    embedding_model: str = ""
+    embedding_base_url: str = ""
+    embedding_api_key: str = Field(default="", exclude=True)
+    embedding_dimension: int = 0
+
     def config_hash(self) -> str:
         """整个应用配置的稳定 hash（密钥字段已 exclude，不进入 hash）。"""
         return stable_config_hash(self.model_dump(mode="json"))

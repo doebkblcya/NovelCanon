@@ -55,7 +55,7 @@ def test_prompt_version_sensitive_to_all_parts() -> None:
     assert MapPrompts(schema_json="{}").version() == v
     assert MapPrompts(system_instruction="改", schema_json="{}").version() != v
     assert MapPrompts(few_shot=["例"], schema_json="{}").version() != v
-    assert MapPrompts(schema_json="{\"x\":1}").version() != v
+    assert MapPrompts(schema_json='{"x":1}').version() != v
 
 
 def test_build_map_prompt_layout() -> None:
@@ -307,6 +307,7 @@ def test_generation_client_retries_429_then_succeeds() -> None:
 
 def test_generation_client_retry_exhaustion_discarded() -> None:
     """重试耗尽：最终失败为 retryable 错误（runner 会重试/判失败）。"""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, json={"error": "server busy"})
 
@@ -383,12 +384,8 @@ def test_generation_client_concurrent_retry_counts_isolated() -> None:
         )
         ra, rb = await asyncio.gather(client.complete("A"), client.complete("B"))
         assert calls["a"] == 3 and calls["b"] == 1
-        assert ra.usage.retry_count == 2, (
-            f"A 重试 2 次必须记在自己的 usage：{ra.usage.retry_count}"
-        )
-        assert rb.usage.retry_count == 0, (
-            f"B 未重试不得消费 A 的重试计数：{rb.usage.retry_count}"
-        )
+        assert ra.usage.retry_count == 2, f"A 重试 2 次必须记在自己的 usage：{ra.usage.retry_count}"
+        assert rb.usage.retry_count == 0, f"B 未重试不得消费 A 的重试计数：{rb.usage.retry_count}"
         # 重建 Usage 时 profile_id 不丢失（此前重建丢失）
         assert ra.usage.profile_id == "g1" and rb.usage.profile_id == "g1"
 
@@ -399,6 +396,7 @@ def test_generation_client_retry_exhaustion_carries_meta() -> None:
     """验收 P1：重试耗尽时（Usage 尚未构造）内部尝试次数与失败消耗的
     prompt token 必须附加到最终异常，供 runner 入账——「所有模型调用
     均可审计」含失败调用。"""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, json={"error": "down"})
 

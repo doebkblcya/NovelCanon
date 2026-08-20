@@ -156,12 +156,24 @@ def test_value_update_new_version_same_fact(repo: Repository) -> None:
 
     fact = state_fact_id("e1", "cultivation_realm")
     v1 = _write_state(
-        repo, run, fact, "cultivation_realm", "金丹",
-        subject_entity_id="e1", chapter_id=ch, ordinal=1,
+        repo,
+        run,
+        fact,
+        "cultivation_realm",
+        "金丹",
+        subject_entity_id="e1",
+        chapter_id=ch,
+        ordinal=1,
     )
     v2 = _write_state(
-        repo, run, fact, "cultivation_realm", "元婴",
-        subject_entity_id="e1", chapter_id=ch, ordinal=2,
+        repo,
+        run,
+        fact,
+        "cultivation_realm",
+        "元婴",
+        subject_entity_id="e1",
+        chapter_id=ch,
+        ordinal=2,
     )
 
     assert v1.is_new and v2.is_new
@@ -318,12 +330,24 @@ def test_multi_book_isolation(repo: Repository) -> None:
     f1 = state_fact_id("ent_b1", "alive")
     f2 = state_fact_id("ent_b2", "alive")
     _write_state(
-        repo, run1, f1, "alive", "true",
-        subject_entity_id="ent_b1", chapter_id=ch1, ordinal=1,
+        repo,
+        run1,
+        f1,
+        "alive",
+        "true",
+        subject_entity_id="ent_b1",
+        chapter_id=ch1,
+        ordinal=1,
     )
     _write_state(
-        repo, run2, f2, "alive", "true",
-        subject_entity_id="ent_b2", chapter_id=ch2, ordinal=1,
+        repo,
+        run2,
+        f2,
+        "alive",
+        "true",
+        subject_entity_id="ent_b2",
+        chapter_id=ch2,
+        ordinal=1,
     )
 
     claims1 = repo.active_claims_for_book(book1)
@@ -422,8 +446,15 @@ def test_state_update_without_prior_version_rejected(repo: Repository) -> None:
     _ensure_entity(repo, run, "e1")
     with pytest.raises(ValueError, match="必须指向已存在版本"):
         _write_state(
-            repo, run, state_fact_id("e1", "realm"), "realm", "x",
-            subject_entity_id="e1", chapter_id=ch, ordinal=1, op=Operation.UPDATE,
+            repo,
+            run,
+            state_fact_id("e1", "realm"),
+            "realm",
+            "x",
+            subject_entity_id="e1",
+            chapter_id=ch,
+            ordinal=1,
+            op=Operation.UPDATE,
         )
 
 
@@ -444,9 +475,7 @@ def test_state_subject_must_exist_entity(repo: Repository) -> None:
     with pytest.raises(Exception, match="引用不存在的实体"):  # noqa: B017
         repo.write_claim(
             env,
-            StatePayload(
-                field="realm", value="x", raw_value="x", subject_entity_id="e_ghost"
-            ),
+            StatePayload(field="realm", value="x", raw_value="x", subject_entity_id="e_ghost"),
         )
     # PRAGMA foreign_key_check 依然无错（触发器约束不在 FK 检查范围）
     assert repo.foreign_key_check() == []
@@ -477,8 +506,14 @@ def test_delete_entity_referenced_by_state_rejected(repo: Repository) -> None:
     run = new_uuid_id("run")
     repo.start_run(run, book)
     _write_state(
-        repo, run, state_fact_id("e1", "realm"), "realm", "x",
-        subject_entity_id="e1", chapter_id=ch, ordinal=1,
+        repo,
+        run,
+        state_fact_id("e1", "realm"),
+        "realm",
+        "x",
+        subject_entity_id="e1",
+        chapter_id=ch,
+        ordinal=1,
     )
     with pytest.raises(Exception), repo._engine.begin() as conn:  # noqa: B017, SLF001
         conn.execute(text("DELETE FROM entities WHERE canonical_id = 'e1'"))
@@ -501,12 +536,8 @@ def _write_event(
     """写一个事件版本（含参与者）；返回 claim_version_id。"""
     for ent in participants:
         _ensure_entity(repo, entity_run, ent)
-    env = _envelope(
-        run_id, fact_id, chapter_id=chapter_id, ordinal=ordinal, claim_type="event"
-    )
-    result = repo.write_claim(
-        env, EventPayload(event_type="测试事件", summary=summary)
-    )
+    env = _envelope(run_id, fact_id, chapter_id=chapter_id, ordinal=ordinal, claim_type="event")
+    result = repo.write_claim(env, EventPayload(event_type="测试事件", summary=summary))
     for ent in participants:
         repo.add_event_participant(result.claim_version_id, ent)
     return result.claim_version_id
@@ -521,16 +552,26 @@ def test_event_participants_requires_current_supported(repo: Repository) -> None
     repo.start_run(run, book)
     repo.finish_run(run, RunStatus.ACTIVE)
 
-    fact = event_fact_id(
-        "测试事件", ["e1", "e2"], None, ch, 1
-    )
+    fact = event_fact_id("测试事件", ["e1", "e2"], None, ch, 1)
     v1 = _write_event(
-        repo, run, fact, summary="初版描述", chapter_id=ch, ordinal=1,
-        participants=["e1", "e2"], entity_run=run,
+        repo,
+        run,
+        fact,
+        summary="初版描述",
+        chapter_id=ch,
+        ordinal=1,
+        participants=["e1", "e2"],
+        entity_run=run,
     )
     v2 = _write_event(
-        repo, run, fact, summary="更新描述", chapter_id=ch, ordinal=2,
-        participants=["e1", "e2"], entity_run=run,
+        repo,
+        run,
+        fact,
+        summary="更新描述",
+        chapter_id=ch,
+        ordinal=2,
+        participants=["e1", "e2"],
+        entity_run=run,
     )
     repo.set_claim_status(v1, "supported")
     repo.set_claim_status(v2, "supported")
@@ -546,7 +587,13 @@ def test_event_participants_requires_current_supported(repo: Repository) -> None
     # unverified 事件（不同 fact）→ 拒绝
     fact_uv = event_fact_id("测试事件", ["e3"], None, ch, 2)
     v_uv = _write_event(
-        repo, run, fact_uv, summary="未验证", chapter_id=ch, ordinal=3,
-        participants=["e3"], entity_run=run,
+        repo,
+        run,
+        fact_uv,
+        summary="未验证",
+        chapter_id=ch,
+        ordinal=3,
+        participants=["e3"],
+        entity_run=run,
     )
     assert q.event_participants(v_uv) is None, "unverified 事件不得返回"

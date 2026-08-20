@@ -79,9 +79,7 @@ class QueryService:
         """
         with self._engine.connect() as conn:
             rows = conn.execute(
-                text(
-                    "SELECT mention_id FROM entity_resolutions WHERE canonical_id = :c"
-                ),
+                text("SELECT mention_id FROM entity_resolutions WHERE canonical_id = :c"),
                 {"c": canonical_id},
             ).fetchall()
         scope = [canonical_id] + [r[0] for r in rows]
@@ -89,9 +87,7 @@ class QueryService:
         return list(dict.fromkeys(scope))
 
     @staticmethod
-    def _scope_sql(
-        scope: list[str], prefix: str = "e"
-    ) -> tuple[str, dict[str, object]]:
+    def _scope_sql(scope: list[str], prefix: str = "e") -> tuple[str, dict[str, object]]:
         """IN 子句（实体集合展开）。prefix 区分多组占位符。"""
         if not scope:
             return "1=0", {}
@@ -221,8 +217,11 @@ class QueryService:
                         "           ORDER BY c._rowid DESC) rn"
                         "  FROM v_active_claims c"
                         "  JOIN relation_claims r ON r.claim_version_id = c.claim_version_id"
-                        "  WHERE (r.from_entity_id " + from_sql + " OR r.to_entity_id "
-                        + to_sql + ") AND c.book_id = :book"
+                        "  WHERE (r.from_entity_id "
+                        + from_sql
+                        + " OR r.to_entity_id "
+                        + to_sql
+                        + ") AND c.book_id = :book"
                         f"  {cutoff_sql}"
                         f"  {world_sql}"
                         ") q"
@@ -230,6 +229,79 @@ class QueryService:
                         # unknown 世界时间不能表达为精确状态——仅当查询
                         # 请求世界时间（world_at）时才排除；普通读者查询
                         # （只看披露）返回全部 supported 关系。
+                        f"{_world_unknown_filter(world_at)}"
+                        " ORDER BY q.observed_ordinal"
+                    ),
+                    params,
+                )
+                .mappings()
+                .fetchall()
+            )
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["evidence"] = self._evidence_for(d["claim_version_id"])
+            out.append(d)
+        return out
+
+    def relation_between(
+        self,
+        canonical_a: str,
+        canonical_b: str,
+        *,
+        knowledge_cutoff: int | None = None,
+        world_at: int | None = None,
+    ) -> list[dict]:
+        """两实体之间的直接关系（P1：双实体问题收窄端点对）。
+
+        只返回一端属于 a 的作用域、另一端属于 b 的作用域的关系——
+        「萧炎与纳兰嫣然的关系」不再返回萧炎的全部一跳关系。
+        双时间过滤与 one_hop_relations 一致。
+        """
+        cutoff_sql, cutoff_params = _cutoff_sql(knowledge_cutoff)
+        world_sql, world_params = _world_sql(world_at)
+        scope_a = self.entity_scope(canonical_a)
+        scope_b = self.entity_scope(canonical_b)
+        a_sql, a_params = self._scope_sql(scope_a, prefix="a")
+        b_sql, b_params = self._scope_sql(scope_b, prefix="b")
+        params: dict[str, object] = {}
+        params.update(cutoff_params)
+        params.update(world_params)
+        params.update(a_params)
+        params.update(b_params)
+        params["book"] = self._book_id
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT q.claim_version_id, q.fact_id, q.observed_ordinal,"
+                        " q.claim_status, q.confidence,"
+                        " q.from_entity_id, q.to_entity_id, q.relation_type, q.relation_raw"
+                        " FROM ("
+                        "  SELECT c.claim_version_id, c.fact_id, c.observed_ordinal,"
+                        "         c.operation, c.claim_status, c.confidence,"
+                        "         c.world_valid_kind,"
+                        "         r.from_entity_id, r.to_entity_id, r.relation_type,"
+                        "         r.relation_raw,"
+                        "         ROW_NUMBER() OVER (PARTITION BY c.fact_id"
+                        "           ORDER BY c._rowid DESC) rn"
+                        "  FROM v_active_claims c"
+                        "  JOIN relation_claims r ON r.claim_version_id = c.claim_version_id"
+                        "  WHERE c.book_id = :book"
+                        "    AND ((r.from_entity_id "
+                        + a_sql
+                        + "         AND r.to_entity_id "
+                        + b_sql
+                        + ")"
+                        "      OR (r.from_entity_id "
+                        + b_sql
+                        + "         AND r.to_entity_id "
+                        + a_sql
+                        + "))"
+                        f"  {cutoff_sql}"
+                        f"  {world_sql}"
+                        ") q"
+                        f" WHERE {_current_filter()}"
                         f"{_world_unknown_filter(world_at)}"
                         " ORDER BY q.observed_ordinal"
                     ),
@@ -300,9 +372,7 @@ class QueryService:
             )
             return {"event": event, "participants": [dict(p) for p in participants]}
 
-    def claim_history(
-        self, fact_id: str, *, knowledge_cutoff: int | None = None
-    ) -> list[dict]:
+    def claim_history(self, fact_id: str, *, knowledge_cutoff: int | None = None) -> list[dict]:
         """某 fact 的版本历史（append-only，按写入序；限定本书）。
 
         knowledge_cutoff（P0）：只返回截止章前披露的版本——关系演变查询
@@ -408,9 +478,7 @@ class QueryService:
         params: dict[str, object] = {"book": self._book_id}
         params.update(cutoff_params)
         params.update(world_params)
-        scope_sql, scope_params = self._scope_sql(
-            self.entity_scope(canonical_id), prefix="f"
-        )
+        scope_sql, scope_params = self._scope_sql(self.entity_scope(canonical_id), prefix="f")
         params.update(scope_params)
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -422,8 +490,11 @@ class QueryService:
                     " JOIN extraction_runs x ON x.run_id = o.extraction_run_id"
                     " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
                     " WHERE ch.book_id = :book AND x.status = 'active'"
-                    "   AND (r.from_entity_id " + scope_sql
-                    + "        OR r.to_entity_id " + scope_sql + ")"
+                    "   AND (r.from_entity_id "
+                    + scope_sql
+                    + "        OR r.to_entity_id "
+                    + scope_sql
+                    + ")"
                     f"{cutoff_sql}{world_sql}"
                 ),
                 params,
@@ -572,9 +643,7 @@ class QueryService:
             # 路径全部事件摘要（P0：多跳正文含中间事件，A → B → C，
             # 模型看到的不是省略中间节点的直接因果）
             event_ids = [e for e in (d.get("path") or "").split(">") if e]
-            d["path_events"] = [
-                self._event_summary(eid) for eid in event_ids if eid
-            ]
+            d["path_events"] = [self._event_summary(eid) for eid in event_ids if eid]
             out.append(d)
         return out
 
@@ -588,9 +657,7 @@ class QueryService:
         if not edge_ids:
             return []
         placeholders = ", ".join(f":e{n}" for n in range(len(edge_ids)))
-        params: dict[str, object] = {
-            f"e{n}": e for n, e in enumerate(edge_ids)
-        }
+        params: dict[str, object] = {f"e{n}": e for n, e in enumerate(edge_ids)}
         params["book"] = self._book_id
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -630,15 +697,10 @@ class QueryService:
         # 补章节 ordinal（Python 侧解析，避免 json_extract 对非法 JSON 抛错）
         if chapter_ids:
             ch_ph = ", ".join(f":c{n}" for n in range(len(chapter_ids)))
-            ch_params: dict[str, object] = {
-                f"c{n}": c for n, c in enumerate(sorted(chapter_ids))
-            }
+            ch_params: dict[str, object] = {f"c{n}": c for n, c in enumerate(sorted(chapter_ids))}
             with self._engine.connect() as conn:
                 ord_rows = conn.execute(
-                    text(
-                        "SELECT chapter_id, ordinal FROM chapters"
-                        f" WHERE chapter_id IN ({ch_ph})"
-                    ),
+                    text(f"SELECT chapter_id, ordinal FROM chapters WHERE chapter_id IN ({ch_ph})"),
                     ch_params,
                 ).fetchall()
             ordinal_by_id = {r[0]: r[1] for r in ord_rows}
@@ -767,9 +829,7 @@ class QueryService:
             edge_ids = [e for e in (d.get("edges") or "").split(",") if e]
             d["edge_evidence"] = self._link_evidence_map(edge_ids)
             event_ids = [e for e in (d.get("path") or "").split("<") if e]
-            d["path_events"] = [
-                self._event_summary(eid) for eid in event_ids if eid
-            ]
+            d["path_events"] = [self._event_summary(eid) for eid in event_ids if eid]
             out.append(d)
         return out
 
@@ -816,8 +876,7 @@ class QueryService:
                         "   ORDER BY c._rowid DESC) rn"
                         " FROM v_active_claims c"
                         " JOIN state_claims s ON s.claim_version_id = c.claim_version_id"
-                        " WHERE s.subject_entity_id " + scope_sql
-                        + " AND c.book_id = :book"
+                        " WHERE s.subject_entity_id " + scope_sql + " AND c.book_id = :book"
                         f"  {cutoff_sql}"
                         " AND ("
                         "   (c.world_valid_kind = 'story_time'"
@@ -877,8 +936,11 @@ class QueryService:
                         "   ORDER BY c._rowid DESC) rn"
                         " FROM v_active_claims c"
                         " JOIN org_claims o ON o.claim_version_id = c.claim_version_id"
-                        " WHERE (o.org_entity_id " + scope_sql
-                        + " OR o.member_entity_id " + scope_sql + ")"
+                        " WHERE (o.org_entity_id "
+                        + scope_sql
+                        + " OR o.member_entity_id "
+                        + scope_sql
+                        + ")"
                         " AND c.book_id = :book"
                         f"  {cutoff_sql}"
                         " AND ("
@@ -920,9 +982,7 @@ class QueryService:
         scope_sql = ""
         params: dict[str, object] = {"book": self._book_id, "chapter": chapter_ordinal}
         if canonical_id is not None:
-            in_sql, scope_params = self._scope_sql(
-                self.entity_scope(canonical_id), prefix="p"
-            )
+            in_sql, scope_params = self._scope_sql(self.entity_scope(canonical_id), prefix="p")
             scope_sql = f"AND ep.entity_id {in_sql}"
             params.update(scope_params)
         with self._engine.connect() as conn:
@@ -1032,10 +1092,7 @@ class QueryService:
     def _event_participant_ids(self, event_claim_version_id: str) -> list[str]:
         with self._engine.connect() as conn:
             rows = conn.execute(
-                text(
-                    "SELECT entity_id FROM event_participants"
-                    " WHERE event_claim_version_id = :v"
-                ),
+                text("SELECT entity_id FROM event_participants WHERE event_claim_version_id = :v"),
                 {"v": event_claim_version_id},
             ).fetchall()
         return [r[0] for r in rows]
@@ -1136,8 +1193,11 @@ class QueryService:
                         "           o.member_entity_id ORDER BY c._rowid DESC) rn"
                         "  FROM v_active_claims c"
                         "  JOIN org_claims o ON o.claim_version_id = c.claim_version_id"
-                        "  WHERE (o.org_entity_id " + org_sql + " OR o.member_entity_id "
-                        + member_sql + ") AND c.book_id = :book"
+                        "  WHERE (o.org_entity_id "
+                        + org_sql
+                        + " OR o.member_entity_id "
+                        + member_sql
+                        + ") AND c.book_id = :book"
                         f"  {cutoff_sql}{world_sql}"
                         ") q"
                         f" WHERE {_current_filter()}"
@@ -1258,17 +1318,13 @@ class QueryService:
         当前披露状态（entity_state，P0 双时间贯通）。
         """
         state = (
-            self.world_state_at(
-                canonical_id, world_at, knowledge_cutoff=knowledge_cutoff
-            )
+            self.world_state_at(canonical_id, world_at, knowledge_cutoff=knowledge_cutoff)
             if world_at is not None
             else self.entity_state(canonical_id, knowledge_cutoff=knowledge_cutoff)
         )
         return {
             "canonical_id": canonical_id,
-            "display_name": self.display_name(
-                canonical_id, knowledge_cutoff=knowledge_cutoff
-            ),
+            "display_name": self.display_name(canonical_id, knowledge_cutoff=knowledge_cutoff),
             "state": state,
             "relations": self.one_hop_relations(
                 canonical_id,

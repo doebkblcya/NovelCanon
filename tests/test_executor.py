@@ -233,9 +233,7 @@ def test_relation_evolution_respects_cutoff(tmp_path: Path, migrated_db: Engine)
     assert "正式收萧炎为徒" in r_full.answer["answer"], "完整查询应含全部版本"
 
 
-def test_structured_answer_carries_evidence_location(
-    tmp_path: Path, migrated_db: Engine
-) -> None:
+def test_structured_answer_carries_evidence_location(tmp_path: Path, migrated_db: Engine) -> None:
     """P0-4：结构化答案的 AnswerSource 带章节定位与原文 span。"""
     data = seed_active_book(migrated_db, tmp_path)
     executor = _executor(migrated_db, data)
@@ -273,9 +271,7 @@ def test_llm_synthesis_usage_tracked(tmp_path: Path, migrated_db: Engine) -> Non
     assert structured["output_tokens"] == 60
 
 
-def test_plotline_fallback_uses_all_book_events(
-    tmp_path: Path, migrated_db: Engine
-) -> None:
+def test_plotline_fallback_uses_all_book_events(tmp_path: Path, migrated_db: Engine) -> None:
     """P1-5c：无摘要时主线回退覆盖全书关键事件（非仅第 0 章）。"""
     data = seed_active_book(migrated_db, tmp_path)
     executor = _executor(migrated_db, data)
@@ -284,14 +280,10 @@ def test_plotline_fallback_uses_all_book_events(
     sources = r.answer["sources"]
     assert sources, "无摘要时应回退关键事件"
     ordinals = {s["observed_ordinal"] for s in sources}
-    assert len(ordinals) >= 2, (
-        f"回退应覆盖多章事件（当前只覆盖 {ordinals}）"
-    )
+    assert len(ordinals) >= 2, f"回退应覆盖多章事件（当前只覆盖 {ordinals}）"
 
 
-def test_causal_route_sources_are_edge_evidence(
-    tmp_path: Path, migrated_db: Engine
-) -> None:
+def test_causal_route_sources_are_edge_evidence(tmp_path: Path, migrated_db: Engine) -> None:
     """P0（复审）：因果路线的 AnswerSource 用因果边版本与验证证据定位。"""
     from tests.test_events import (
         _book_and_chapters,
@@ -386,9 +378,7 @@ def test_llm_usage_persisted_to_ledger(tmp_path: Path, migrated_db: Engine) -> N
     assert stats["discarded_tokens"] == 3
 
 
-def test_causal_multi_hop_sources_cover_all_edges(
-    tmp_path: Path, migrated_db: Engine
-) -> None:
+def test_causal_multi_hop_sources_cover_all_edges(tmp_path: Path, migrated_db: Engine) -> None:
     """P0（三轮）：多跳因果路径的 AnswerSource 覆盖全部边（含后续边）。"""
     from tests.test_events import (
         _book_and_chapters,
@@ -436,19 +426,12 @@ def test_causal_multi_hop_sources_cover_all_edges(
     r = executor.ask("陆尘为什么立誓报仇")
     source_ids = {s["claim_version_id"] for s in r.answer["sources"]}
     missing = expected_edges - source_ids
-    assert not missing, (
-        f"多跳路径的后续边必须进入 AnswerSource，缺失：{missing}"
-    )
-    edge_source = next(
-        s for s in r.answer["sources"]
-        if s["claim_version_id"] in expected_edges
-    )
+    assert not missing, f"多跳路径的后续边必须进入 AnswerSource，缺失：{missing}"
+    edge_source = next(s for s in r.answer["sources"] if s["claim_version_id"] in expected_edges)
     assert edge_source["chapter_id"] and edge_source["char_start"] is not None
 
 
-def test_relation_evolution_includes_ended_relations(
-    tmp_path: Path, migrated_db: Engine
-) -> None:
+def test_relation_evolution_includes_ended_relations(tmp_path: Path, migrated_db: Engine) -> None:
     """P0（三轮）：最新版本 retract 的关系仍可查演变（含结束版本）。"""
     data = seed_active_book(migrated_db, tmp_path)
     repo = Repository(migrated_db)
@@ -479,22 +462,16 @@ def test_relation_evolution_includes_ended_relations(
     )
     # 当前关系视图已无此关系（最新版本 retract）
     qs = QueryService(migrated_db, data["book_id"])
-    assert all(
-        r["relation_type"] != "恋人" for r in qs.one_hop_relations("ent_xiaoyan")
-    )
+    assert all(r["relation_type"] != "恋人" for r in qs.one_hop_relations("ent_xiaoyan"))
     # 但关系演变仍能展示建立 → 结束 完整时间线
     executor = _executor(migrated_db, data)
     r = _ask(executor, "萧炎与纳兰嫣然的关系如何变化")
     answer = r.answer["answer"]
     assert "[版本 assert]" in answer, "应有建立版本"
-    assert "[版本 retract]" in answer, (
-        f"已结束的关系必须展示 retract 版本：{answer}"
-    )
+    assert "[版本 retract]" in answer, f"已结束的关系必须展示 retract 版本：{answer}"
 
 
-def test_causal_chain_body_contains_middle_event(
-    tmp_path: Path, migrated_db: Engine
-) -> None:
+def test_causal_chain_body_contains_middle_event(tmp_path: Path, migrated_db: Engine) -> None:
     """P0（四轮）：多跳因果正文含中间事件（A → B → C，非直接因果）。"""
     from tests.test_events import (
         _book_and_chapters,
@@ -559,3 +536,17 @@ def test_relation_evolution_honors_world_at(tmp_path: Path, migrated_db: Engine)
     # world_at=1：可见
     r1 = _ask(executor, "药老和萧炎的关系如何变化", world_at=1)
     assert "师徒" in r1.answer["answer"]
+
+
+def test_dual_entity_relation_narrows_endpoints(tmp_path: Path, migrated_db: Engine) -> None:
+    """P1（11）：双实体问题按端点对收窄——只返回两者之间的关系。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    executor = _executor(migrated_db, data)
+    # 萧炎有：师徒（药老）、恋人（纳兰嫣然）两条关系
+    r_single = _ask(executor, "萧炎与纳兰嫣然的关系")
+    answer = r_single.answer["answer"]
+    assert "恋人" in answer
+    assert "师徒" not in answer, f"双实体问题只应返回两者之间：{answer}"
+    r_pair = _ask(executor, "药老和萧炎的关系")
+    assert "师徒" in r_pair.answer["answer"]
+    assert "恋人" not in r_pair.answer["answer"]

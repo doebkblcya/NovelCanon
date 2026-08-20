@@ -75,11 +75,10 @@ class RefMapper:
             if not (0 <= ref.char_offset <= text_len):
                 raise RefMappingError(
                     "ref_out_of_range",
-                    f"段 {ref.segment_id} char_offset={ref.char_offset} 越界"
-                    f"（章长 {text_len}）",
+                    f"段 {ref.segment_id} char_offset={ref.char_offset} 越界（章长 {text_len}）",
                 )
             end = ordered[i + 1].char_offset if i + 1 < len(ordered) else text_len
-            span_text = self._chapter_text[ref.char_offset:end]
+            span_text = self._chapter_text[ref.char_offset : end]
             if sha256(span_text) != ref.segment_content_hash:
                 raise RefMappingError(
                     "ref_hash_mismatch",

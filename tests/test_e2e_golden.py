@@ -479,8 +479,7 @@ def test_materialize_rejects_bad_evidence(tmp_path, migrated_db: Engine) -> None
     other_chapter = chapter_ids[1]
     bad_owner = replace(
         d0,
-        claims=d0.claims
-        + [claim_with(GoldenEvidence(other_chapter, 0, 1, chapter_texts[0][0:1]))],
+        claims=d0.claims + [claim_with(GoldenEvidence(other_chapter, 0, 1, chapter_texts[0][0:1]))],
     )
     with pytest.raises(AssertionError, match="不一致"):
         materialize_draft(

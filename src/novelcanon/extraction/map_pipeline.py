@@ -155,19 +155,21 @@ def build_map_process_fn(
             )
         }
 
-        parts = await asyncio.gather(*[
-            _request_segment(seg, [ref_line_by_seg[seg.segment_id]], task.chapter_id, task.ordinal)
-            for seg in segments
-        ])
+        parts = await asyncio.gather(
+            *[
+                _request_segment(
+                    seg, [ref_line_by_seg[seg.segment_id]], task.chapter_id, task.ordinal
+                )
+                for seg in segments
+            ]
+        )
 
         total_usage = Usage()
         for part in parts:
             total_usage = total_usage + part.usage
 
         if any(p.parsed is None for p in parts):
-            issues = [i for p in parts for i in p.issues] or [
-                Issue("parse_error", "响应解析失败")
-            ]
+            issues = [i for p in parts for i in p.issues] or [Issue("parse_error", "响应解析失败")]
             return ProcessResult(
                 payload=_invalid_payload(issues, parts),
                 usage=total_usage,
@@ -219,10 +221,7 @@ def _combine_response_hashes(parts: list[_SegmentPart]) -> str:
 
 def _combine_raw(parts: list[_SegmentPart]) -> str:
     """多段响应摘要（完整原文过大，保存每段 hash + 前 200 字符）。"""
-    return "\n---\n".join(
-        f"[{p.response_hash[:12]}…] {p.raw_text[:200]}"
-        for p in parts
-    )
+    return "\n---\n".join(f"[{p.response_hash[:12]}…] {p.raw_text[:200]}" for p in parts)
 
 
 def _valid_payload(draft: ExtractionDraftV1, parts: list[_SegmentPart]) -> dict:

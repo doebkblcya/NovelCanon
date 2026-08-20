@@ -85,9 +85,7 @@ def upgrade() -> None:
         ),
     )
     op.create_index("ix_evidence_errors_run", "evidence_errors", ["run_id"])
-    op.create_index(
-        "ix_evidence_errors_chapter", "evidence_errors", ["book_id", "chapter_id"]
-    )
+    op.create_index("ix_evidence_errors_chapter", "evidence_errors", ["book_id", "chapter_id"])
 
 
 def downgrade() -> None:

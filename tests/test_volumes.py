@@ -102,9 +102,7 @@ def test_grouping_rebuild_on_chapter_change(tmp_path: Path, migrated_db: Engine)
     # 旧卷摘要被标 stale
     with migrated_db.connect() as conn:
         status = conn.execute(
-            text(
-                "SELECT status FROM summary_artifacts WHERE summary_id = 'sum_old'"
-            )
+            text("SELECT status FROM summary_artifacts WHERE summary_id = 'sum_old'")
         ).scalar()
     assert status == "stale"
 

@@ -39,14 +39,11 @@ class EvidenceAggregator:
             (
                 e
                 for e in evidences
-                if e.stance == EvidenceStance.SUPPORTS
-                and e.evidence_type == EvidenceType.DIRECT
+                if e.stance == EvidenceStance.SUPPORTS and e.evidence_type == EvidenceType.DIRECT
             ),
             next(
                 (e for e in evidences if e.stance == EvidenceStance.SUPPORTS),
                 None,
             ),
         )
-        return AggregatedResult(
-            claim_status=status, evidences=evidences, primary=primary
-        )
+        return AggregatedResult(claim_status=status, evidences=evidences, primary=primary)

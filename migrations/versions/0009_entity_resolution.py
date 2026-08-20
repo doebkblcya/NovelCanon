@@ -56,12 +56,8 @@ def upgrade() -> None:
         ),
         sa.Column("created_at", sa.Text, nullable=False),
     )
-    op.create_index(
-        "ix_entity_resolutions_canonical", "entity_resolutions", ["canonical_id"]
-    )
-    op.create_index(
-        "ix_entity_resolutions_run", "entity_resolutions", ["run_id"]
-    )
+    op.create_index("ix_entity_resolutions_canonical", "entity_resolutions", ["canonical_id"])
+    op.create_index("ix_entity_resolutions_run", "entity_resolutions", ["run_id"])
 
     op.create_table(
         "unresolved_mentions",
@@ -84,13 +80,9 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("created_at", sa.Text, nullable=False),
-        sa.UniqueConstraint(
-            "surface_name", "chapter_id", name="uq_unresolved_mention"
-        ),
+        sa.UniqueConstraint("surface_name", "chapter_id", name="uq_unresolved_mention"),
     )
-    op.create_index(
-        "ix_unresolved_run", "unresolved_mentions", ["run_id"]
-    )
+    op.create_index("ix_unresolved_run", "unresolved_mentions", ["run_id"])
 
 
 def downgrade() -> None:

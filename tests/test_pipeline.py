@@ -419,9 +419,7 @@ def test_ledger_sums_provider_internal_and_outer_retries(
         )
 
     async def main() -> None:
-        run_id, summary, issues = await _full_run(
-            migrated_db, tasks, process, timeout_seconds=1.0
-        )
+        run_id, summary, issues = await _full_run(migrated_db, tasks, process, timeout_seconds=1.0)
         assert issues is None and summary.completed == 1
         led = TokenLedger(migrated_db).summary(run_id)
         # 总重试 = 外层 1 次 + provider 内部 2 次 = 3（不得覆盖为 1）
@@ -455,9 +453,7 @@ def test_ledger_records_structured_failure_usage(migrated_db: Engine) -> None:
         )
 
     async def main() -> None:
-        run_id, summary, issues = await _full_run(
-            migrated_db, tasks, process, timeout_seconds=1.0
-        )
+        run_id, summary, issues = await _full_run(migrated_db, tasks, process, timeout_seconds=1.0)
         assert issues is not None and summary.failed == 1
         led = TokenLedger(migrated_db).summary(run_id)
         assert led["input_tokens"] == 50, f"结构化失败的调用必须入账：{led}"

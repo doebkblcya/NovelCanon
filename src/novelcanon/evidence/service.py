@@ -98,9 +98,7 @@ class EvidenceService:
         for row in drafts:
             draft = ExtractionDraftV1.model_validate(json.loads(row["draft_json"]))
             chapter_text = self._repo.chapter_text_for(book_id, draft.chapter_id)
-            stats = self.align_chapter(
-                run_id, book_id, draft, chapter_text, row["draft_id"]
-            )
+            stats = self.align_chapter(run_id, book_id, draft, chapter_text, row["draft_id"])
             total.chapters += 1
             total.claims += stats.claims
             total.evidence += stats.evidence
@@ -126,16 +124,12 @@ class EvidenceService:
         """
         stats = ChapterAlignStats(chapter_id=draft.chapter_id)
         try:
-            refs = RefMapper(draft.chapter_id, chapter_text).map(
-                draft.ref_source_segments
-            )
+            refs = RefMapper(draft.chapter_id, chapter_text).map(draft.ref_source_segments)
         except RefMappingError as exc:
             self._record_error(
                 run_id, book_id, draft.chapter_id, draft_id, "", exc.error_code, exc.message
             )
-            stats.errors.append(
-                self._error_dict(draft.chapter_id, "", exc.error_code, exc.message)
-            )
+            stats.errors.append(self._error_dict(draft.chapter_id, "", exc.error_code, exc.message))
             return stats
 
         mention_surface = {m.mention_id: m.surface_name for m in draft.mentions}
@@ -152,9 +146,7 @@ class EvidenceService:
             evidences = self._align_claim(
                 draft, claim, refs, mention_surface, run_id, book_id, draft_id, stats
             )
-            aligned.append(
-                (_AdaptedClaim(claim, draft, evidences, ns, local_events), evidences)
-            )
+            aligned.append((_AdaptedClaim(claim, draft, evidences, ns, local_events), evidences))
 
         # 只有找到证据的 claim 才 materialize（找不到原文的不落库，
         # 保持 unverified 语义 + 避免无实体引用写库失败，07 退出标准）
@@ -164,11 +156,14 @@ class EvidenceService:
                 self._engine,
                 run_id=run_id,
                 book_id=book_id,
-                draft=cast(GoldenDraftLike, _AlignedDraft(  # 结构匹配（Protocol）
-                    draft,
-                    [c for c, _ in with_evidence],
-                    ns,
-                )),
+                draft=cast(
+                    GoldenDraftLike,
+                    _AlignedDraft(  # 结构匹配（Protocol）
+                        draft,
+                        [c for c, _ in with_evidence],
+                        ns,
+                    ),
+                ),
                 canonical_map={ns(m_id): ns(m_id) for m_id in mention_surface},
                 chapter_text=chapter_text,
                 repo=self._repo,
@@ -208,8 +203,13 @@ class EvidenceService:
         if seg_id not in refs:
             message = f"claim {claim.provisional_claim_id} 引用不存在的段 {seg_id}"
             self._record_error(
-                run_id, book_id, draft.chapter_id, draft_id,
-                claim.provisional_claim_id, "ref_missing", message,
+                run_id,
+                book_id,
+                draft.chapter_id,
+                draft_id,
+                claim.provisional_claim_id,
+                "ref_missing",
+                message,
             )
             stats.errors.append(
                 self._error_dict(
@@ -227,8 +227,13 @@ class EvidenceService:
         if not anchors:
             message = f"claim {claim.provisional_claim_id} 无可用锚文本"
             self._record_error(
-                run_id, book_id, draft.chapter_id, draft_id,
-                claim.provisional_claim_id, "no_span_found", message,
+                run_id,
+                book_id,
+                draft.chapter_id,
+                draft_id,
+                claim.provisional_claim_id,
+                "no_span_found",
+                message,
             )
             stats.errors.append(
                 self._error_dict(
@@ -237,9 +242,7 @@ class EvidenceService:
             )
             return []
 
-        candidates = self._candidates.generate(
-            draft.chapter_id, seg.char_start, seg.text, anchors
-        )
+        candidates = self._candidates.generate(draft.chapter_id, seg.char_start, seg.text, anchors)
         for candidate in candidates:
             verification = self._literal.verify(candidate)
             if verification is not None:
@@ -250,8 +253,13 @@ class EvidenceService:
                 return [self._to_aligned(candidate, verification)]
         message = f"claim {claim.provisional_claim_id} 在段 {seg_id} 内无匹配候选"
         self._record_error(
-            run_id, book_id, draft.chapter_id, draft_id,
-            claim.provisional_claim_id, "no_span_found", message,
+            run_id,
+            book_id,
+            draft.chapter_id,
+            draft_id,
+            claim.provisional_claim_id,
+            "no_span_found",
+            message,
         )
         stats.errors.append(
             self._error_dict(draft.chapter_id, claim.provisional_claim_id, "no_span_found", message)
@@ -259,9 +267,7 @@ class EvidenceService:
         return []
 
     @staticmethod
-    def _to_aligned(
-        candidate: SpanCandidate, verification: Verification
-    ) -> AlignedEvidence:
+    def _to_aligned(candidate: SpanCandidate, verification: Verification) -> AlignedEvidence:
         return AlignedEvidence(
             chapter_id=candidate.chapter_id,
             char_start=candidate.char_start,
@@ -286,15 +292,18 @@ class EvidenceService:
         message: str,
     ) -> None:
         stage = "ref_mapping" if error_code.startswith("ref_") else "span_candidate"
-        error_id = "ev_err_" + stable_config_hash(
-            {
-                "run": run_id,
-                "chapter": chapter_id,
-                "claim": claim_id,
-                "stage": stage,
-                "code": error_code,
-            }
-        )[:16]
+        error_id = (
+            "ev_err_"
+            + stable_config_hash(
+                {
+                    "run": run_id,
+                    "chapter": chapter_id,
+                    "claim": claim_id,
+                    "stage": stage,
+                    "code": error_code,
+                }
+            )[:16]
+        )
         self._repo.write_evidence_error(
             error_id=error_id,
             run_id=run_id,
@@ -307,9 +316,7 @@ class EvidenceService:
         )
 
     @staticmethod
-    def _error_dict(
-        chapter_id: str, claim_id: str, error_code: str, message: str
-    ) -> dict:
+    def _error_dict(chapter_id: str, claim_id: str, error_code: str, message: str) -> dict:
         return {
             "chapter_id": chapter_id,
             "claim_id": claim_id,
@@ -344,9 +351,7 @@ class _AlignedDraft:
 
     @property
     def mentions(self) -> list[tuple[str, str]]:
-        return [
-            (self._ns(m.mention_id), m.surface_name) for m in self._draft.mentions
-        ]
+        return [(self._ns(m.mention_id), m.surface_name) for m in self._draft.mentions]
 
     @property
     def claims(self) -> list[_AdaptedClaim]:

@@ -57,9 +57,7 @@ class ResolutionService:
         # 预置已知 alias（跨 run 稳定）：只 seed 已确认的历史 canonical
         # alias，排除本轮 materialize 写入的临时 mention alias（P0：
         # 否则同名实体直接走 seed-alias 合并，绕过隔章歧义判断）。
-        self._resolver.seed(
-            self._known_aliases(book_id, exclude_run_id=run_id)
-        )
+        self._resolver.seed(self._known_aliases(book_id, exclude_run_id=run_id))
         plan = self._resolver.resolve(mentions, book_id=book_id)
         self._apply_plan(run_id, book_id, plan, stats)
         return stats
@@ -86,9 +84,7 @@ class ResolutionService:
             )
         return [dict(r) for r in rows]
 
-    def _known_aliases(
-        self, book_id: str, *, exclude_run_id: str | None = None
-    ) -> dict[str, str]:
+    def _known_aliases(self, book_id: str, *, exclude_run_id: str | None = None) -> dict[str, str]:
         """库里已有 alias：surface → canonical（跨 run 复用，08 §2）。
 
         只 seed「已确认的历史 canonical alias」（验收 P0，两轮收紧）：
@@ -145,9 +141,7 @@ class ResolutionService:
         """
         with self._engine.connect() as conn:
             row = conn.execute(
-                text(
-                    "SELECT canonical_id FROM entity_resolutions WHERE mention_id = :m"
-                ),
+                text("SELECT canonical_id FROM entity_resolutions WHERE mention_id = :m"),
                 {"m": canonical_id},
             ).fetchone()
             if row is not None:
@@ -196,7 +190,10 @@ class ResolutionService:
             self._record_merge_if_needed(run_id, item, stats)
             # 3) resolution 投影（幂等：mention_id 主键）
             self._write_resolution(
-                run_id, item.mention_id, item.canonical_id, plan.resolver_version,
+                run_id,
+                item.mention_id,
+                item.canonical_id,
+                plan.resolver_version,
                 item.reason,
             )
             # 4) entity_mentions.canonical_id 更新（投影重写）
@@ -234,9 +231,7 @@ class ResolutionService:
     def _update_mention_canonical(self, mention_id: str, canonical_id: str) -> None:
         with self._engine.begin() as conn:
             conn.execute(
-                text(
-                    "UPDATE entity_mentions SET canonical_id = :c WHERE mention_id = :m"
-                ),
+                text("UPDATE entity_mentions SET canonical_id = :c WHERE mention_id = :m"),
                 {"c": canonical_id, "m": mention_id},
             )
 
@@ -276,9 +271,7 @@ class ResolutionService:
         )
         stats.merges += 1
 
-    def _write_unresolved(
-        self, run_id: str, book_id: str, item: ResolvedMention
-    ) -> None:
+    def _write_unresolved(self, run_id: str, book_id: str, item: ResolvedMention) -> None:
         # 找到 mention 的章内位置（char_start/char_end/context）
         with self._engine.connect() as conn:
             row = conn.execute(
@@ -290,9 +283,9 @@ class ResolutionService:
             ).fetchone()
         if row is None:
             return
-        unresolved_id = "unres_" + stable_config_hash(
-            {"run": run_id, "mention": item.mention_id}
-        )[:16]
+        unresolved_id = (
+            "unres_" + stable_config_hash({"run": run_id, "mention": item.mention_id})[:16]
+        )
         with self._engine.begin() as conn:
             conn.execute(
                 text(

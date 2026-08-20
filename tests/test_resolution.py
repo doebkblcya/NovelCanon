@@ -97,15 +97,9 @@ def _seed_mentions(migrated_db: Engine, book_id: str, ids, texts) -> str:
 def _counts(engine: Engine) -> dict[str, int]:
     with engine.connect() as conn:
         return {
-            "resolutions": conn.execute(
-                text("SELECT count(*) FROM entity_resolutions")
-            ).scalar(),
-            "unresolved": conn.execute(
-                text("SELECT count(*) FROM unresolved_mentions")
-            ).scalar(),
-            "merges": conn.execute(
-                text("SELECT count(*) FROM entity_merge_audit")
-            ).scalar(),
+            "resolutions": conn.execute(text("SELECT count(*) FROM entity_resolutions")).scalar(),
+            "unresolved": conn.execute(text("SELECT count(*) FROM unresolved_mentions")).scalar(),
+            "merges": conn.execute(text("SELECT count(*) FROM entity_merge_audit")).scalar(),
         }
 
 
@@ -201,12 +195,27 @@ def test_resolver_idempotent_stable() -> None:
     r1 = EntityResolver(book_id="book1")
     r2 = EntityResolver(book_id="book1")
     mentions = [
-        {"mention_id": "a", "surface_name": "萧炎", "chapter_id": "ch1",
-         "ordinal": 0, "char_start": 10},
-        {"mention_id": "b", "surface_name": "萧薰儿", "chapter_id": "ch1",
-         "ordinal": 0, "char_start": 20},
-        {"mention_id": "c", "surface_name": "萧炎", "chapter_id": "ch2",
-         "ordinal": 1, "char_start": 5},
+        {
+            "mention_id": "a",
+            "surface_name": "萧炎",
+            "chapter_id": "ch1",
+            "ordinal": 0,
+            "char_start": 10,
+        },
+        {
+            "mention_id": "b",
+            "surface_name": "萧薰儿",
+            "chapter_id": "ch1",
+            "ordinal": 0,
+            "char_start": 20,
+        },
+        {
+            "mention_id": "c",
+            "surface_name": "萧炎",
+            "chapter_id": "ch2",
+            "ordinal": 1,
+            "char_start": 5,
+        },
     ]
     p1 = r1.resolve(mentions)
     p2 = r2.resolve(mentions)
@@ -221,8 +230,13 @@ def test_resolver_idempotent_stable() -> None:
 def test_resolver_canonical_id_book_scoped() -> None:
     """P0：不同书中的同名人物不得共享 canonical_id（book 进入身份）。"""
     mentions = [
-        {"mention_id": "a", "surface_name": "林风", "chapter_id": "ch1",
-         "ordinal": 0, "char_start": 0},
+        {
+            "mention_id": "a",
+            "surface_name": "林风",
+            "chapter_id": "ch1",
+            "ordinal": 0,
+            "char_start": 0,
+        },
     ]
     r1 = EntityResolver(book_id="book_a")
     r2 = EntityResolver(book_id="book_b")
@@ -239,15 +253,25 @@ def test_resolver_canonical_id_name_independent() -> None:
     r2 = EntityResolver(book_id="book1")
     p1 = r1.resolve(
         [
-            {"mention_id": "a", "surface_name": "小石", "chapter_id": "ch1",
-             "ordinal": 0, "char_start": 3},
+            {
+                "mention_id": "a",
+                "surface_name": "小石",
+                "chapter_id": "ch1",
+                "ordinal": 0,
+                "char_start": 3,
+            },
         ]
     )
     p2 = r2.resolve(
         [
             # 身份揭示后改用正式名，但锚点（位置）相同 → 同一 canonical
-            {"mention_id": "a", "surface_name": "林风", "chapter_id": "ch1",
-             "ordinal": 0, "char_start": 3},
+            {
+                "mention_id": "a",
+                "surface_name": "林风",
+                "chapter_id": "ch1",
+                "ordinal": 0,
+                "char_start": 3,
+            },
         ]
     )
     assert p1.resolved[0].canonical_id == p2.resolved[0].canonical_id, (
@@ -260,16 +284,24 @@ def test_resolver_same_chapter_repeated_mentions_merge() -> None:
     r = EntityResolver(book_id="book1")
     plan = r.resolve(
         [
-            {"mention_id": "a", "surface_name": "王明", "chapter_id": "ch1",
-             "ordinal": 0, "char_start": 10},
-            {"mention_id": "b", "surface_name": "王明", "chapter_id": "ch1",
-             "ordinal": 0, "char_start": 40},
+            {
+                "mention_id": "a",
+                "surface_name": "王明",
+                "chapter_id": "ch1",
+                "ordinal": 0,
+                "char_start": 10,
+            },
+            {
+                "mention_id": "b",
+                "surface_name": "王明",
+                "chapter_id": "ch1",
+                "ordinal": 0,
+                "char_start": 40,
+            },
         ]
     )
     canonicals = {m.canonical_id for m in plan.resolved}
-    assert len(canonicals) == 1, (
-        f"同章两次提及 = 同一人物，必须合并：{canonicals}"
-    )
+    assert len(canonicals) == 1, f"同章两次提及 = 同一人物，必须合并：{canonicals}"
     assert len(plan.resolved) == 2 and plan.unresolved == []
 
 
@@ -279,15 +311,23 @@ def test_resolver_cross_chapter_isolated_same_name_unresolved() -> None:
     r = EntityResolver(book_id="book1")
     plan = r.resolve(
         [
-            {"mention_id": "a", "surface_name": "林风", "chapter_id": "ch3",
-             "ordinal": 2, "char_start": 5},
-            {"mention_id": "b", "surface_name": "林风", "chapter_id": "ch5",
-             "ordinal": 4, "char_start": 8},
+            {
+                "mention_id": "a",
+                "surface_name": "林风",
+                "chapter_id": "ch3",
+                "ordinal": 2,
+                "char_start": 5,
+            },
+            {
+                "mention_id": "b",
+                "surface_name": "林风",
+                "chapter_id": "ch5",
+                "ordinal": 4,
+                "char_start": 8,
+            },
         ]
     )
-    assert plan.resolved == [], (
-        f"跨章孤立同名不得合并：{plan.resolved}"
-    )
+    assert plan.resolved == [], f"跨章孤立同名不得合并：{plan.resolved}"
     assert len(plan.unresolved) == 2
     assert all(u.reason == "ambiguous-name-no-continuity" for u in plan.unresolved)
     assert all(u.canonical_id is None for u in plan.unresolved)
@@ -299,12 +339,27 @@ def test_resolver_cross_chapter_continuity_merges() -> None:
     # 章节序连续（ch1→ch2）且 ch1 内出现两次 → 合并
     plan = r.resolve(
         [
-            {"mention_id": "a", "surface_name": "萧炎", "chapter_id": "ch1",
-             "ordinal": 0, "char_start": 10},
-            {"mention_id": "b", "surface_name": "萧炎", "chapter_id": "ch1",
-             "ordinal": 0, "char_start": 60},
-            {"mention_id": "c", "surface_name": "萧炎", "chapter_id": "ch2",
-             "ordinal": 1, "char_start": 5},
+            {
+                "mention_id": "a",
+                "surface_name": "萧炎",
+                "chapter_id": "ch1",
+                "ordinal": 0,
+                "char_start": 10,
+            },
+            {
+                "mention_id": "b",
+                "surface_name": "萧炎",
+                "chapter_id": "ch1",
+                "ordinal": 0,
+                "char_start": 60,
+            },
+            {
+                "mention_id": "c",
+                "surface_name": "萧炎",
+                "chapter_id": "ch2",
+                "ordinal": 1,
+                "char_start": 5,
+            },
         ]
     )
     canonicals = {m.canonical_id for m in plan.resolved}
@@ -319,15 +374,27 @@ def test_resolver_canonical_anchor_from_position_not_mention_id() -> None:
     r2 = EntityResolver(book_id="book1")
     p1 = r1.resolve(
         [
-            {"mention_id": "m_llm_a", "surface_name": "萧炎", "chapter_id": "ch1",
-             "ordinal": 0, "char_start": 12, "char_end": 14},
+            {
+                "mention_id": "m_llm_a",
+                "surface_name": "萧炎",
+                "chapter_id": "ch1",
+                "ordinal": 0,
+                "char_start": 12,
+                "char_end": 14,
+            },
         ],
         book_id="book1",
     )
     p2 = r2.resolve(
         [
-            {"mention_id": "m_llm_b", "surface_name": "萧炎", "chapter_id": "ch1",
-             "ordinal": 0, "char_start": 12, "char_end": 14},
+            {
+                "mention_id": "m_llm_b",
+                "surface_name": "萧炎",
+                "chapter_id": "ch1",
+                "ordinal": 0,
+                "char_start": 12,
+                "char_end": 14,
+            },
         ],
         book_id="book1",
     )
@@ -401,9 +468,7 @@ def test_materialize_then_resolve_isolated_same_name_not_merged(
     stats = ResolutionService(migrated_db).resolve_run(run_id, book_id)
     with migrated_db.connect() as conn:
         unres = conn.execute(
-            text(
-                "SELECT surface_name, reason FROM unresolved_mentions WHERE run_id = :r"
-            ),
+            text("SELECT surface_name, reason FROM unresolved_mentions WHERE run_id = :r"),
             {"r": run_id},
         ).fetchall()
     wm = [u for u in unres if u[0] == "王明"]
@@ -423,9 +488,7 @@ def test_materialize_then_resolve_isolated_same_name_not_merged(
     assert mapped_wm == 0, "王明 不得被映射为 canonical（v3 歧义判断必须生效）"
 
 
-def test_unresolved_round_one_not_seeded_into_round_two(
-    tmp_path, migrated_db: Engine
-) -> None:
+def test_unresolved_round_one_not_seeded_into_round_two(tmp_path, migrated_db: Engine) -> None:
     """验收 P0：首轮 unresolved 的 mention alias 不得成为次轮 seed。
 
     首轮 unresolved 的 alias 没有 entity_resolutions（_resolve_canonical
@@ -496,32 +559,24 @@ def test_unresolved_round_one_not_seeded_into_round_two(
     with migrated_db.connect() as conn:
         reasons = conn.execute(
             text(
-                "SELECT reason, count(*) FROM entity_resolutions"
-                " WHERE run_id = :r GROUP BY reason"
+                "SELECT reason, count(*) FROM entity_resolutions WHERE run_id = :r GROUP BY reason"
             ),
             {"r": run2},
         ).fetchall()
     assert stats2.unresolved == 2, (
         f"次轮王明必须仍 unresolved（run1 未消歧 alias 不得 seed）：{reasons}"
     )
-    assert "seed-alias" not in dict(reasons), (
-        f"次轮不得出现 seed-alias 合并：{reasons}"
-    )
+    assert "seed-alias" not in dict(reasons), f"次轮不得出现 seed-alias 合并：{reasons}"
     # unresolved_mentions 是 (surface, chapter) 级别的正式产物：首轮已
     # 登记（唯一约束），次轮同位置 mention 仍未被映射——book 级记录仍在
     with migrated_db.connect() as conn:
         wm_unres = conn.execute(
-            text(
-                "SELECT count(*) FROM unresolved_mentions"
-                " WHERE surface_name = '王明'"
-            )
+            text("SELECT count(*) FROM unresolved_mentions WHERE surface_name = '王明'")
         ).scalar()
     assert wm_unres == 2, "首轮 unresolved → 次轮仍 unresolved（P0 回归）"
 
 
-def test_display_name_real_flow_materialize_resolve_activate(
-    tmp_path, migrated_db: Engine
-) -> None:
+def test_display_name_real_flow_materialize_resolve_activate(tmp_path, migrated_db: Engine) -> None:
     """验收 P0：真实 materialize→resolve→activate 链路中 display_name
     必须返回非空展示名。
 
@@ -574,9 +629,7 @@ def test_display_name_real_flow_materialize_resolve_activate(
 
     with migrated_db.connect() as conn:
         canonical = conn.execute(
-            text(
-                "SELECT canonical_id FROM entity_resolutions WHERE mention_id = 'm_wm'"
-            )
+            text("SELECT canonical_id FROM entity_resolutions WHERE mention_id = 'm_wm'")
         ).fetchone()[0]
     q = QueryService(migrated_db, book_id)
     assert q.display_name(canonical) == "王明", (
@@ -600,9 +653,7 @@ def test_materialize_position_anchor_deterministic() -> None:
     assert _locate_surface(text, "药老") is None
 
 
-def test_same_service_two_books_seed_not_residue(
-    tmp_path, migrated_db: Engine
-) -> None:
+def test_same_service_two_books_seed_not_residue(tmp_path, migrated_db: Engine) -> None:
     """验收 P0：复用同一 ResolutionService 处理书 A 再处理书 B，书 B 的
     同名实体不得命中书 A 的 canonical——seed 必须整份替换而非增量追加
     （书 A 已激活的 alias 不得跨书残留）。"""
@@ -664,23 +715,15 @@ def test_same_service_two_books_seed_not_residue(
 
     with migrated_db.connect() as conn:
         ca = conn.execute(
-            text(
-                "SELECT canonical_id FROM entity_resolutions WHERE run_id = :r"
-            ),
+            text("SELECT canonical_id FROM entity_resolutions WHERE run_id = :r"),
             {"r": run_a},
         ).fetchone()[0]
         cb = conn.execute(
-            text(
-                "SELECT canonical_id, reason FROM entity_resolutions WHERE run_id = :r"
-            ),
+            text("SELECT canonical_id, reason FROM entity_resolutions WHERE run_id = :r"),
             {"r": run_b},
         ).fetchone()
-    assert ca != cb[0], (
-        f"书 B 的萧炎不得命中书 A 的 canonical（seed 跨书残留）：{ca} == {cb[0]}"
-    )
-    assert cb[1] == "exact-surface-match", (
-        f"书 B 的萧炎必须走自身消歧而非 seed-alias：{cb}"
-    )
+    assert ca != cb[0], f"书 B 的萧炎不得命中书 A 的 canonical（seed 跨书残留）：{ca} == {cb[0]}"
+    assert cb[1] == "exact-surface-match", f"书 B 的萧炎必须走自身消歧而非 seed-alias：{cb}"
 
 
 # ── service 落库 + 投影 ────────────────────────────────────────
@@ -718,9 +761,7 @@ def test_resolution_service_end_to_end(tmp_path, migrated_db: Engine) -> None:
             text("SELECT count(*) FROM unresolved_mentions WHERE run_id = :r"),
             {"r": run_id},
         ).scalar()
-    assert mapped + unresolved == stats.mentions, (
-        "每个 mention 必须 mapped 或 unresolved"
-    )
+    assert mapped + unresolved == stats.mentions, "每个 mention 必须 mapped 或 unresolved"
 
 
 def test_merge_audit_traceable(tmp_path, migrated_db: Engine) -> None:
@@ -755,9 +796,7 @@ def test_cutoff_safe_display_name(tmp_path, migrated_db: Engine) -> None:
         if m["surface_name"] == "小石":
             with migrated_db.connect() as conn:
                 row = conn.execute(
-                    text(
-                        "SELECT canonical_id FROM entity_resolutions WHERE mention_id = :m"
-                    ),
+                    text("SELECT canonical_id FROM entity_resolutions WHERE mention_id = :m"),
                     {"m": m["mention_id"]},
                 ).fetchone()
             canonical = row[0] if row else None
@@ -808,9 +847,7 @@ def test_cutoff_safe_display_name(tmp_path, migrated_db: Engine) -> None:
 def _mentions_of(migrated_db: Engine) -> list[dict]:
     with migrated_db.connect() as conn:
         rows = (
-            conn.execute(
-                text("SELECT mention_id, surface_name FROM entity_mentions")
-            )
+            conn.execute(text("SELECT mention_id, surface_name FROM entity_mentions"))
             .mappings()
             .fetchall()
         )
@@ -830,9 +867,7 @@ def test_query_scope_expands_mentions(tmp_path, migrated_db: Engine) -> None:
     xiaoshi = next(m for m in mentions if m["surface_name"] == "小石")
     with migrated_db.connect() as conn:
         canonical = conn.execute(
-            text(
-                "SELECT canonical_id FROM entity_resolutions WHERE mention_id = :m"
-            ),
+            text("SELECT canonical_id FROM entity_resolutions WHERE mention_id = :m"),
             {"m": xiaoshi["mention_id"]},
         ).fetchone()[0]
     scope = q.entity_scope(canonical)
@@ -840,9 +875,7 @@ def test_query_scope_expands_mentions(tmp_path, migrated_db: Engine) -> None:
     # 该 canonical 名下所有 mention 都在作用域
     with migrated_db.connect() as conn:
         rows = conn.execute(
-            text(
-                "SELECT mention_id FROM entity_resolutions WHERE canonical_id = :c"
-            ),
+            text("SELECT mention_id FROM entity_resolutions WHERE canonical_id = :c"),
             {"c": canonical},
         ).fetchall()
     assert {r[0] for r in rows} <= set(scope)

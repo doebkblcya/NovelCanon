@@ -52,9 +52,7 @@ def schema_for_draft() -> str:
     """ExtractionDraftV1 的 JSON Schema 文本（排序稳定，供 prompt 与版本化）。"""
     from novelcanon.schemas.draft import ExtractionDraftV1
 
-    return json.dumps(
-        ExtractionDraftV1.model_json_schema(), sort_keys=True, ensure_ascii=False
-    )
+    return json.dumps(ExtractionDraftV1.model_json_schema(), sort_keys=True, ensure_ascii=False)
 
 
 def build_map_prompt(
@@ -85,8 +83,7 @@ def build_map_prompt(
         if chapter_ordinal is not None:
             meta.append(f"chapter_ordinal：{chapter_ordinal}")
         parts.append(
-            "[元数据]（输出 Draft 时必须原样使用下列值，禁止自行填写或留空）\n"
-            + "\n".join(meta)
+            "[元数据]（输出 Draft 时必须原样使用下列值，禁止自行填写或留空）\n" + "\n".join(meta)
         )
     if book_title or chapter_title:
         parts.append(

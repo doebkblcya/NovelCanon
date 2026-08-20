@@ -81,9 +81,7 @@ def test_deterministic_answer_grounds_facts(tmp_path: Path, migrated_db: Engine)
     assert result.query_profile == "default"
 
 
-def test_llm_synthesis_prompt_isolated_from_raw_text(
-    tmp_path: Path, migrated_db: Engine
-) -> None:
+def test_llm_synthesis_prompt_isolated_from_raw_text(tmp_path: Path, migrated_db: Engine) -> None:
     """prompt 只含过滤后上下文：结构上无法访问过滤前全文（10 §4）。"""
     fake = FakeGenerationClient(
         {

@@ -83,9 +83,7 @@ def extract_anchors(
     anchors: list[AnchorTerm] = []
     seen: set[str] = set()
 
-    def add(
-        text: str, source: str, hard: bool = True, group: str | None = None
-    ) -> None:
+    def add(text: str, source: str, hard: bool = True, group: str | None = None) -> None:
         text = (text or "").strip()
         if text and text not in seen:
             seen.add(text)
@@ -135,9 +133,7 @@ def extract_anchors(
     # hard_total=0 时 hard_rate 恒为 1.0，属空洞支持）。
     if ctype == "org":
         action = str(payload.get("action") or "join").strip().lower()
-        verbs = _ORG_ACTION_VERBS.get(action) or (
-            [action] if len(action) >= 2 else []
-        )
+        verbs = _ORG_ACTION_VERBS.get(action) or ([action] if len(action) >= 2 else [])
         for verb in verbs:
             add(verb, f"org_action:{action}", hard=True, group="org_action")
 
@@ -169,9 +165,7 @@ def _sentence_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _find_with_tolerance(
-    text: str, needle: str
-) -> list[tuple[int, int]]:
+def _find_with_tolerance(text: str, needle: str) -> list[tuple[int, int]]:
     """在 text 中查找 needle，容忍标点/空白差异（§2）。
 
     规范化（去标点/空白）后在规范化文本上匹配，命中位置映射回原文
@@ -234,9 +228,7 @@ class SpanCandidateGenerator:
         candidates: list[SpanCandidate] = []
         sentences = _sentence_spans(segment_text) or [(0, len(segment_text))]
 
-        def make_candidate(
-            covered: set[int], lo: int, hi: int
-        ) -> SpanCandidate | None:
+        def make_candidate(covered: set[int], lo: int, hi: int) -> SpanCandidate | None:
             if not covered:
                 return None
             # 硬要求 = 未分组硬锚（每条一项）+ 分组（每组一项，组内任一命中

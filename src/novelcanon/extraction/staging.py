@@ -30,15 +30,18 @@ def draft_id(
     schema_version: str,
 ) -> str:
     """确定性 draft_id：run 不进 ID（同配置重跑得到相同 ID）。"""
-    return "draft_" + stable_config_hash(
-        {
-            "book_id": book_id,
-            "chapter_id": chapter_id,
-            "content_hash": content_hash,
-            "prompt_version": prompt_version,
-            "schema_version": schema_version,
-        }
-    )[:16]
+    return (
+        "draft_"
+        + stable_config_hash(
+            {
+                "book_id": book_id,
+                "chapter_id": chapter_id,
+                "content_hash": content_hash,
+                "prompt_version": prompt_version,
+                "schema_version": schema_version,
+            }
+        )[:16]
+    )
 
 
 class MapStaging:

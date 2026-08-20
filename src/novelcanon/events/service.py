@@ -141,10 +141,7 @@ class EventLinkService:
     def _evidence_stances(self, claim_version_id_value: str) -> list[str]:
         with self._engine.connect() as conn:
             rows = conn.execute(
-                text(
-                    "SELECT evidence_stance FROM claim_evidence"
-                    " WHERE claim_version_id = :v"
-                ),
+                text("SELECT evidence_stance FROM claim_evidence WHERE claim_version_id = :v"),
                 {"v": claim_version_id_value},
             ).fetchall()
         return [r[0] for r in rows]
@@ -158,9 +155,7 @@ class EventLinkService:
         with self._engine.connect() as conn:
             for p in participants:
                 row = conn.execute(
-                    text(
-                        "SELECT canonical_id FROM entity_resolutions WHERE mention_id = :m"
-                    ),
+                    text("SELECT canonical_id FROM entity_resolutions WHERE mention_id = :m"),
                     {"m": p},
                 ).fetchone()
                 canonical = row[0] if row is not None else p  # 已是 canonical 时保留
@@ -171,10 +166,7 @@ class EventLinkService:
     def _participants_for(self, event_claim_version_id: str) -> list[str]:
         with self._engine.connect() as conn:
             rows = conn.execute(
-                text(
-                    "SELECT entity_id FROM event_participants"
-                    " WHERE event_claim_version_id = :v"
-                ),
+                text("SELECT entity_id FROM event_participants WHERE event_claim_version_id = :v"),
                 {"v": event_claim_version_id},
             ).fetchall()
         return [r[0] for r in rows]
@@ -197,16 +189,14 @@ class EventLinkService:
 
     # ── 落库（幂等）────────────────────────────────────────────
 
-    def _write_link(
-        self, run_id: str, book_id: str, cand: LinkCandidate
-    ) -> ClaimStatus | None:
+    def _write_link(self, run_id: str, book_id: str, cand: LinkCandidate) -> ClaimStatus | None:
         """写一条 event_link（幂等：claim_version_id 确定性主键）。"""
         source = cand.source
         target = cand.target
         # observed ordinal = 原因端+结果端证据最大披露章节（09 §4）
         ordinals = source.evidence_ordinals + target.evidence_ordinals
-        observed_ordinal = max(ordinals) if ordinals else max(
-            source.observed_ordinal, target.observed_ordinal
+        observed_ordinal = (
+            max(ordinals) if ordinals else max(source.observed_ordinal, target.observed_ordinal)
         )
         # 边状态（P0 收紧）：规则层只生成 candidate——端点各自有证据
         # 不等于边有因果证据。LinkVerifier 检查目标章原文是否出现
@@ -295,9 +285,7 @@ class EventLinkService:
         target_text = self._repo.chapter_text_for(book_id, target.observed_chapter_id)
         if not target_text:
             return None
-        return self._verifier.verify(
-            target.observed_chapter_id, target_text, refs
-        )
+        return self._verifier.verify(target.observed_chapter_id, target_text, refs)
 
     def _source_refs(self, source: EventInfo) -> list[str]:
         """源事件的动作/摘要锚点（P0 收紧：**不含参与者**）。

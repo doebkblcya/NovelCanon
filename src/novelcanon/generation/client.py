@@ -58,9 +58,7 @@ def resolve_api_key(profile: GenerationProfile) -> str | None:
 
 def request_hash(prompt: str, *, model: str = "", profile_id: str = "") -> str:
     """可审计但不泄露密钥的请求 hash（不含 API key）。"""
-    return stable_config_hash(
-        {"prompt": prompt, "model": model, "profile_id": profile_id}
-    )
+    return stable_config_hash({"prompt": prompt, "model": model, "profile_id": profile_id})
 
 
 def response_hash(raw_text: str) -> str:
@@ -173,9 +171,7 @@ class GenerationClient:
         usage = self._usage_from(data, prompt, content)
         if failures:
             # dataclasses.replace 保留 provider/model/profile_id 等全部字段
-            usage = dataclasses.replace(
-                usage, retry_count=usage.retry_count + failures
-            )
+            usage = dataclasses.replace(usage, retry_count=usage.retry_count + failures)
         return GenerationResult(raw_text=content, usage=usage)
 
     def _usage_from(self, data: dict, prompt: str, content: str) -> Usage:
@@ -183,9 +179,7 @@ class GenerationClient:
         profile = self._profile
         if self._tokenizer is not None:
             input_tokens = int(raw.get("prompt_tokens") or self._tokenizer.count(prompt))
-            output_tokens = int(
-                raw.get("completion_tokens") or self._tokenizer.count(content)
-            )
+            output_tokens = int(raw.get("completion_tokens") or self._tokenizer.count(content))
         else:
             input_tokens = int(raw.get("prompt_tokens") or 0)
             output_tokens = int(raw.get("completion_tokens") or 0)
@@ -220,9 +214,7 @@ class FakeGenerationClient:
     async def complete(self, prompt: str) -> GenerationResult:
         self.calls.append(prompt)
         if isinstance(self._respond, Mapping):
-            raw = next(
-                (v for k, v in self._respond.items() if k in prompt), "{}"
-            )
+            raw = next((v for k, v in self._respond.items() if k in prompt), "{}")
         else:
             raw = self._respond(prompt)
         return GenerationResult(raw_text=raw, usage=self._usage)

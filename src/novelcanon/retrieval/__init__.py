@@ -1,6 +1,13 @@
 """检索（阶段 03/10）：raw chunk、FTS、向量、RRF 混合检索。"""
 
 from novelcanon.retrieval.chunker import ChunkConfig, ChunkDraft, chunk_text, chunking_version_for
+from novelcanon.retrieval.factory import (
+    UnknownEmbeddingProfileError,
+    create_backend,
+    register_backend,
+    register_configured_backends,
+    unregister_backend,
+)
 from novelcanon.retrieval.fts import (
     FTS_TOKENIZER_VERSION,
     insert_shadow,
@@ -36,6 +43,11 @@ from novelcanon.retrieval.vectorstore import (
 
 __all__ = [
     "BruteForceVectorStore",
+    "UnknownEmbeddingProfileError",
+    "create_backend",
+    "register_backend",
+    "register_configured_backends",
+    "unregister_backend",
     "ChunkConfig",
     "ChunkDraft",
     "DEFAULT_RRF_K",

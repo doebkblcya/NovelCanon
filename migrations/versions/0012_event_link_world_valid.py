@@ -43,9 +43,7 @@ def upgrade() -> None:
         "ALTER TABLE event_links ADD COLUMN world_valid_from INTEGER"
         " CHECK (world_valid_from IS NOT NULL OR world_valid_kind = 'unknown')"
     )
-    op.execute(
-        "ALTER TABLE event_links ADD COLUMN world_valid_to INTEGER"
-    )
+    op.execute("ALTER TABLE event_links ADD COLUMN world_valid_to INTEGER")
     op.execute(
         "ALTER TABLE event_links ADD COLUMN world_valid_confidence REAL"
         " CHECK (world_valid_confidence IS NULL OR"

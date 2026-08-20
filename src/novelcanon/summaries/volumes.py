@@ -81,8 +81,10 @@ class VolumeGrouper:
                 volumes=self._to_groups(current),
             )
 
-        if current and all(v["content_hash"] is None for v in current) and (
-            self._boundaries_match(current, boundaries)
+        if (
+            current
+            and all(v["content_hash"] is None for v in current)
+            and (self._boundaries_match(current, boundaries))
         ):
             # 旧版导入卷行缺 content_hash：边界匹配则补全，不重建版本
             self._backfill(current, boundaries, source, content_hash)
@@ -217,9 +219,7 @@ class VolumeGrouper:
                 return src
         return "source" if any(ch["volume_id"] for ch in chapters) else "default"
 
-    def _expected_boundaries(
-        self, chapters: list[dict], source: str
-    ) -> list[dict]:
+    def _expected_boundaries(self, chapters: list[dict], source: str) -> list[dict]:
         """期望分组边界：[{title, ordinal, start/end chapter_id, start/end ordinal}]。"""
         if source == "source":
             return self._source_boundaries(chapters)
@@ -227,10 +227,7 @@ class VolumeGrouper:
 
     def _source_boundaries(self, chapters: list[dict]) -> list[dict]:
         """按章节 volume_id 分组（保持 ordinal 序；同卷章节必须连续）。"""
-        existing = {
-            v["volume_id"]: v
-            for v in self._current_grouping()
-        }
+        existing = {v["volume_id"]: v for v in self._current_grouping()}
         groups: list[dict] = []
         current_vid: str | None = None
         for ch in chapters:
@@ -277,9 +274,7 @@ class VolumeGrouper:
                 g["end_ordinal"] = ch["ordinal"]
         return groups
 
-    def _content_hash(
-        self, chapters: list[dict], source: str, boundaries: list[dict]
-    ) -> str:
+    def _content_hash(self, chapters: list[dict], source: str, boundaries: list[dict]) -> str:
         """分组内容 hash：来源 + 边界 + 每章 content_hash（输入变化即变化）。"""
         return stable_config_hash(
             {
@@ -288,9 +283,7 @@ class VolumeGrouper:
                 "boundaries": [
                     [g["start_ordinal"], g["end_ordinal"], g["title"]] for g in boundaries
                 ],
-                "chapters": [
-                    (c["ordinal"], c["content_hash"] or "") for c in chapters
-                ],
+                "chapters": [(c["ordinal"], c["content_hash"] or "") for c in chapters],
             }
         )
 

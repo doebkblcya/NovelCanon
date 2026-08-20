@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
-        run: uv sync --extra vec --extra tokenizer --dev
+        run: uv sync --extra vec --extra tokenizer --extra api --dev
       - name: Lint (ruff)
         run: uv run ruff check .
       - name: Format check (ruff)
@@ -28,3 +28,19 @@ jobs:
         run: uv run mypy src/novelcanon
       - name: Test (pytest，含 SQLite/vec smoke)
         run: uv run pytest
+      - name: 持续回归（黄金集评测 + 备份恢复 + cutoff 泄露扫描）
+        run: |
+          uv run pytest tests/test_eval.py tests/test_backup.py -q
+          uv run python -c "
+            from novelcanon.ops.scan import scan_integrity
+            import tempfile, pathlib
+            from novelcanon.storage.engine import create_db_engine
+            from novelcanon.storage.migrations import migrate_to_head
+            with tempfile.TemporaryDirectory() as d:
+                db = pathlib.Path(d) / 'scan.db'
+                migrate_to_head(db)
+                eng = create_db_engine(db)
+                r = scan_integrity(eng)
+                assert r.ok, r.as_dict()
+                print('integrity-scan-ok', r.as_dict())
+          "

@@ -76,9 +76,7 @@ class DraftValidator:
         self._ordinal = chapter_ordinal
         self._chapter_text = chapter_text
 
-    def validate(
-        self, payload: dict[str, Any]
-    ) -> tuple[ExtractionDraftV1 | None, list[Issue]]:
+    def validate(self, payload: dict[str, Any]) -> tuple[ExtractionDraftV1 | None, list[Issue]]:
         issues: list[Issue] = []
 
         # 第 6 层（dict 级先行）：event_link 等越界 claim 在 Schema 校验前拒绝，
@@ -155,8 +153,7 @@ class DraftValidator:
                     issues.append(
                         Issue(
                             "id_ref",
-                            f"事件 {event.local_event_id} 引用不存在的 mention_id："
-                            f"{participant}",
+                            f"事件 {event.local_event_id} 引用不存在的 mention_id：{participant}",
                         )
                     )
         for cause in draft.local_causes:
@@ -204,9 +201,7 @@ class DraftValidator:
         issues: list[Issue] = []
         for key in ("canonical_id", "canonical_map", "final_evidence", "event_link"):
             if key in payload:
-                issues.append(
-                    Issue("disclosure", f"Draft 包含越界字段：{key}（Map 不得输出）")
-                )
+                issues.append(Issue("disclosure", f"Draft 包含越界字段：{key}（Map 不得输出）"))
         # claim 类型为 event_link 属于跨章事件链接，Map 不得输出
         for claim in payload.get("provisional_claims", []):
             if isinstance(claim, dict) and claim.get("claim_type") == "event_link":

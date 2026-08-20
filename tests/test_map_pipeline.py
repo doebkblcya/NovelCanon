@@ -154,9 +154,7 @@ async def _run_map(
 def _staging_counts(engine: Engine, run_id: str) -> dict[str, int]:
     with engine.connect() as conn:
         rows = conn.execute(
-            text(
-                "SELECT status, COUNT(*) FROM map_drafts WHERE run_id = :r GROUP BY status"
-            ),
+            text("SELECT status, COUNT(*) FROM map_drafts WHERE run_id = :r GROUP BY status"),
             {"r": run_id},
         ).fetchall()
     return {row[0]: row[1] for row in rows}
@@ -206,11 +204,7 @@ def test_map_pipeline_dev_samples_to_staging(tmp_path, migrated_db: Engine) -> N
     by_type = report["extraction"]["claims_by_type"]
     assert set(by_type) >= {"relation", "state", "event", "org", "foreshadowing"}
     # 状态更新语义保留（炼气→筑基为 update）
-    assert any(
-        c["operation"] == "update"
-        for draft in drafts
-        for c in draft["provisional_claims"]
-    )
+    assert any(c["operation"] == "update" for draft in drafts for c in draft["provisional_claims"])
 
     # Token 账本覆盖全部成功调用
     tokens = TokenLedger(migrated_db).summary(run_id)
@@ -239,10 +233,18 @@ def test_map_checkpoint_reuse_on_repeat_run(tmp_path, migrated_db: Engine) -> No
     assert _staging_counts(migrated_db, run2) == {"valid": 10}
     # draft_id 确定性：同配置重跑得到相同 draft_id
     with migrated_db.connect() as conn:
-        ids1 = {r[0] for r in conn.execute(
-            text("SELECT draft_id FROM map_drafts WHERE run_id = :r"), {"r": run1}).fetchall()}
-        ids2 = {r[0] for r in conn.execute(
-            text("SELECT draft_id FROM map_drafts WHERE run_id = :r"), {"r": run2}).fetchall()}
+        ids1 = {
+            r[0]
+            for r in conn.execute(
+                text("SELECT draft_id FROM map_drafts WHERE run_id = :r"), {"r": run1}
+            ).fetchall()
+        }
+        ids2 = {
+            r[0]
+            for r in conn.execute(
+                text("SELECT draft_id FROM map_drafts WHERE run_id = :r"), {"r": run2}
+            ).fetchall()
+        }
     assert ids1 == ids2
 
 
@@ -272,13 +274,17 @@ def test_map_failed_chapter_invalid_staging_and_resume(tmp_path, migrated_db: En
     assert counts.get("valid") == 9
     assert counts.get("invalid") == 1, "非法响应必须保存为 invalid（含错误摘要与响应 hash）"
     with migrated_db.connect() as conn:
-        bad = conn.execute(
-            text(
-                "SELECT status, error_summary, response_hash, validation_issues FROM map_drafts"
-                " WHERE run_id = :r AND status != 'valid'"
-            ),
-            {"r": run1},
-        ).mappings().fetchone()
+        bad = (
+            conn.execute(
+                text(
+                    "SELECT status, error_summary, response_hash, validation_issues FROM map_drafts"
+                    " WHERE run_id = :r AND status != 'valid'"
+                ),
+                {"r": run1},
+            )
+            .mappings()
+            .fetchone()
+        )
     assert bad["error_summary"] and "JSON" in bad["error_summary"]
     assert bad["response_hash"]
     assert json.loads(bad["validation_issues"])  # 结构化校验问题
@@ -338,10 +344,16 @@ def test_map_multi_segment_combines_hashes() -> None:
             self.raw_text = raw
 
     parts = [
-        Part(request_hash("seg0", model="m", profile_id="p"),
-             response_hash('{"mentions": []}'), '{"mentions": []}'),
-        Part(request_hash("seg1", model="m", profile_id="p"),
-             response_hash('{"claims": []}'), '{"claims": []}'),
+        Part(
+            request_hash("seg0", model="m", profile_id="p"),
+            response_hash('{"mentions": []}'),
+            '{"mentions": []}',
+        ),
+        Part(
+            request_hash("seg1", model="m", profile_id="p"),
+            response_hash('{"claims": []}'),
+            '{"claims": []}',
+        ),
     ]
     req_combined = _combine_request_hashes(parts)
     resp_combined = _combine_response_hashes(parts)
@@ -359,10 +371,16 @@ def test_map_multi_segment_combines_hashes() -> None:
     assert _combine_response_hashes(parts) == resp_combined
     # 单段请求 hash 变化必须反映到聚合（请求审计有效）
     parts2 = [
-        Part(request_hash("seg0-changed", model="m", profile_id="p"),
-             response_hash('{"mentions": []}'), '{"mentions": []}'),
-        Part(request_hash("seg1", model="m", profile_id="p"),
-             response_hash('{"claims": []}'), '{"claims": []}'),
+        Part(
+            request_hash("seg0-changed", model="m", profile_id="p"),
+            response_hash('{"mentions": []}'),
+            '{"mentions": []}',
+        ),
+        Part(
+            request_hash("seg1", model="m", profile_id="p"),
+            response_hash('{"claims": []}'),
+            '{"claims": []}',
+        ),
     ]
     assert _combine_request_hashes(parts2) != req_combined
     # raw 摘要包含每段的响应 hash 前缀

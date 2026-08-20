@@ -95,9 +95,7 @@ def test_cache_key_includes_query_and_profiles(tmp_path: Path, migrated_db: Engi
     assert _key(data["book_id"], migrated_db, world=3).to_key() != base.to_key()
 
 
-def test_summary_rebuild_invalidates_plotline_cache(
-    tmp_path: Path, migrated_db: Engine
-) -> None:
+def test_summary_rebuild_invalidates_plotline_cache(tmp_path: Path, migrated_db: Engine) -> None:
     """P1-5a：同一 active run 下摘要重建 → 签名变化 → 主线缓存不命中。"""
     data = seed_active_book(migrated_db, tmp_path)
     from novelcanon.query import QueryExecutor

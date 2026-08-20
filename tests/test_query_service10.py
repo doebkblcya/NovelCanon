@@ -38,14 +38,10 @@ def test_org_membership_folding(tmp_path: Path, migrated_db: Engine) -> None:
     data = seed_active_book(migrated_db, tmp_path)
     qs = QueryService(migrated_db, data["book_id"])
     members = qs.org_membership("ent_xiaoyan")
-    assert [(m["org_entity_id"], m["role"]) for m in members] == [
-        ("ent_xiaojia", "少主")
-    ]
+    assert [(m["org_entity_id"], m["role"]) for m in members] == [("ent_xiaojia", "少主")]
     # 林风加入青云宗（弟子）已在 seed
     members_lin = qs.org_membership("ent_linfeng")
-    assert [(m["org_entity_id"], m["role"]) for m in members_lin] == [
-        ("ent_qingyunzong", "弟子")
-    ]
+    assert [(m["org_entity_id"], m["role"]) for m in members_lin] == [("ent_qingyunzong", "弟子")]
     # leave 后成员消失（折叠）
     repo = Repository(migrated_db)
     repo.write_claim(
@@ -163,9 +159,7 @@ def test_unknown_world_visible_in_plain_query_hidden_in_world_query(
     )
 
 
-def test_claim_history_limited_to_active_runs(
-    tmp_path: Path, migrated_db: Engine
-) -> None:
+def test_claim_history_limited_to_active_runs(tmp_path: Path, migrated_db: Engine) -> None:
     """P0（复审）：claim_history 经 observation 限定 active run——
     失败/失效 run 的版本不计入。"""
     data = seed_active_book(migrated_db, tmp_path)
@@ -219,8 +213,11 @@ def test_all_events_current_version_only(tmp_path: Path, migrated_db: Engine) ->
     from novelcanon.schemas.payloads import EventPayload
 
     fact = event_fact_id(
-        "拜师", ["ent_linfeng", "ent_qingyunzong"],
-        "ent_qingyunzong", data["chapters"][0], 1,
+        "拜师",
+        ["ent_linfeng", "ent_qingyunzong"],
+        "ent_qingyunzong",
+        data["chapters"][0],
+        1,
     )
     repo = Repository(migrated_db)
     new_v = repo.write_claim(
@@ -253,17 +250,18 @@ def test_all_events_current_version_only(tmp_path: Path, migrated_db: Engine) ->
     assert new_v in {e["claim_version_id"] for e in events}
 
 
-def test_event_contested_version_does_not_fall_back(
-    tmp_path: Path, migrated_db: Engine
-) -> None:
+def test_event_contested_version_does_not_fall_back(tmp_path: Path, migrated_db: Engine) -> None:
     """P0（三轮）：最新版本 contested → 旧 supported 版本不得回退为当前。"""
     data = seed_active_book(migrated_db, tmp_path)
     from novelcanon.schemas.ids import event_fact_id
     from novelcanon.schemas.payloads import EventPayload
 
     fact = event_fact_id(
-        "拜师", ["ent_linfeng", "ent_qingyunzong"],
-        "ent_qingyunzong", data["chapters"][0], 1,
+        "拜师",
+        ["ent_linfeng", "ent_qingyunzong"],
+        "ent_qingyunzong",
+        data["chapters"][0],
+        1,
     )
     repo = Repository(migrated_db)
     # 第 2 版：contested（证据存疑）
@@ -291,12 +289,6 @@ def test_event_contested_version_does_not_fall_back(
     qs = QueryService(migrated_db, data["book_id"])
     events = qs.all_events()
     summaries = {e["summary"] for e in events}
-    assert "林风拜入青云宗" not in summaries, (
-        "旧 supported 版本不得回退为当前版本"
-    )
-    assert not any("存疑" in s for s in summaries), (
-        "contested 版本不得进入默认查询"
-    )
-    assert "林风拜入青云宗" not in {
-        e["summary"] for e in qs.entity_events("ent_linfeng")
-    }
+    assert "林风拜入青云宗" not in summaries, "旧 supported 版本不得回退为当前版本"
+    assert not any("存疑" in s for s in summaries), "contested 版本不得进入默认查询"
+    assert "林风拜入青云宗" not in {e["summary"] for e in qs.entity_events("ent_linfeng")}

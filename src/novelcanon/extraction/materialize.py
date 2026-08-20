@@ -310,13 +310,11 @@ def materialize_draft(
         for ev in raw_evidences:
             if ev.chapter_id != claim.observed_chapter_id:
                 raise AssertionError(
-                    f"证据章节 {ev.chapter_id} 与 claim 章节"
-                    f" {claim.observed_chapter_id} 不一致"
+                    f"证据章节 {ev.chapter_id} 与 claim 章节 {claim.observed_chapter_id} 不一致"
                 )
             if not 0 <= ev.char_start < ev.char_end <= len(chapter_text):
                 raise AssertionError(
-                    f"证据 span [{ev.char_start},{ev.char_end}) 越界"
-                    f"（章长 {len(chapter_text)}）"
+                    f"证据 span [{ev.char_start},{ev.char_end}) 越界（章长 {len(chapter_text)}）"
                 )
             span = chapter_text[ev.char_start : ev.char_end]
             if sha256(span) != sha256(ev.span_text):
@@ -355,11 +353,7 @@ def materialize_draft(
                 and e.evidence_type == EvidenceType.DIRECT
             ),
             next(
-                (
-                    e.evidence_id
-                    for e in evidences
-                    if e.evidence_stance == EvidenceStance.SUPPORTS
-                ),
+                (e.evidence_id for e in evidences if e.evidence_stance == EvidenceStance.SUPPORTS),
                 None,
             ),
         )

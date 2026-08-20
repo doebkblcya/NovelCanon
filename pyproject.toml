@@ -22,7 +22,11 @@ vec = ["sqlite-vec==0.1.9"]
 # tiktoken 仅为可选计量 adapter（ADR-0006）
 tokenizer = ["tiktoken>=0.7,<1"]
 # P4 查询 API，阶段 04 前不引入
-api = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.30,<1"]
+# 固定成熟组合（阶段 11 复审 P0：fastapi 0.141/starlette 1.6 的 TestClient
+# 在锁定环境阻塞 /health；回退到 0.115.x + starlette 0.41.x + httpx 的
+# 久经验证组合，TestClient 稳定可退出。TestClient 走 httpx 传输层会有
+# starlette 弃用警告，但功能可靠）
+api = ["fastapi>=0.115,<0.116", "uvicorn[standard]>=0.30,<1"]
 
 [project.scripts]
 novelcanon = "novelcanon.cli:app"

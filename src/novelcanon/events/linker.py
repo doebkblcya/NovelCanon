@@ -21,7 +21,7 @@ from novelcanon.schemas.types import EventLinkType
 
 # 因果链接置信度（规则层）
 _CONFIDENCE_ENABLES = 0.6  # 参与者交集 + 时间先后的弱因果（使能）
-_CONFIDENCE_CAUSES = 0.8   # 同参与者 + 同地点 + 时间先后的强因果
+_CONFIDENCE_CAUSES = 0.8  # 同参与者 + 同地点 + 时间先后的强因果
 
 
 @dataclass(frozen=True)
@@ -72,9 +72,7 @@ class EventLinker:
     def __init__(self, max_ordinal_gap: int = 100) -> None:
         self._max_gap = max_ordinal_gap
 
-    def generate_candidates(
-        self, events: list[EventInfo]
-    ) -> list[LinkCandidate]:
+    def generate_candidates(self, events: list[EventInfo]) -> list[LinkCandidate]:
         """跨章因果候选（§2 候选阻塞）。
 
         规则：
@@ -110,8 +108,7 @@ class EventLinker:
                     seen.add(key)
                     # 同地点 → 强因果（拜师→突破 同在山门）；否则弱使能
                     same_location = bool(
-                        src.location_entity_id
-                        and src.location_entity_id == tgt.location_entity_id
+                        src.location_entity_id and src.location_entity_id == tgt.location_entity_id
                     )
                     if same_location:
                         rtype = EventLinkType.CAUSES
@@ -137,6 +134,4 @@ class EventLinker:
     @staticmethod
     def _type_compatible(src: EventInfo, tgt: EventInfo) -> bool:
         """事件类型兼容性（§2）：同类型或类型文本有交集。"""
-        return src.event_type == tgt.event_type or bool(
-            set(src.event_type) & set(tgt.event_type)
-        )
+        return src.event_type == tgt.event_type or bool(set(src.event_type) & set(tgt.event_type))

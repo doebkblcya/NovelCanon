@@ -123,9 +123,7 @@ def _hard_cut_chars(text: str, tokenizer: Tokenizer, max_tokens: int) -> int:
     return max(1, lo)
 
 
-def build_ref_segments(
-    chapter_id: str, segments: list[SourceSegment]
-) -> list[RefSourceSegment]:
+def build_ref_segments(chapter_id: str, segments: list[SourceSegment]) -> list[RefSourceSegment]:
     """每段 → RefSourceSegment（压缩关闭时直接指向原文区间）。"""
     return [
         RefSourceSegment(
@@ -137,9 +135,7 @@ def build_ref_segments(
     ]
 
 
-def ref_segment_prompt_lines(
-    chapter_id: str, segments: list[SourceSegment]
-) -> list[str]:
+def ref_segment_prompt_lines(chapter_id: str, segments: list[SourceSegment]) -> list[str]:
     """给模型的「可用原文段」清单（含偏移与内容 hash）。"""
     return [
         f"{seg.segment_id}：章内偏移 [{seg.char_start},{seg.char_end})"

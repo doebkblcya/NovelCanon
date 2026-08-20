@@ -30,9 +30,7 @@ def _reduce(migrated_db: Engine, data: dict) -> object:
     return reducer.reduce()
 
 
-def test_reduce_hierarchy_and_max_ordinal(
-    tmp_path: Path, migrated_db: Engine
-) -> None:
+def test_reduce_hierarchy_and_max_ordinal(tmp_path: Path, migrated_db: Engine) -> None:
     """章节 → 卷 → 全书：输入集合/max ordinal/依赖图记录正确。"""
     data = seed_active_book(migrated_db, tmp_path)
     result = _reduce(migrated_db, data)
@@ -62,10 +60,7 @@ def test_reduce_idempotent_reuse(tmp_path: Path, migrated_db: Engine) -> None:
     assert r2.rebuilt == 0
     with migrated_db.connect() as conn:
         n = conn.execute(
-            text(
-                "SELECT COUNT(*) FROM summary_artifacts"
-                " WHERE book_id = :b AND status = 'valid'"
-            ),
+            text("SELECT COUNT(*) FROM summary_artifacts WHERE book_id = :b AND status = 'valid'"),
             {"b": data["book_id"]},
         ).scalar()
     assert n == 2  # 卷 + 全书，无重复
@@ -145,18 +140,11 @@ def test_reduce_deterministic_content_stable(tmp_path: Path, migrated_db: Engine
             {"b": data["book_id"]},
         )
     r2 = _reduce(migrated_db, data)
-    assert (
-        r1.volume_summaries[0]["content_hash"]
-        == r2.volume_summaries[0]["content_hash"]
-    )
-    assert (
-        r1.book_summary["content_hash"] == r2.book_summary["content_hash"]
-    )
+    assert r1.volume_summaries[0]["content_hash"] == r2.volume_summaries[0]["content_hash"]
+    assert r1.book_summary["content_hash"] == r2.book_summary["content_hash"]
 
 
-def test_book_summary_consumes_volume_summaries(
-    tmp_path: Path, migrated_db: Engine
-) -> None:
+def test_book_summary_consumes_volume_summaries(tmp_path: Path, migrated_db: Engine) -> None:
     """P0-1：全书摘要的生成输入是卷摘要（分层 Reduce），不再展开章节记忆。
 
     LLM prompt 断言：book 级调用只含卷摘要内容，不含章节记忆 JSON。
@@ -174,9 +162,7 @@ def test_book_summary_consumes_volume_summaries(
         usage=Usage(input_tokens=80, output_tokens=30, provider="fake", model="m"),
     )
     summarizer = LLMSummarizer(fake, profile_id="p1")
-    reducer = HierarchicalReducer(
-        migrated_db, data["book_id"], summarizer=summarizer
-    )
+    reducer = HierarchicalReducer(migrated_db, data["book_id"], summarizer=summarizer)
     result = reducer.reduce()
     assert result.book_summary is not None
     # 两次调用：卷摘要（章节记忆）→ 全书摘要（卷摘要）
@@ -213,9 +199,7 @@ def test_llm_reduce_usage_aggregated(tmp_path: Path, migrated_db: Engine) -> Non
     assert result.tokens.output_tokens == 100
 
 
-def test_reducer_reuse_compares_profile_and_schema(
-    tmp_path: Path, migrated_db: Engine
-) -> None:
+def test_reducer_reuse_compares_profile_and_schema(tmp_path: Path, migrated_db: Engine) -> None:
     """P1（复审）：幂等复用判定比较 generation profile 与 schema 版本。"""
     data = seed_active_book(migrated_db, tmp_path)
     from novelcanon.generation.client import FakeGenerationClient
@@ -259,14 +243,10 @@ def test_reducer_reuse_compares_profile_and_schema(
             ),
             {"b": data["book_id"]},
         ).fetchall()
-    assert ("p-v2", "pv2") in row, (
-        f"profile/prompt 变化后不得保留旧配置：{row}"
-    )
+    assert ("p-v2", "pv2") in row, f"profile/prompt 变化后不得保留旧配置：{row}"
 
 
-def test_reducer_restore_updates_metadata(
-    tmp_path: Path, migrated_db: Engine
-) -> None:
+def test_reducer_restore_updates_metadata(tmp_path: Path, migrated_db: Engine) -> None:
     """P1（复审）：恢复内容相同的历史摘要时补全 max ordinal/profile/schema。"""
     data = seed_active_book(migrated_db, tmp_path)
     reducer = HierarchicalReducer(

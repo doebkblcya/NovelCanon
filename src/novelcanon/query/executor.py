@@ -30,13 +30,20 @@ from novelcanon.retrieval.service import RetrievalHit, RetrievalService
 from novelcanon.retrieval.vectorstore import Embedder, VectorStore
 
 _CN_DIGITS = {
-    "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
-    "六": 6, "七": 7, "八": 8, "九": 9,
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
 }
 # 阿拉伯/全角/汉字数字章节（如 第二章 / 第12章 / 第一百二十章）
-_CHAPTER_RE = re.compile(
-    r"第\s*([0-9０-９零〇一二两三四五六七八九十百]+)\s*章"
-)
+_CHAPTER_RE = re.compile(r"第\s*([0-9０-９零〇一二两三四五六七八九十百]+)\s*章")
 
 
 def _cn_to_int(token: str) -> int:
@@ -158,9 +165,7 @@ class QueryExecutor:
                 self._synthesis.profile_id if self._synthesis.has_client else "deterministic"
             ),
         )
-        stats = self._stats.setdefault(
-            decision.route, RouteStats(route=decision.route)
-        )
+        stats = self._stats.setdefault(decision.route, RouteStats(route=decision.route))
         if self._use_cache:
             cached = self._cache.get(cache_key)
             if cached is not None:
@@ -274,9 +279,7 @@ class QueryExecutor:
             return self._term(decision.normalized_query, knowledge_cutoff)
         if qtype == QueryType.CHAPTER_GRAPH:
             return self._chapter(decision.normalized_query, knowledge_cutoff, world_at)
-        return self._structured(
-            qtype, decision.normalized_query, knowledge_cutoff, world_at
-        )
+        return self._structured(qtype, decision.normalized_query, knowledge_cutoff, world_at)
 
     def _structured(
         self,
@@ -300,17 +303,26 @@ class QueryExecutor:
                     cid, world_at, knowledge_cutoff=knowledge_cutoff
                 )
             else:
-                states = self._query.entity_state(
-                    cid, knowledge_cutoff=knowledge_cutoff
-                )
+                states = self._query.entity_state(cid, knowledge_cutoff=knowledge_cutoff)
             for s in states:
-                items.append(
-                    self._claim_item(s, f"{surface} 的 {s['field']} = {s['value']}")
-                )
+                items.append(self._claim_item(s, f"{surface} 的 {s['field']} = {s['value']}"))
         elif qtype == QueryType.RELATION:
-            for r in self._query.one_hop_relations(
-                cid, knowledge_cutoff=knowledge_cutoff, world_at=world_at
-            ):
+            # P1：解析问题中全部实体；两个实体时按端点对收窄（「萧炎与
+            # 纳兰嫣然的关系」只返回两者之间），单实体返回全部一跳关系。
+            entities = self._find_entities(normalized, knowledge_cutoff=knowledge_cutoff)
+            if len(entities) >= 2:
+                (a_cid, _), (b_cid, _) = entities[:2]
+                relations = self._query.relation_between(
+                    a_cid,
+                    b_cid,
+                    knowledge_cutoff=knowledge_cutoff,
+                    world_at=world_at,
+                )
+            else:
+                relations = self._query.one_hop_relations(
+                    cid, knowledge_cutoff=knowledge_cutoff, world_at=world_at
+                )
+            for r in relations:
                 items.append(
                     self._claim_item(
                         r,
@@ -368,16 +380,12 @@ class QueryExecutor:
                     # 正文 = 路径全部事件（P0：A → B → C，中间事件进入生成
                     # 上下文，模型不会把间接链写成直接因果）
                     chain_events = [
-                        e
-                        for e in (p.get("path_events") or [])
-                        if e and e.get("summary")
+                        e for e in (p.get("path_events") or []) if e and e.get("summary")
                     ]
                     if len(chain_events) >= 2:
                         chain = " → ".join(e["summary"] for e in chain_events)
                     else:
-                        chain = (
-                            f"{ev['summary']} → {tgt.get('summary', p['tgt'])}"
-                        )
+                        chain = f"{ev['summary']} → {tgt.get('summary', p['tgt'])}"
                     # 来源 = 路径全部因果边（P0）：首条边作主定位，其余边
                     # 进 extra_evidence，AnswerSource 展开覆盖每条边的版本
                     # 与验证证据定位（多跳路径的后续边也有引用）。
@@ -391,9 +399,7 @@ class QueryExecutor:
                                 primary["claim_version_id"] if primary else p["path"]
                             ),
                             chapter_id=primary.get("chapter_id") if primary else None,
-                            observed_ordinal=(
-                                primary.get("observed_ordinal") if primary else None
-                            ),
+                            observed_ordinal=(primary.get("observed_ordinal") if primary else None),
                             char_start=primary.get("char_start") if primary else None,
                             char_end=primary.get("char_end") if primary else None,
                             content=(
@@ -401,9 +407,7 @@ class QueryExecutor:
                                 f"（{len(edges)} 条已验证因果边）"
                             ),
                             claim_status="supported",
-                            evidence_stance=(
-                                primary.get("stance", "") if primary else ""
-                            ),
+                            evidence_stance=(primary.get("stance", "") if primary else ""),
                             extra_evidence=[
                                 {
                                     "claim_version_id": e["claim_version_id"],
@@ -421,14 +425,10 @@ class QueryExecutor:
             return []
         return items
 
-    def _raw_detail(
-        self, normalized: str, knowledge_cutoff: int | None
-    ) -> list[ContextItem]:
+    def _raw_detail(self, normalized: str, knowledge_cutoff: int | None) -> list[ContextItem]:
         if self._retrieval is None:
             return []
-        result = self._retrieval.hybrid_search(
-            normalized, top_k=8, cutoff=knowledge_cutoff
-        )
+        result = self._retrieval.hybrid_search(normalized, top_k=8, cutoff=knowledge_cutoff)
         return [self._chunk_item(h) for h in result.hits]
 
     def _plotline(self, knowledge_cutoff: int | None) -> list[ContextItem]:
@@ -466,19 +466,11 @@ class QueryExecutor:
         if not items:
             # 尚无摘要：回退全书关键事件（P1：不再只查第 0 章，
             # all_events 取 cutoff 前全部 supported 事件，限量排序）
-            for ev in self._query.all_events(
-                knowledge_cutoff=knowledge_cutoff, limit=30
-            ):
-                items.append(
-                    self._claim_item(
-                        ev, content=f"[{ev['event_type']}] {ev['summary']}"
-                    )
-                )
+            for ev in self._query.all_events(knowledge_cutoff=knowledge_cutoff, limit=30):
+                items.append(self._claim_item(ev, content=f"[{ev['event_type']}] {ev['summary']}"))
         return items
 
-    def _term(
-        self, normalized: str, knowledge_cutoff: int | None
-    ) -> list[ContextItem]:
+    def _term(self, normalized: str, knowledge_cutoff: int | None) -> list[ContextItem]:
         term = self._find_term(normalized)
         if term is None:
             return []
@@ -505,11 +497,7 @@ class QueryExecutor:
             ordinal, knowledge_cutoff=knowledge_cutoff, world_at=world_at
         ):
             payload = g.get("payload") or "{}"
-            items.append(
-                self._claim_item(
-                    g, content=f"[{g['claim_type']}] {payload}"
-                )
-            )
+            items.append(self._claim_item(g, content=f"[{g['claim_type']}] {payload}"))
         return items
 
     # ── 上下文条目构造 ───────────────────────────────────────────
@@ -590,11 +578,50 @@ class QueryExecutor:
             ).fetchall()
         best: tuple[str, str] | None = None
         for cid, surface in rows:
-            if surface and surface in normalized and (
-                best is None or len(surface) > len(best[1])
-            ):
+            if surface and surface in normalized and (best is None or len(surface) > len(best[1])):
                 best = (cid, surface)
         return best
+
+    def _find_entities(
+        self, normalized: str, *, knowledge_cutoff: int | None = None
+    ) -> list[tuple[str, str]]:
+        """问题中全部匹配实体（P1：双实体问题可收窄端点对）。
+
+        按表面名长度降序（最长匹配优先）；cutoff 截断与 _find_entity 一致。
+        """
+        cutoff_sql = ""
+        params: dict[str, object] = {"b": self._book_id}
+        if knowledge_cutoff is not None:
+            cutoff_sql = " AND a.observed_ordinal <= :cutoff"
+            params["cutoff"] = knowledge_cutoff
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT COALESCE(er.canonical_id, a.canonical_id) AS cid,"
+                    " a.surface_name"
+                    " FROM entity_alias_claims a"
+                    " JOIN alias_observations o ON o.claim_version_id = a.claim_version_id"
+                    " JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
+                    " LEFT JOIN entity_resolutions er ON er.mention_id = a.canonical_id"
+                    " WHERE r.status = 'active' AND r.book_id = :b AND a.operation = 'assert'"
+                    f"{cutoff_sql}"
+                    " GROUP BY cid, a.surface_name"
+                ),
+                params,
+            ).fetchall()
+        found: list[tuple[str, str]] = []
+        for cid, surface in rows:
+            if surface and surface in normalized and surface:
+                found.append((cid, surface))
+        found.sort(key=lambda x: len(x[1]), reverse=True)
+        # 去重（同一 canonical 多表面名取最长）
+        dedup: list[tuple[str, str]] = []
+        seen_cid: set[str] = set()
+        for cid, surface in found:
+            if cid not in seen_cid:
+                seen_cid.add(cid)
+                dedup.append((cid, surface))
+        return dedup
 
     def _find_term(self, normalized: str) -> str | None:
         with self._engine.connect() as conn:

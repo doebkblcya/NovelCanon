@@ -79,18 +79,34 @@ def remove_chunk_from(conn: Connection, raw_chunk_id: str) -> None:
     )
 
 
-def search_shadow(engine: Engine, *, query: str, book_id: str, limit: int = 20) -> list[dict]:
-    """jieba 影子列检索：查询词同版本分词，FTS5 MATCH + book 限定。"""
+def search_shadow(
+    engine: Engine,
+    *,
+    query: str,
+    book_id: str,
+    limit: int = 20,
+    cutoff: int | None = None,
+) -> list[dict]:
+    """jieba 影子列检索：查询词同版本分词，FTS5 MATCH + book 限定。
+
+    cutoff（P1）：observed_ordinal 在 SQL LIMIT 前过滤——后期高排名候选
+    不会挤占截止点前的相关结果（避免候选窗口截断后假性无结果）。
+    """
     query_ws = segment_ws(query)
+    params: dict[str, object] = {"q": query_ws, "b": book_id, "lim": limit}
+    cutoff_sql = ""
+    if cutoff is not None:
+        cutoff_sql = " AND observed_ordinal <= :cutoff"
+        params["cutoff"] = cutoff
     with engine.connect() as conn:
         rows = (
             conn.execute(
                 text(
                     "SELECT raw_chunk_id, observed_ordinal, bm25(fts_chunks) AS score"
                     " FROM fts_chunks WHERE fts_chunks MATCH :q AND book_id = :b"
-                    " ORDER BY score LIMIT :lim"
+                    f"{cutoff_sql} ORDER BY score LIMIT :lim"
                 ),
-                {"q": query_ws, "b": book_id, "lim": limit},
+                params,
             )
             .mappings()
             .fetchall()
@@ -98,18 +114,32 @@ def search_shadow(engine: Engine, *, query: str, book_id: str, limit: int = 20) 
     return [dict(r) for r in rows]
 
 
-def search_trigram(engine: Engine, *, query: str, book_id: str, limit: int = 20) -> list[dict]:
-    """trigram 检索：原文子串匹配（如专名/短查询）。"""
+def search_trigram(
+    engine: Engine,
+    *,
+    query: str,
+    book_id: str,
+    limit: int = 20,
+    cutoff: int | None = None,
+) -> list[dict]:
+    """trigram 检索：原文子串匹配（如专名/短查询）。
+
+    cutoff（P1）：同 search_shadow，SQL LIMIT 前过滤 ordinal。
+    """
+    params: dict[str, object] = {"q": f'"{query}"', "b": book_id, "lim": limit}
+    cutoff_sql = ""
+    if cutoff is not None:
+        cutoff_sql = " AND observed_ordinal <= :cutoff"
+        params["cutoff"] = cutoff
     with engine.connect() as conn:
         rows = (
             conn.execute(
                 text(
                     "SELECT raw_chunk_id, observed_ordinal, bm25(fts_chunks_trigram) AS score"
                     " FROM fts_chunks_trigram WHERE fts_chunks_trigram MATCH :q AND book_id = :b"
-                    " ORDER BY score LIMIT :lim"
+                    f"{cutoff_sql} ORDER BY score LIMIT :lim"
                 ),
-                # trigram 查询用引号包裹做短语/子串匹配
-                {"q": f'"{query}"', "b": book_id, "lim": limit},
+                params,
             )
             .mappings()
             .fetchall()

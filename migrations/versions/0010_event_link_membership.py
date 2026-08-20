@@ -30,9 +30,7 @@ def upgrade() -> None:
         "event_links",
         sa.Column("created_by_run_id", sa.Text, nullable=True),
     )
-    op.create_index(
-        "ix_event_links_run", "event_links", ["created_by_run_id"]
-    )
+    op.create_index("ix_event_links_run", "event_links", ["created_by_run_id"])
 
     op.create_table(
         "event_link_observations",

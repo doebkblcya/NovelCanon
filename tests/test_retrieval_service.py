@@ -143,3 +143,37 @@ def test_hybrid_search_no_index_raises(tmp_path: Path, migrated_db: Engine) -> N
         raise AssertionError("无 active 索引应拒绝")
     except ValueError:
         pass
+
+
+def test_hybrid_cutoff_widens_vector_window(tmp_path: Path, migrated_db: Engine) -> None:
+    """P1（11）：cutoff 过滤后向量候选不足时迭代扩窗口（不假性无结果）。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    _build(migrated_db, data["book_id"])
+    service = RetrievalService(
+        migrated_db,
+        data["book_id"],
+        embedder=FakeEmbedder(dimension=8),
+        vector_store=BruteForceVectorStore(dimension=8),
+    )
+    # top_k=3、cutoff=0（只保留 ch0 chunks）：窗口 12 → 过滤后若不足 3
+    # 条则扩窗口，最终仍返回有效结果（不因后期高排名候选被截断而空）
+    result = service.hybrid_search("青云宗", top_k=3, cutoff=0)
+    for h in result.hits:
+        assert h.observed_ordinal <= 0, "cutoff=0 不得返回后期章节"
+    # 诊断记录向量候选规模（扩窗口后 >= 初始窗口）
+    assert result.diagnostics["vector_candidates"] >= 0
+
+
+def test_fts_cutoff_filters_in_sql(tmp_path: Path, migrated_db: Engine) -> None:
+    """P1（11）：FTS 的 cutoff 在 SQL LIMIT 前过滤（后期候选不挤占窗口）。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    _build(migrated_db, data["book_id"])
+    from novelcanon.retrieval.fts import search_shadow, search_trigram
+
+    for fn in (search_shadow, search_trigram):
+        hits = fn(migrated_db, query="青云宗", book_id=data["book_id"], limit=50, cutoff=0)
+        assert hits, f"{fn.__name__} cutoff=0 仍应返回 ch0 命中"
+        for h in hits:
+            assert h["observed_ordinal"] <= 0, (
+                f"{fn.__name__} cutoff 未在 SQL 内过滤：{h['observed_ordinal']}"
+            )

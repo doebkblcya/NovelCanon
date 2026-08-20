@@ -18,18 +18,14 @@ def extraction_report(engine: Engine, run_id: str) -> dict:
     """返回 run 的抽取报告（纯查询，不修改数据）。"""
     with engine.connect() as conn:
         chapters = conn.execute(
-            text(
-                "SELECT status, COUNT(*) AS n FROM map_drafts WHERE run_id = :r"
-                " GROUP BY status"
-            ),
+            text("SELECT status, COUNT(*) AS n FROM map_drafts WHERE run_id = :r GROUP BY status"),
             {"r": run_id},
         ).fetchall()
         status_counts = {row[0]: row[1] for row in chapters}
 
         issue_rows = conn.execute(
             text(
-                "SELECT validation_issues FROM map_drafts"
-                " WHERE run_id = :r AND status != 'valid'"
+                "SELECT validation_issues FROM map_drafts WHERE run_id = :r AND status != 'valid'"
             ),
             {"r": run_id},
         ).fetchall()
@@ -43,29 +39,31 @@ def extraction_report(engine: Engine, run_id: str) -> dict:
                 code = issue.get("code", "unknown") if isinstance(issue, dict) else "unknown"
                 issues_by_code[code] = issues_by_code.get(code, 0) + 1
 
-        count_rows = conn.execute(
-            text(
-                "SELECT"
-                " COALESCE(SUM(CASE WHEN status='valid' THEN 1 ELSE 0 END),0) AS valid,"
-                " COUNT(*) AS total,"
-                " COALESCE(SUM(json_array_length(json_extract(draft_json,'$.mentions'))),0)"
-                "   AS mentions,"
-                " COALESCE(SUM(json_array_length(json_extract(draft_json,'$.unresolved'))),0)"
-                "   AS unresolved,"
-                " COALESCE(SUM(json_array_length(json_extract(draft_json,'$.local_events'))),0)"
-                "   AS local_events,"
-                " COALESCE(SUM(json_array_length(json_extract(draft_json,"
-                "   '$.provisional_claims'))),0) AS claims"
-                " FROM map_drafts WHERE run_id = :r"
-            ),
-            {"r": run_id},
-        ).mappings().fetchone()
+        count_rows = (
+            conn.execute(
+                text(
+                    "SELECT"
+                    " COALESCE(SUM(CASE WHEN status='valid' THEN 1 ELSE 0 END),0) AS valid,"
+                    " COUNT(*) AS total,"
+                    " COALESCE(SUM(json_array_length(json_extract(draft_json,'$.mentions'))),0)"
+                    "   AS mentions,"
+                    " COALESCE(SUM(json_array_length(json_extract(draft_json,'$.unresolved'))),0)"
+                    "   AS unresolved,"
+                    " COALESCE(SUM(json_array_length(json_extract(draft_json,'$.local_events'))),0)"
+                    "   AS local_events,"
+                    " COALESCE(SUM(json_array_length(json_extract(draft_json,"
+                    "   '$.provisional_claims'))),0) AS claims"
+                    " FROM map_drafts WHERE run_id = :r"
+                ),
+                {"r": run_id},
+            )
+            .mappings()
+            .fetchone()
+        )
 
         claims_by_type: dict[str, int] = {}
         claim_rows = conn.execute(
-            text(
-                "SELECT draft_json FROM map_drafts WHERE run_id = :r AND status='valid'"
-            ),
+            text("SELECT draft_json FROM map_drafts WHERE run_id = :r AND status='valid'"),
             {"r": run_id},
         ).fetchall()
         for (draft_json,) in claim_rows:

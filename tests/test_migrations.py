@@ -49,30 +49,42 @@ def _seed_multi_run_links(tmp_path, engine: Engine) -> tuple[str, str]:
     run1 = RunManager(engine).create(book_id, input_hash="r1")
     repo.upsert_entity(
         EntityRecord(
-            canonical_id="ent_luchen", canonical_name="陆尘",
-            tier=EntityTier.CORE, created_by_run_id=run1,
+            canonical_id="ent_luchen",
+            canonical_name="陆尘",
+            tier=EntityTier.CORE,
+            created_by_run_id=run1,
         )
     )
     # 两个事件 claim（source/target）
     from novelcanon.schemas.ids import event_fact_id, event_link_fact_id
 
     payloads = [
-        EventPayload(event_type="拜师", summary="陆尘拜入青云宗",
-                     location_entity_id=None, sequence_in_chapter=1),
-        EventPayload(event_type="突破", summary="陆尘闭关突破",
-                     location_entity_id=None, sequence_in_chapter=1),
+        EventPayload(
+            event_type="拜师",
+            summary="陆尘拜入青云宗",
+            location_entity_id=None,
+            sequence_in_chapter=1,
+        ),
+        EventPayload(
+            event_type="突破",
+            summary="陆尘闭关突破",
+            location_entity_id=None,
+            sequence_in_chapter=1,
+        ),
     ]
     vids = []
     for ordinal, p in enumerate(payloads):
-        fact = event_fact_id(
-            p.event_type, ["ent_luchen"], None, chs[ordinal]["chapter_id"], 1
-        )
+        fact = event_fact_id(p.event_type, ["ent_luchen"], None, chs[ordinal]["chapter_id"], 1)
         wr = repo.write_claim(
             ClaimEnvelope(
-                fact_id=fact, claim_version_id="", claim_type="event",
-                operation=Operation.ASSERT, claim_status=ClaimStatus.SUPPORTED,
+                fact_id=fact,
+                claim_version_id="",
+                claim_type="event",
+                operation=Operation.ASSERT,
+                claim_status=ClaimStatus.SUPPORTED,
                 observed_chapter_id=chs[ordinal]["chapter_id"],
-                observed_ordinal=ordinal, created_by_run_id=run1,
+                observed_ordinal=ordinal,
+                created_by_run_id=run1,
                 created_at="2026-01-01T00:00:00+00:00",
             ),
             p,
@@ -97,8 +109,12 @@ def _seed_multi_run_links(tmp_path, engine: Engine) -> tuple[str, str]:
                 " '拜师之后突破（迁移种子）')"
             ),
             {
-                "v": edge_id, "f": edge_fact, "s": vids[0], "t": vids[1],
-                "ch": chs[1]["chapter_id"], "run": run1,
+                "v": edge_id,
+                "f": edge_fact,
+                "s": vids[0],
+                "t": vids[1],
+                "ch": chs[1]["chapter_id"],
+                "run": run1,
             },
         )
     # 第二条边：claim_status=supported 但方法/证据是空字符串/纯空白
@@ -120,8 +136,12 @@ def _seed_multi_run_links(tmp_path, engine: Engine) -> tuple[str, str]:
                 " :ch, 1, :run, 'chapter_proxy', 1, 1.0, '', '  ')"
             ),
             {
-                "v": edge2_id, "f": edge2_fact, "s": vids[1], "t": vids[0],
-                "ch": chs[0]["chapter_id"], "run": run1,
+                "v": edge2_id,
+                "f": edge2_fact,
+                "s": vids[1],
+                "t": vids[0],
+                "ch": chs[0]["chapter_id"],
+                "run": run1,
             },
         )
     # run2 复用两条边（成员关系 = observations）

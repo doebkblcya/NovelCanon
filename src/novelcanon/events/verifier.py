@@ -88,9 +88,7 @@ class LinkVerifier:
             matched_ref = next((r for r in refs if r in sentence), None)
             if matched_ref is None:
                 continue
-            matched_conn = next(
-                (c for c in self._connectives if c in sentence), None
-            )
+            matched_conn = next((c for c in self._connectives if c in sentence), None)
             if matched_conn is None:
                 continue
             return LinkVerification(

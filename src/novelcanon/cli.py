@@ -340,6 +340,7 @@ def _run_link(engine: Engine, book_id: str, *, run_id: str | None = None) -> Non
     """读取 run 的 event claims，生成并落库跨章因果链接。"""
     from novelcanon.events import EventLinkService
     from novelcanon.pipeline.run import RunManager
+
     if run_id is None:
         with engine.connect() as conn:
             row = conn.execute(
@@ -392,6 +393,7 @@ def _run_resolve(engine: Engine, book_id: str, *, run_id: str | None = None) -> 
     """读取 run 的 mention，执行确定性消歧并落库投影/审计。"""
     from novelcanon.pipeline.run import RunManager
     from novelcanon.resolution import ResolutionService
+
     if run_id is None:
         with engine.connect() as conn:
             row = conn.execute(
@@ -419,10 +421,7 @@ def _run_resolve(engine: Engine, book_id: str, *, run_id: str | None = None) -> 
     )
     with engine.connect() as conn:
         canonical_count = conn.execute(
-            text(
-                "SELECT COUNT(DISTINCT canonical_id) FROM entity_resolutions"
-                " WHERE run_id = :r"
-            ),
+            text("SELECT COUNT(DISTINCT canonical_id) FROM entity_resolutions WHERE run_id = :r"),
             {"r": run_id},
         ).scalar()
     typer.echo(f"   canonical 实体数={canonical_count}")
@@ -482,16 +481,12 @@ def _run_align(engine: Engine, book_id: str, *, run_id: str | None = None) -> No
         f"✅ 证据对齐 run={run_id}：章节={stats.chapters}"
         f" claims={stats.claims} evidence={stats.evidence}"
     )
-    typer.echo(
-        "   状态分布：" + " ".join(f"{k}={v}" for k, v in sorted(stats.statuses.items()))
-    )
+    typer.echo("   状态分布：" + " ".join(f"{k}={v}" for k, v in sorted(stats.statuses.items())))
     if stats.errors:
         by_code: dict[str, int] = {}
         for e in stats.errors:
             by_code[e["error_code"]] = by_code.get(e["error_code"], 0) + 1
-        typer.echo(
-            "   ⚠️  证据错误：" + " ".join(f"{k}={v}" for k, v in sorted(by_code.items()))
-        )
+        typer.echo("   ⚠️  证据错误：" + " ".join(f"{k}={v}" for k, v in sorted(by_code.items())))
     typer.echo("   run 状态保持 running（阶段 09 事件链接与双时间后 activate）")
 
 
@@ -585,9 +580,7 @@ def query(
     _log_command_invoked("query")
     engine = _open_db()
     try:
-        _run_query(
-            engine, question, book_id, cutoff=cutoff, world=world, no_cache=no_cache
-        )
+        _run_query(engine, question, book_id, cutoff=cutoff, world=world, no_cache=no_cache)
     finally:
         engine.dispose()
 
@@ -619,9 +612,7 @@ def _run_query(
         vector_store=BruteForceVectorStore(dimension=8),
         use_cache=not no_cache,
     )
-    result = executor.ask(
-        question, knowledge_cutoff=cutoff, world_at=world
-    )
+    result = executor.ask(question, knowledge_cutoff=cutoff, world_at=world)
     payload = result.answer
     if result.cached:
         typer.echo("♻️  命中缓存（active run/index 签名一致）")
@@ -789,9 +780,7 @@ def _run_stats(engine: Engine, book_id: str) -> None:
             {"b": book_id},
         ).fetchall()
         volumes = conn.execute(
-            text(
-                "SELECT COUNT(*) FROM volumes WHERE book_id = :b"
-            ),
+            text("SELECT COUNT(*) FROM volumes WHERE book_id = :b"),
             {"b": book_id},
         ).scalar()
     typer.echo(f"📊 book={book_id} 统计：")
@@ -803,6 +792,298 @@ def _run_stats(engine: Engine, book_id: str) -> None:
     for level, status, n in summary_rows:
         typer.echo(f"     {level}/{status}: {n}")
     typer.echo("   提示：query 命令输出含按路线延迟/命中统计（QueryExecutor.stats）")
+
+
+@app.command()
+def pilot(
+    book_id: Annotated[str, typer.Argument(help="book_id（黄金样例库，novelcanon inspect 可查）")],
+    cutoff: Annotated[int | None, typer.Option(help="knowledge cutoff（评测截断）")] = None,
+    out: Annotated[Path | None, typer.Option("--out", help="报告 JSON 输出路径")] = None,
+    compressed: Annotated[
+        bool, typer.Option("--compressed", help="运行压缩路线（决策门）")
+    ] = False,
+    golden: Annotated[
+        Path | None,
+        typer.Option(
+            "--golden",
+            help="冻结黄金集 JSON 文件（正式 P1/P2 评测必须提供；缺省用 4 章 fixture 黄金集）",
+        ),
+    ] = None,
+    extraction: Annotated[
+        str | None,
+        typer.Option(
+            "--extraction-mode",
+            help="压缩重抽取模式：llm-map（正式，真实 LLM Map 抽取，需 LLM 配置）"
+            " / golden-replay（oracle 辅助验证，只适合 fixture，不能授权启用压缩）；"
+            "缺省：--golden 正式模式自动 llm-map（未配置 LLM 报错），fixture 自动 golden-replay",
+        ),
+    ] = None,
+) -> None:
+    """短篇 Pilot：黄金集评测（11 §P1，结构化 + hybrid + 可选压缩路线）。"""
+    _log_command_invoked("pilot")
+    engine = _open_db()
+    try:
+        _run_pilot(
+            engine,
+            book_id,
+            cutoff=cutoff,
+            out=out,
+            compressed=compressed,
+            golden_path=golden,
+            extraction_mode=extraction,
+        )
+    finally:
+        engine.dispose()
+
+
+def _run_pilot(
+    engine: Engine,
+    book_id: str,
+    *,
+    cutoff: int | None,
+    out: Path | None,
+    compressed: bool = False,
+    golden_path: Path | None = None,
+    extraction_mode: str | None = None,
+) -> None:
+    import json
+
+    from novelcanon.eval import (
+        golden_set_from_chapters,
+        golden_set_from_file,
+        run_pilot,
+        validate_golden_against_book,
+    )
+
+    if extraction_mode not in (None, "llm-map", "golden-replay"):
+        typer.echo(
+            f"❌ --extraction-mode 仅支持 llm-map / golden-replay：{extraction_mode!r}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    if golden_path is not None:
+        golden = golden_set_from_file(golden_path)
+        # 正式评测强制书内容 hash（P1：防止同 book_id 旧标注错配到已修改文本）
+        errors = validate_golden_against_book(engine, book_id, golden, require_content_hash=True)
+        if errors:
+            for e in errors:
+                typer.echo(f"❌ 黄金集校验失败：{e}", err=True)
+            raise typer.Exit(code=1)
+        typer.echo(f"✅ 黄金集已加载并校验通过：{golden_path}")
+    else:
+        golden = golden_set_from_chapters(book_id)
+        typer.echo(
+            "⚠️  使用 4 章 fixture 黄金集（仅用于黄金样例验收；正式 P1/P2 评测请用 --golden）"
+        )
+
+    # 压缩重抽取器（复审 P0：正式路径必须注入生产 Map 抽取器，不得静默
+    # 回退 golden-replay）：
+    # - --extraction-mode llm-map 或正式（--golden）+ --compressed：构造
+    #   生产 LLM Map 抽取器（未配置 LLM → 报错退出）；
+    # - --extraction-mode golden-replay：显式 oracle 辅助验证（fixture）；
+    # - fixture（无 --golden）+ --compressed：允许 golden-replay（开发）。
+    claim_extractor = None
+    want_llm = extraction_mode == "llm-map" or (extraction_mode is None and golden_path is not None)
+    if compressed and want_llm:
+        from novelcanon.eval.extractor import build_map_extractor
+
+        try:
+            claim_extractor = build_map_extractor()
+        except RuntimeError as exc:
+            typer.echo(f"❌ {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+        typer.echo("✅ 压缩重抽取：生产 LLM Map 抽取器（llm-map，真实抽取 recall）")
+    elif compressed:
+        typer.echo(
+            "⚠️  压缩重抽取：golden-replay（oracle 辅助验证，只适合 fixture；"
+            "不能授权启用压缩——决策门 extraction_mode 硬前置拒绝）"
+        )
+
+    report = run_pilot(
+        engine,
+        book_id,
+        golden,
+        cutoff=cutoff,
+        compressed=compressed,
+        claim_extractor=claim_extractor,
+    )
+    payload = report.to_dict()
+    if out is not None:
+        out.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+        typer.echo(f"✅ Pilot 报告已写入 {out}")
+    typer.echo(f"📊 Pilot book={book_id}（cutoff={cutoff}）：")
+    for route, metrics in sorted(payload["routes"].items()):
+        if metrics.get("status"):
+            typer.echo(f"   {route}: {metrics['status']}")
+            continue
+        qa = metrics.get("qa_chapter_accuracy", {})
+        facts = metrics.get("facts", {})
+        if route == "compressed":
+            decision = metrics.get("decision", {})
+            usage = metrics.get("usage", {})
+            per_wan = usage.get("per_wan", {})
+            typer.echo(
+                f"   {route}: QA={qa.get('accuracy', 0.0)} 事实 recall="
+                f"{facts.get('recall', 0.0)} 保留率={metrics.get('retention', 0.0)}"
+                f" 抽取模式={metrics.get('extraction_mode', '')}"
+                f" 每万字token={per_wan.get('tokens', 0.0)}"
+                f" 决策门={'启用' if decision.get('enable') else '不启用'}"
+            )
+            continue
+        merges = metrics.get("entity_merges", {})
+        merge_all = merges.get("all", {})
+        merge_core = merges.get("core", {})
+        usage = metrics.get("usage", {})
+        per_wan = usage.get("per_wan", {})
+        typer.echo(
+            f"   {route}: QA 章节正确率={qa.get('accuracy', 0.0)}"
+            f" 事实 F1={facts.get('f1', 0.0)}"
+            f" 实体合并 F1 all/core={merge_all.get('f1', 0.0)}/"
+            f"{merge_core.get('f1', 0.0)}"
+            f" 延迟={metrics.get('latency_ms')}ms"
+            f" 吞吐={usage.get('throughput_qps', 0.0)}qps"
+            f" 每万字token={per_wan.get('tokens', 0.0)}"
+        )
+
+
+@app.command()
+def compress(
+    book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],
+    chapters: Annotated[int | None, typer.Option(help="只压缩前 N 章")] = None,
+) -> None:
+    """压缩实验（11 §压缩实验）：规则预扫描 → 改写 → 后验校验（确定性）。"""
+    _log_command_invoked("compress")
+    engine = _open_db()
+    try:
+        _run_compress(engine, book_id, chapters=chapters)
+    finally:
+        engine.dispose()
+
+
+def _run_compress(engine: Engine, book_id: str, *, chapters: int | None) -> None:
+    from novelcanon.compression import CompressionService
+    from novelcanon.storage.repository import Repository
+
+    repo = Repository(engine)
+    chs = repo.list_chapters(book_id)
+    if chapters is not None:
+        chs = chs[:chapters]
+    if not chs:
+        typer.echo(f"❌ book={book_id} 没有章节")
+        raise typer.Exit(1)
+    full = repo.get_book_text(book_id)
+    # 已知实体表面名（供保留词典）
+    with engine.connect() as conn:
+        surfaces = [
+            r[0]
+            for r in conn.execute(
+                text(
+                    "SELECT surface_name FROM entity_alias_claims"
+                    " WHERE canonical_id IN (SELECT canonical_id FROM entities)"
+                    " LIMIT 200"
+                )
+            ).fetchall()
+        ]
+    texts = [(c["chapter_id"], full[c["char_start"] : c["char_end"]]) for c in chs]
+    service = CompressionService()
+    results = service.compress_book(texts, known_surfaces=surfaces)
+    total_in = sum(len(r.original_text) for r in results)
+    total_out = sum(len(r.compressed_text) for r in results)
+    dropped = sum(r.result.dropped for r in results)
+    fallback = sum(r.validation.get("fallback_segments", 0) for r in results)
+    version = results[0].compression_version if results else ""
+    typer.echo(
+        f"✅ 压缩实验 book={book_id} 章数={len(results)}："
+        f"保留率={total_out / total_in:.2%}"
+        f" drop 段={dropped} 回退段={fallback}"
+    )
+    typer.echo(f"   compression version={version[:20]}…")
+    passed = sum(1 for r in results if r.passed_validation)
+    typer.echo(f"   后验通过章={passed}/{len(results)}")
+
+
+@app.command()
+def backup(
+    out: Annotated[Path, typer.Argument(help="备份文件路径")],
+) -> None:
+    """备份数据库（在线备份，WAL 安全；11 §P3）。"""
+    _log_command_invoked("backup")
+    from novelcanon.storage.backup import backup_database
+
+    engine = _open_db()
+    try:
+        result = backup_database(engine, out)
+    finally:
+        engine.dispose()
+    meta = result.meta
+    typer.echo(
+        f"✅ 备份完成 {out}：books={meta['books']} chapters={meta['chapters']}"
+        f" claims={meta['claims']} evidence={meta['evidence']}"
+    )
+
+
+@app.command()
+def restore(
+    backup_path: Annotated[Path, typer.Argument(help="备份文件路径")],
+    db_path: Annotated[Path, typer.Argument(help="恢复目标数据库路径")],
+) -> None:
+    """恢复数据库并校验完整性（FK/证据 hash；11 §P3/P5）。"""
+    _log_command_invoked("restore")
+    from novelcanon.storage.backup import restore_database
+
+    engine = _open_db()
+    try:
+        report = restore_database(engine, backup_path, db_path)
+    finally:
+        engine.dispose()
+    typer.echo(
+        f"✅ 恢复完成 {db_path}：FK 违规={report.fk_violations}"
+        f" 证据复现={report.evidence_reproduced}/{report.evidence_checked}"
+        f" claims 重复={report.claim_duplicates} 完整性={'通过' if report.ok else '失败'}"
+    )
+
+
+@app.command()
+def scan_leakage(
+    book_id: Annotated[str, typer.Argument(help="book_id（novelcanon inspect 可查）")],
+) -> None:
+    """cutoff 泄露扫描（11 §P5：泄露回归为零）。"""
+    _log_command_invoked("scan-leakage")
+    engine = _open_db()
+    try:
+        _run_scan_leakage(engine, book_id)
+    finally:
+        engine.dispose()
+
+
+def _run_scan_leakage(engine: Engine, book_id: str) -> None:
+    from novelcanon.ops import scan_cutoff_leakage
+
+    questions = ["萧炎的修为状态", "第二章发生了什么", "这本书的主线是什么"]
+    cutoffs = [1, 2, 5]
+    result = scan_cutoff_leakage(engine, book_id, questions, cutoffs)
+    typer.echo(
+        f"🔍 cutoff 泄露扫描 book={book_id}：检查={result.checks}"
+        f" 泄露={'有' if result.leaked else '无'}"
+    )
+    for f in result.findings:
+        typer.echo(f"   ⚠️  {f.question} cutoff={f.cutoff} 泄露章节={f.leaked_ordinals}")
+    if result.leaked:
+        raise typer.Exit(1)
+
+
+@app.command()
+def serve(
+    port: Annotated[int, typer.Option(help="监听端口")] = 8000,
+    host: Annotated[str, typer.Option(help="监听地址")] = "127.0.0.1",
+) -> None:
+    """启动查询 API（11 §P4；复用 CLI 的 application service）。"""
+    _log_command_invoked("serve")
+    import uvicorn
+
+    typer.echo(f"🚀 查询 API 启动 http://{host}:{port}（阶段 11 P4）")
+    uvicorn.run("novelcanon.api:app", host=host, port=port)
 
 
 @app.command()
