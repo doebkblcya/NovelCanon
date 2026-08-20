@@ -184,3 +184,27 @@ def test_rebuild_chapter_only(imported_book) -> None:
 
     assert chunk_hashes(other["chapter_id"]) == before_other, "其他章 chunk 不得变化"
     assert chunk_hashes(target["chapter_id"]) != before_target, "目标章 chunk 已重建"
+
+
+def test_fts_query_with_punctuation_no_syntax_error(imported_book) -> None:
+    """冒烟修复（阶段 11 复审 D）：用户问题带标点（？·。！）不得触发
+    FTS5 MATCH 语法错误——jieba 切出的标点 token 必须被清洗。"""
+    engine, book_id = imported_book
+    build_index(engine, book_id, **_stack(engine, book_id))
+
+    # 带全角标点的自然问题（此前 fts5: syntax error near "?" → 500）
+    hits = search_shadow(engine, query="青云宗？", book_id=book_id)
+    assert hits, "清洗标点后应能正常召回"
+    # 长自然问题（含停用词，AND 语义可能空召回）不得抛语法错误——向量路线兜底
+    long_hits = search_shadow(engine, query="青云宗是什么门派？", book_id=book_id)
+    assert isinstance(long_hits, list), "清洗后长查询不得抛语法错误"
+    hits2 = search_shadow(engine, query="萧炎·林动！", book_id=book_id)
+    assert isinstance(hits2, list), "带 · 和 ！ 的查询不得抛语法错误"
+
+    # trigram 路线同样不抛错（引号剥离）
+    hits3 = search_trigram(engine, query="三年之约！", book_id=book_id)
+    assert isinstance(hits3, list)
+
+    # 纯标点查询：无词可查 → 空结果（不触发 MATCH）
+    assert search_shadow(engine, query="？？？", book_id=book_id) == []
+    assert search_trigram(engine, query="???", book_id=book_id) == []

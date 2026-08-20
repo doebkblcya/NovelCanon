@@ -707,3 +707,47 @@ def test_pool_submit_shutdown_race_no_hanging_futures() -> None:
             if f.cancelled():
                 continue
             assert f.result() == 1, f"round={_round} 执行结果异常"
+
+
+def test_books_list_endpoint(tmp_path: Path, migrated_db: Engine) -> None:
+    """阶段 11 复审 D：GET /books 返回图书列表（前端选择页一次拿全）。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    app = create_app(migrated_db)
+    client = make_client(app)
+    r = client.get("/books")
+    assert r.status_code == 200
+    books = r.json()
+    assert isinstance(books, list) and books, "至少应有一本书"
+    b = next(x for x in books if x["book_id"] == data["book_id"])
+    assert b["title"]
+    assert b["chapter_count"] == 3
+    assert b["active_run"] == data["run_id"]
+    assert "active_index" in b and "embedding_profile" in b  # 未建索引时可为 null
+
+
+def test_query_sources_carry_span_text(tmp_path: Path, migrated_db: Engine) -> None:
+    """阶段 11 复审 D：/query 的 sources 回填 span_text（前端点击证据展开）。"""
+    from novelcanon.storage.repository import Repository
+
+    data = seed_active_book(migrated_db, tmp_path)
+    app = create_app(migrated_db)
+    client = make_client(app)
+    r = client.post(
+        "/query",
+        json={"question": "萧炎的修为状态", "book_id": data["book_id"]},
+    )
+    assert r.status_code == 200, r.text
+    sources = r.json()["sources"]
+    assert sources, "应有 sources"
+    full = Repository(migrated_db).get_book_text(data["book_id"])
+    chapter_bounds = {
+        c["chapter_id"]: (c["char_start"], c["char_end"])
+        for c in Repository(migrated_db).list_chapters(data["book_id"])
+    }
+    located = [s for s in sources if s.get("span_text") is not None]
+    assert located, "至少一个 source 应带 span_text"
+    for s in located:
+        start, end = chapter_bounds[s["chapter_id"]]
+        cs, ce = s["char_start"], s["char_end"]
+        expect = full[start + cs : start + ce]
+        assert s["span_text"] == expect, "span_text 必须等于原文切片"

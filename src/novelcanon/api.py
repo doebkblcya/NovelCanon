@@ -231,6 +231,45 @@ def _error(status: int, code: str, detail: str | None = None) -> HTTPException:
     return HTTPException(status_code=status, detail={"code": code, "message": detail or ERR[code]})
 
 
+def _attach_span_text(engine: Engine, book_id: str, sources: list[dict]) -> list[dict]:
+    """给 sources 回填 span_text（前端「点击证据展开原文」）。
+
+    章节区间（书内偏移）+ source 的章内 char_start/char_end → 书全文切片。
+    定位缺失的 source（如因果边只有 claim 无定位）跳过，不抛错。
+    """
+    chapter_ids = {
+        s["chapter_id"]
+        for s in sources
+        if s.get("chapter_id") and s.get("char_start") is not None and s.get("char_end") is not None
+    }
+    if not chapter_ids:
+        return sources
+    ph = ", ".join(f":c{n}" for n in range(len(chapter_ids)))
+    params: dict[str, object] = {f"c{n}": c for n, c in enumerate(chapter_ids)}
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                f"SELECT chapter_id, char_start, char_end FROM chapters WHERE chapter_id IN ({ph})"
+            ),
+            params,
+        ).fetchall()
+    bounds = {r[0]: (r[1], r[2]) for r in rows}
+    from novelcanon.storage.repository import Repository
+
+    full = Repository(engine).get_book_text(book_id)
+    out: list[dict] = []
+    for s in sources:
+        d = dict(s)
+        b = bounds.get(s.get("chapter_id"))
+        cs, ce = s.get("char_start"), s.get("char_end")
+        if b is not None and isinstance(cs, int) and isinstance(ce, int) and cs < ce:
+            start = b[0] + max(0, cs)
+            end = b[0] + min(ce, b[1] - b[0])
+            d["span_text"] = full[start:end] if start < end else ""
+        out.append(d)
+    return out
+
+
 # ── 应用工厂 ──────────────────────────────────────────────────
 
 
@@ -407,6 +446,35 @@ def create_app(
     async def health() -> dict:
         return {"status": "ok", "api_version": API_VERSION}
 
+    @app.get("/books")
+    async def list_books() -> list[dict]:
+        """图书列表（前端图书选择页）：id/title + 章节数 + active run/index
+        /embedding profile 状态——一次请求拿全，不用多次往返。"""
+        eng = _open_engine()
+        with eng.connect() as conn:
+            rows = (
+                conn.execute(
+                    text(
+                        "SELECT b.book_id, b.title,"
+                        " (SELECT COUNT(*) FROM chapters c"
+                        "   WHERE c.book_id = b.book_id) AS chapter_count,"
+                        " (SELECT r.run_id FROM extraction_runs r"
+                        "   WHERE r.book_id = b.book_id AND r.status = 'active'"
+                        "   ORDER BY r.rowid DESC LIMIT 1) AS active_run,"
+                        " (SELECT iv.index_version_id FROM index_versions iv"
+                        "   WHERE iv.book_id = b.book_id AND iv.status = 'active')"
+                        "   AS active_index,"
+                        " (SELECT iv.embedding_profile_id FROM index_versions iv"
+                        "   WHERE iv.book_id = b.book_id AND iv.status = 'active')"
+                        "   AS embedding_profile"
+                        " FROM books b ORDER BY b.created_at"
+                    )
+                )
+                .mappings()
+                .fetchall()
+            )
+        return [dict(r) for r in rows]
+
     async def _execute_query(req: QueryRequest) -> QueryResponse:
         # 准入计数读写（同步分支）与 _release_slot 共享 create_app 作用域
         nonlocal _in_flight
@@ -499,6 +567,9 @@ def create_app(
         total = len(all_sources)
         start = (req.page - 1) * req.page_size
         page_sources = all_sources[start : start + req.page_size]
+        # 前端「点击证据展开原文 span」：sources 回填 span_text（章内偏移
+        # → 书全文切片；char_start/end 缺失的 source 跳过）
+        page_sources = _attach_span_text(eng, req.book_id, page_sources)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
         run_version, index_version = _run_versions(req.book_id)
         logger.info(
@@ -562,6 +633,16 @@ def create_app(
             "is_fallback": decision.is_fallback,
             "explain": decision.explain,
         }
+
+    # 静态前端（阶段 11 复审 D：轻量查询页）——挂载在最后，/health /books
+    # /query /explain 等 API 路由优先匹配；目录缺失时 no-op（纯 API 部署）。
+    from pathlib import Path as _Path
+
+    from fastapi.staticfiles import StaticFiles
+
+    _web_static = _Path(__file__).resolve().parent / "web" / "static"
+    if _web_static.is_dir():
+        app.mount("/", StaticFiles(directory=str(_web_static), html=True), name="web")
 
     return app
 

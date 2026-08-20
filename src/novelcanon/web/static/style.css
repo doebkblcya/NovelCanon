@@ -1,0 +1,117 @@
+:root {
+  --bg: #10131a;
+  --panel: #171c26;
+  --panel2: #1e2532;
+  --border: #2a3344;
+  --text: #dbe2ee;
+  --muted: #8b96ab;
+  --accent: #4f8cff;
+  --accent-dim: #2b4a80;
+  --ok: #3fae6a;
+  --warn: #d9a23f;
+  --danger: #d45b5b;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+.app { max-width: 860px; margin: 0 auto; padding: 24px 20px 60px; }
+
+.topbar { display: flex; align-items: baseline; gap: 12px; margin-bottom: 20px; }
+.topbar h1 { margin: 0; font-size: 22px; letter-spacing: 1px; }
+.sub { color: var(--muted); font-size: 13px; }
+
+.controls {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+}
+.row { display: flex; gap: 12px; flex-wrap: wrap; }
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field .label { font-size: 12px; color: var(--muted); }
+.field code { color: var(--accent); background: var(--panel2); padding: 0 4px; border-radius: 4px; font-size: 11px; }
+.book { flex: 2 1 220px; }
+.cutoff, .world { flex: 1 1 130px; }
+
+select, input[type="number"], input[type="text"] {
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 14px;
+  width: 100%;
+}
+select:focus, input:focus { outline: none; border-color: var(--accent); }
+input::placeholder { color: var(--muted); }
+
+.qrow { margin-top: 12px; }
+.qrow input { flex: 1; }
+
+button {
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 14px;
+  padding: 9px 22px;
+  cursor: pointer;
+}
+button:disabled { background: var(--accent-dim); cursor: not-allowed; opacity: 0.7; }
+
+.status { margin-top: 12px; padding: 10px 12px; border-radius: 6px; font-size: 13px; }
+.status.error { background: rgba(212, 91, 91, 0.12); border: 1px solid var(--danger); color: #f0b9b9; }
+.status.loading { background: rgba(79, 140, 255, 0.1); border: 1px solid var(--accent-dim); color: var(--accent); }
+
+.result { margin-top: 20px; }
+.meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.badge {
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 2px 12px;
+  font-size: 12px;
+}
+.badge.danger { background: rgba(212, 91, 91, 0.15); border-color: var(--danger); color: #f0b9b9; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.versions { font-family: var(--mono); }
+
+.answer {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.caveats { margin-top: 8px; font-size: 13px; color: var(--warn); }
+
+.src-heading { font-size: 15px; margin: 22px 0 8px; }
+.sources { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.source {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+.source .head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; cursor: pointer; }
+.source .ord { font-weight: 600; color: var(--accent); }
+.source .kind { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 0 6px; }
+.source .stance { font-size: 11px; }
+.source .stance.supports { color: var(--ok); }
+.source .stance.refutes { color: var(--danger); }
+.source .pos { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+.source .snippet { margin-top: 6px; color: var(--muted); font-size: 13px; overflow: hidden; }
+.source .span { display: none; margin-top: 8px; padding: 10px 12px; background: var(--panel2); border-radius: 6px; font-size: 14px; }
+.source.open .span { display: block; }
+.source.open .snippet { display: none; }
+.toggle-hint { font-size: 11px; color: var(--muted); margin-left: auto; }

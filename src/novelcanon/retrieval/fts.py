@@ -7,10 +7,16 @@
 
 from __future__ import annotations
 
+import re
+
 from sqlalchemy import Engine, text
 from sqlalchemy.engine import Connection
 
 FTS_TOKENIZER_VERSION = "jieba-v1"
+
+# FTS5 MATCH 会把 `?` `*` `"` `()` `:` 等当语法符号——查询词只允许
+# 中英文/数字，纯标点 token 必须丢弃（用户问题天然带标点）。
+_FTS_QUERY_TOKEN = re.compile(r"[0-9A-Za-z\u4e00-\u9fff]")
 
 
 def segment_ws(text: str) -> str:
@@ -18,6 +24,24 @@ def segment_ws(text: str) -> str:
     import jieba  # type: ignore[import-untyped]
 
     return " ".join(jieba.cut(text))
+
+
+def _fts_query_terms(query: str) -> str:
+    """jieba 分词 → 丢弃纯标点 token → 每个词双引号包裹（FTS5 字面量）。
+
+    冒烟实测：用户问题「…是什么人物？」经 jieba 切出 `？` 独立 token，
+    直接拼进 MATCH 触发 fts5: syntax error near "?" → 500。索引侧影子列
+    内容含标点无害（unicode61 索引时忽略），只清洗查询侧。
+    双引号包裹使词按字面匹配（隐含 AND，与原实现语义一致），并防御
+    token 内含 AND/OR/NOT 等 FTS 关键字被误解析。
+    """
+    terms: list[str] = []
+    for tok in re.split(r"\s+", segment_ws(query)):
+        tok = tok.strip()
+        if not tok or not _FTS_QUERY_TOKEN.search(tok):
+            continue  # 纯标点 token 丢弃（FTS5 语法字符）
+        terms.append(f'"{tok.replace(chr(34), "")}"')
+    return " ".join(terms)
 
 
 def insert_shadow(
@@ -92,7 +116,9 @@ def search_shadow(
     cutoff（P1）：observed_ordinal 在 SQL LIMIT 前过滤——后期高排名候选
     不会挤占截止点前的相关结果（避免候选窗口截断后假性无结果）。
     """
-    query_ws = segment_ws(query)
+    query_ws = _fts_query_terms(query)
+    if not query_ws:
+        return []  # 全标点/空查询：无词可查，返回空（不触发 MATCH 语法错误）
     params: dict[str, object] = {"q": query_ws, "b": book_id, "lim": limit}
     cutoff_sql = ""
     if cutoff is not None:
@@ -126,7 +152,10 @@ def search_trigram(
 
     cutoff（P1）：同 search_shadow，SQL LIMIT 前过滤 ordinal。
     """
-    params: dict[str, object] = {"q": f'"{query}"', "b": book_id, "lim": limit}
+    query_clean = query.replace(chr(34), "").strip()
+    if not query_clean:
+        return []  # 空/纯引号查询：无内容可查
+    params: dict[str, object] = {"q": f'"{query_clean}"', "b": book_id, "lim": limit}
     cutoff_sql = ""
     if cutoff is not None:
         cutoff_sql = " AND observed_ordinal <= :cutoff"
