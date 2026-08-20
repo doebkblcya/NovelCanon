@@ -81,39 +81,6 @@ def _constrained_columns() -> list[sa.Column]:
     ]
 
 
-def _unconstrained_columns() -> list[sa.Column]:
-    """0017 upgrade 时的结构（无枚举 CHECK / 无级联，供 downgrade 还原）。"""
-    return [
-        sa.Column("evidence_id", sa.Text, primary_key=True),
-        sa.Column(
-            "claim_version_id",
-            sa.Text,
-            sa.ForeignKey("claims.claim_version_id"),
-            nullable=False,
-        ),
-        sa.Column("evidence_stance", sa.Text, nullable=False, server_default="supports"),
-        sa.Column("evidence_type", sa.Text, nullable=False, server_default="direct"),
-        sa.Column(
-            "chapter_id",
-            sa.Text,
-            sa.ForeignKey("chapters.chapter_id"),
-            nullable=False,
-        ),
-        sa.Column("char_start", sa.Integer, nullable=False),
-        sa.Column("char_end", sa.Integer, nullable=False),
-        sa.Column("span_hash", sa.Text, nullable=False),
-        sa.Column(
-            "literal_match_rate",
-            sa.REAL,
-            sa.CheckConstraint("literal_match_rate >= 0 AND literal_match_rate <= 1"),
-            nullable=False,
-            server_default="0",
-        ),
-        sa.Column("verification_method", sa.Text, nullable=False, server_default=""),
-        sa.Column("verification_run_id", sa.Text, nullable=True),
-    ]
-
-
 def _copy_all(src: str, dst: str) -> None:
     """原样迁移全部行（不按 span 去重，保留 v1/v2 与跨 run 并存）。"""
     op.execute(f"INSERT INTO {dst} ({_EVIDENCE_COLUMNS}) SELECT {_EVIDENCE_COLUMNS} FROM {src}")
@@ -131,8 +98,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # 回 0017 upgrade 后的结构（无枚举 CHECK / 无级联），数据原样保留
-    op.create_table("claim_evidence_0017", *_unconstrained_columns())
+    # 约束收敛迁移：降到 0017 **不撤销约束**——当前 0017 源码已定义强约束
+    # （evidence_stance/evidence_type CHECK + ON DELETE CASCADE），同一个
+    # revision 不得因迁移路径（fresh→0017 vs head→downgrade 0017）产生
+    # 不同 schema。表结构与 upgrade 一致，数据原样保留。
+    op.create_table("claim_evidence_0017", *_constrained_columns())
     _copy_all("claim_evidence", "claim_evidence_0017")
     op.drop_table("claim_evidence")
     op.rename_table("claim_evidence_0017", "claim_evidence")

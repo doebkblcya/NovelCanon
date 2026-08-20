@@ -22,6 +22,7 @@ from novelcanon.pipeline.run import RunManager
 from novelcanon.pipeline.validation import Activator, Validator
 from novelcanon.query.service import QueryService
 from novelcanon.schemas.types import RunStatus
+from novelcanon.storage.engine import create_db_engine
 from tests.test_events import _book_and_chapters, _seed_events
 from tests.test_evidence import _book_and_chapter, build_real_draft
 
@@ -407,3 +408,55 @@ def test_0018_preserves_multiple_verifications(tmp_path, migrated_db: Engine) ->
             {"v": vid},
         ).scalar()
     assert n == 2, f"0018 不得按 span 去重（同 span 多验证须并存）：{n}"
+
+
+def test_0017_schema_path_independent(tmp_path) -> None:
+    """同一 0017 revision 不得因迁移路径产生不同 schema（十七轮 P1）。
+
+    fresh → 0017 与 head → downgrade 0017 的 claim_evidence 表结构、
+    CHECK、FK 级联删除行为必须一致——0018 downgrade 不得恢复弱约束
+    （当前 0017 源码已定义强约束，同 revision 必须 schema 确定）。
+    """
+
+    def migrate(db_path, revision: str, *, downgrade: bool = False) -> None:
+        cfg = Config(ALEMBIC_INI)
+        cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+        if downgrade:
+            command.downgrade(cfg, revision)
+        else:
+            command.upgrade(cfg, revision)
+
+    def schema_sql(engine: Engine) -> str:
+        with engine.connect() as conn:
+            return conn.execute(
+                text("SELECT sql FROM sqlite_master WHERE name = 'claim_evidence'")
+            ).scalar()
+
+    # 路径 A：fresh → 0017
+    db_a = tmp_path / "a.db"
+    engine_a = create_db_engine(db_a)
+    migrate(db_a, "0017_evidence_run_version")
+    assert _alembic_version(engine_a) == "0017_evidence_run_version"
+    sql_a = schema_sql(engine_a)
+    assert "ck_evidence_stance" in sql_a and "ck_evidence_type" in sql_a
+    assert "ON DELETE CASCADE" in sql_a, "fresh→0017 必须带级联删除"
+    book_a, ch_a, text_a = _book_and_chapter(engine_a, tmp_path)
+    run_a = RunManager(engine_a).create(book_a, input_hash="path-a")
+    _assert_schema_constraints(engine_a, ch_a, run_a, "path_a")
+    engine_a.dispose()
+
+    # 路径 B：fresh → head → downgrade 0017
+    db_b = tmp_path / "b.db"
+    engine_b = create_db_engine(db_b)
+    migrate(db_b, "head")
+    migrate(db_b, "0017_evidence_run_version", downgrade=True)
+    assert _alembic_version(engine_b) == "0017_evidence_run_version"
+    sql_b = schema_sql(engine_b)
+    assert "ck_evidence_stance" in sql_b and "ck_evidence_type" in sql_b
+    assert "ON DELETE CASCADE" in sql_b, "head→downgrade 0017 必须保留级联删除"
+    book_b, ch_b, text_b = _book_and_chapter(engine_b, tmp_path)
+    run_b = RunManager(engine_b).create(book_b, input_hash="path-b")
+    _assert_schema_constraints(engine_b, ch_b, run_b, "path_b")
+    engine_b.dispose()
+
+    assert sql_a == sql_b, "fresh→0017 与 head→downgrade 0017 的 claim_evidence schema 必须一致"
