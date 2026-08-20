@@ -251,3 +251,52 @@ def test_all_events_current_version_only(tmp_path: Path, migrated_db: Engine) ->
     assert any("内门弟子" in s for s in summaries), "应返回当前版本"
     assert all(e["claim_version_id"] != data["claims"]["event_linfeng"] for e in events)
     assert new_v in {e["claim_version_id"] for e in events}
+
+
+def test_event_contested_version_does_not_fall_back(
+    tmp_path: Path, migrated_db: Engine
+) -> None:
+    """P0（三轮）：最新版本 contested → 旧 supported 版本不得回退为当前。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    from novelcanon.schemas.ids import event_fact_id
+    from novelcanon.schemas.payloads import EventPayload
+
+    fact = event_fact_id(
+        "拜师", ["ent_linfeng", "ent_qingyunzong"],
+        "ent_qingyunzong", data["chapters"][0], 1,
+    )
+    repo = Repository(migrated_db)
+    # 第 2 版：contested（证据存疑）
+    repo.write_claim(
+        ClaimEnvelope(
+            fact_id=fact,
+            claim_version_id="",
+            claim_type="event",
+            operation=Operation.ASSERT,
+            claim_status=ClaimStatus.CONTESTED,
+            observed_chapter_id=data["chapters"][0],
+            observed_ordinal=0,
+            world_valid_kind="chapter_proxy",
+            world_valid_from=0,
+            created_by_run_id=data["run_id"],
+            created_at="2026-01-01T00:00:00+00:00",
+        ),
+        EventPayload(
+            event_type="拜师",
+            summary="林风拜入青云宗（存疑）",
+            location_entity_id="ent_qingyunzong",
+            sequence_in_chapter=1,
+        ),
+    )
+    qs = QueryService(migrated_db, data["book_id"])
+    events = qs.all_events()
+    summaries = {e["summary"] for e in events}
+    assert "林风拜入青云宗" not in summaries, (
+        "旧 supported 版本不得回退为当前版本"
+    )
+    assert not any("存疑" in s for s in summaries), (
+        "contested 版本不得进入默认查询"
+    )
+    assert "林风拜入青云宗" not in {
+        e["summary"] for e in qs.entity_events("ent_linfeng")
+    }

@@ -330,13 +330,14 @@ class QueryExecutor:
                     )
                 )
         elif qtype == QueryType.RELATION_EVOLUTION:
-            # 版本时间序列（P0）：逐版本返回 assert/update/retract 的实际
-            # 变化（payload/章节/状态/证据），而非只显示版本计数。
-            for r in self._query.one_hop_relations(
-                cid, knowledge_cutoff=knowledge_cutoff, world_at=world_at
+            # 版本时间序列（P0）：从 active 历史按实体枚举全部 relation
+            # fact（含最新版本 retract 的已结束关系），逐 fact 输出
+            # assert/update/retract 的实际变化。
+            for fact_id in self._query.relation_facts_for_entity(
+                cid, knowledge_cutoff=knowledge_cutoff
             ):
                 versions = self._query.relation_evolution(
-                    r["fact_id"], knowledge_cutoff=knowledge_cutoff
+                    fact_id, knowledge_cutoff=knowledge_cutoff
                 )
                 for v in versions:
                     items.append(
@@ -359,8 +360,9 @@ class QueryExecutor:
                 )
                 for p in paths[:5]:
                     tgt = p.get("event") or {}
-                    # 来源 = 形成路径的因果边（event_link 版本）+ 验证证据
-                    # 定位（P0：不再是起始事件或路径深度）
+                    # 来源 = 路径全部因果边（P0）：首条边作主定位，其余边
+                    # 进 extra_evidence，AnswerSource 展开覆盖每条边的版本
+                    # 与验证证据定位（多跳路径的后续边也有引用）。
                     edges = p.get("edge_evidence") or []
                     primary = edges[0] if edges else None
                     items.append(
@@ -385,6 +387,17 @@ class QueryExecutor:
                             evidence_stance=(
                                 primary.get("stance", "") if primary else ""
                             ),
+                            extra_evidence=[
+                                {
+                                    "claim_version_id": e["claim_version_id"],
+                                    "chapter_id": e.get("chapter_id"),
+                                    "observed_ordinal": e.get("observed_ordinal"),
+                                    "char_start": e.get("char_start"),
+                                    "char_end": e.get("char_end"),
+                                    "stance": e.get("stance", "supported"),
+                                }
+                                for e in edges[1:]
+                            ],
                         )
                     )
         else:

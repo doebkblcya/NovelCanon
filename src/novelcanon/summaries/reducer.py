@@ -453,6 +453,20 @@ class HierarchicalReducer:
         )
         content = output.content
         usage = output.usage
+        if usage is not None:
+            # P1：LLM Reduce 的 token 持久化入账（stage='summary'，
+            # run_id 可空 0015）——不只在 SummaryResult.tokens 内存汇总
+            from novelcanon.pipeline.ledger import LedgerEntry, TokenLedger
+
+            TokenLedger(self._engine).record(
+                LedgerEntry(
+                    run_id=None,
+                    book_id=self._book_id,
+                    chapter_id=None,
+                    stage="summary",
+                    usage=usage,
+                )
+            )
         content_hash = stable_config_hash({"content": content})
         summary_id = stable_config_hash(
             {

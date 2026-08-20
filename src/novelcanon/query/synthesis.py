@@ -43,6 +43,10 @@ class ContextItem:
     claim_status: str = ""
     confidence: float | None = None
     evidence_stance: str = ""
+    # 附加证据（P0：一个上下文可携带多条证据定位，如多跳因果路径的
+    # 全部边；每项 {claim_version_id, chapter_id, observed_ordinal,
+    # char_start, char_end, stance}）
+    extra_evidence: list[dict] = field(default_factory=list)
 
     def source_label(self) -> str:
         return f"{self.kind}:{self.claim_type or ''}@{self.observed_ordinal}"
@@ -349,19 +353,39 @@ class SynthesisService:
 
     @staticmethod
     def _sources_from(context: list[ContextItem]) -> list[AnswerSource]:
-        return [
-            AnswerSource(
-                claim_version_id=c.claim_version_id,
-                chapter_id=c.chapter_id,
-                observed_ordinal=c.observed_ordinal,
-                char_start=c.char_start,
-                char_end=c.char_end,
-                stance=c.evidence_stance or c.claim_status or "",
-                kind=c.kind,
-                label=c.source_label(),
+        """上下文 → 证据来源列表；extra_evidence 逐条展开（P0）。
+
+        一个上下文（如多跳因果路径）可携带多条证据定位，来源列表
+        展开后覆盖路径的全部边，保证回答中的每条因果关系都有引用。
+        """
+        sources: list[AnswerSource] = []
+        for c in context:
+            sources.append(
+                AnswerSource(
+                    claim_version_id=c.claim_version_id,
+                    chapter_id=c.chapter_id,
+                    observed_ordinal=c.observed_ordinal,
+                    char_start=c.char_start,
+                    char_end=c.char_end,
+                    stance=c.evidence_stance or c.claim_status or "",
+                    kind=c.kind,
+                    label=c.source_label(),
+                )
             )
-            for c in context
-        ]
+            for e in c.extra_evidence:
+                sources.append(
+                    AnswerSource(
+                        claim_version_id=e.get("claim_version_id"),
+                        chapter_id=e.get("chapter_id"),
+                        observed_ordinal=e.get("observed_ordinal"),
+                        char_start=e.get("char_start"),
+                        char_end=e.get("char_end"),
+                        stance=e.get("stance", "") or "supported",
+                        kind=c.kind,
+                        label=f"{c.source_label()}#edge",
+                    )
+                )
+        return sources
 
     # ── 章节定位辅助（10 §4「返回章节定位」）────────────────────
 

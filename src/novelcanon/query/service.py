@@ -382,6 +382,43 @@ class QueryService:
             out.append(d)
         return out
 
+    def relation_facts_for_entity(
+        self, canonical_id: str, *, knowledge_cutoff: int | None = None
+    ) -> list[str]:
+        """实体参与的全部 relation fact_id（P0：含已结束关系）。
+
+        从 active run 观察的**历史** relation 版本中按实体作用域枚举
+        fact——不要求当前版本 supported/非 retract，因此「关系已结束
+        （最新版本 retract）」的 fact 仍可进入关系演变查询，展示建立、
+        更新、结束的完整时间线。
+        """
+        cutoff_sql = ""
+        params: dict[str, object] = {"book": self._book_id}
+        if knowledge_cutoff is not None:
+            cutoff_sql = " AND c.observed_ordinal <= :cutoff"
+            params["cutoff"] = knowledge_cutoff
+        scope_sql, scope_params = self._scope_sql(
+            self.entity_scope(canonical_id), prefix="f"
+        )
+        params.update(scope_params)
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT DISTINCT c.fact_id"
+                    " FROM claims c"
+                    " JOIN relation_claims r ON r.claim_version_id = c.claim_version_id"
+                    " JOIN claim_observations o ON o.claim_version_id = c.claim_version_id"
+                    " JOIN extraction_runs x ON x.run_id = o.extraction_run_id"
+                    " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
+                    " WHERE ch.book_id = :book AND x.status = 'active'"
+                    "   AND (r.from_entity_id " + scope_sql
+                    + "        OR r.to_entity_id " + scope_sql + ")"
+                    f"{cutoff_sql}"
+                ),
+                params,
+            ).fetchall()
+        return [r[0] for r in rows]
+
     def chapter_citation(self, claim_version_id_value: str) -> dict | None:
         """回答附带的章节定位（chapter_id/ordinal/source span，05 验证项）。"""
         with self._engine.connect() as conn:
@@ -944,10 +981,13 @@ class QueryService:
                         "  JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
                         "  JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
                         "  WHERE r.status = 'active' AND r.book_id = :book"
-                        "    AND c.claim_status = 'supported'"
                         f"    {cutoff_sql}{world_sql}"
                         ") q"
+                        # P0：先按全部状态排名（rn=1），再过滤 supported +
+                        # 非 retract——最新 contested/rejected 版本不会被提前
+                        # 移除，旧 supported 版本不会错误回退为当前版本
                         " WHERE q.rn = 1 AND q.operation != 'retract'"
+                        "   AND q.claim_status = 'supported'"
                         " ORDER BY q.observed_ordinal, q.sequence_in_chapter"
                         " LIMIT :lim"
                     ),
@@ -1264,14 +1304,18 @@ class QueryService:
                         "  JOIN claims c ON c.claim_version_id = e.claim_version_id"
                         "  JOIN claim_observations o ON o.claim_version_id = c.claim_version_id"
                         "  JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
-                        "  JOIN event_participants ep"
-                        "   ON ep.event_claim_version_id = c.claim_version_id"
                         "  WHERE r.status = 'active' AND r.book_id = :book"
-                        "    AND c.claim_status = 'supported'"
-                        f"    AND ep.entity_id {scope_sql}"
                         f"    {cutoff_sql}{world_sql}"
                         ") q"
+                        # P0：先排名再过滤（同 all_events）；参与者匹配移到
+                        # 外层——内层 JOIN participants 会过滤掉无参与者的
+                        # 新版本（如 contested 版），导致旧 supported 版本
+                        # 错误回退为当前。
+                        " JOIN event_participants ep"
+                        "   ON ep.event_claim_version_id = q.claim_version_id"
                         " WHERE q.rn = 1 AND q.operation != 'retract'"
+                        "   AND q.claim_status = 'supported'"
+                        f"   AND ep.entity_id {scope_sql}"
                         " ORDER BY q.observed_ordinal, q.sequence_in_chapter"
                     ),
                     params,

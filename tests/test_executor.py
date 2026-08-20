@@ -23,6 +23,7 @@ from novelcanon.retrieval import (
     build_index,
 )
 from novelcanon.schemas.envelope import ClaimEnvelope
+from novelcanon.schemas.payloads import RelationPayload
 from novelcanon.schemas.types import ClaimStatus, Operation
 from novelcanon.storage.repository import Repository
 from tests.helpers import seed_active_book
@@ -383,3 +384,109 @@ def test_llm_usage_persisted_to_ledger(tmp_path: Path, migrated_db: Engine) -> N
     assert stats["reasoning_tokens"] == 5
     assert stats["retry_count"] == 1
     assert stats["discarded_tokens"] == 3
+
+
+def test_causal_multi_hop_sources_cover_all_edges(
+    tmp_path: Path, migrated_db: Engine
+) -> None:
+    """P0（三轮）：多跳因果路径的 AnswerSource 覆盖全部边（含后续边）。"""
+    from tests.test_events import (
+        _book_and_chapters,
+        _link_events,
+        _seed_events,
+    )
+
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
+    from novelcanon.schemas.ids import alias_fact_id
+    from novelcanon.schemas.memory import AliasClaim
+    from novelcanon.storage.repository import Repository
+
+    Repository(migrated_db).write_alias(
+        AliasClaim(
+            alias_fact_id=alias_fact_id("ent_luchen", "陆尘"),
+            claim_version_id="",
+            canonical_id="ent_luchen",
+            surface_name="陆尘",
+            observed_ordinal=0,
+            observed_chapter_id=ids[0],
+            created_by_run_id=run_id,
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+    )
+    _link_events(migrated_db, book_id, run_id)
+    from novelcanon.query import QueryExecutor, QueryService
+
+    # 找 depth>=2 的路径（多跳：如 遇险→获救→立誓）
+    qs = QueryService(migrated_db, book_id)
+    multi_hop = False
+    for ev_id in version_ids:
+        for p in qs.causal_paths(ev_id):
+            if len(p.get("edge_evidence") or []) >= 2:
+                multi_hop = True
+    assert multi_hop, "测试数据应含多跳因果路径"
+    # 多跳路径的全部边 id
+    expected_edges: set[str] = set()
+    for ev_id in version_ids:
+        for p in qs.causal_paths(ev_id):
+            for e in p.get("edge_evidence") or []:
+                expected_edges.add(e["claim_version_id"])
+    assert len(expected_edges) >= 2, "测试数据应含至少两条已验证因果边"
+    executor = QueryExecutor(migrated_db, book_id)
+    r = executor.ask("陆尘为什么立誓报仇")
+    source_ids = {s["claim_version_id"] for s in r.answer["sources"]}
+    missing = expected_edges - source_ids
+    assert not missing, (
+        f"多跳路径的后续边必须进入 AnswerSource，缺失：{missing}"
+    )
+    edge_source = next(
+        s for s in r.answer["sources"]
+        if s["claim_version_id"] in expected_edges
+    )
+    assert edge_source["chapter_id"] and edge_source["char_start"] is not None
+
+
+def test_relation_evolution_includes_ended_relations(
+    tmp_path: Path, migrated_db: Engine
+) -> None:
+    """P0（三轮）：最新版本 retract 的关系仍可查演变（含结束版本）。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    repo = Repository(migrated_db)
+    from novelcanon.schemas.ids import relation_fact_id
+
+    fact = relation_fact_id("ent_xiaoyan", "恋人", "ent_nalan")
+    # 第 2 版：ch3（ordinal 2）解除婚约（retract）
+    repo.write_claim(
+        ClaimEnvelope(
+            fact_id=fact,
+            claim_version_id="",
+            claim_type="relation",
+            operation=Operation.RETRACT,
+            claim_status=ClaimStatus.SUPPORTED,
+            observed_chapter_id=data["chapters"][2],
+            observed_ordinal=2,
+            world_valid_kind="chapter_proxy",
+            world_valid_from=2,
+            created_by_run_id=data["run_id"],
+            created_at="2026-01-01T00:00:00+00:00",
+        ),
+        RelationPayload(
+            from_entity_id="ent_xiaoyan",
+            to_entity_id="ent_nalan",
+            relation_type="恋人",
+            relation_raw="解除婚约",
+        ),
+    )
+    # 当前关系视图已无此关系（最新版本 retract）
+    qs = QueryService(migrated_db, data["book_id"])
+    assert all(
+        r["relation_type"] != "恋人" for r in qs.one_hop_relations("ent_xiaoyan")
+    )
+    # 但关系演变仍能展示建立 → 结束 完整时间线
+    executor = _executor(migrated_db, data)
+    r = _ask(executor, "萧炎与纳兰嫣然的关系如何变化")
+    answer = r.answer["answer"]
+    assert "[版本 assert]" in answer, "应有建立版本"
+    assert "[版本 retract]" in answer, (
+        f"已结束的关系必须展示 retract 版本：{answer}"
+    )

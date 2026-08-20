@@ -299,3 +299,38 @@ def test_reducer_restore_updates_metadata(
     assert row[0] == 2, f"max ordinal 应恢复为真实值：{row}"
     assert row[1] is None, "确定性模式 profile 应为 NULL"
     assert row[2] == "reducer-v1"
+
+
+def test_llm_reduce_writes_summary_ledger(tmp_path: Path, migrated_db: Engine) -> None:
+    """P1（三轮）：LLM Reduce 的 token 持久化到 token_ledger（stage='summary'）。"""
+    data = seed_active_book(migrated_db, tmp_path)
+    from novelcanon.generation.client import FakeGenerationClient
+    from novelcanon.pipeline.ledger import Usage
+    from novelcanon.summaries import LLMSummarizer
+
+    fake = FakeGenerationClient(
+        {
+            "章节记忆": '{"summary":"卷摘要","key_events":[],"key_entities":[]}',
+            "卷摘要": '{"summary":"全书摘要","key_events":[],"key_entities":[]}',
+        },
+        usage=Usage(input_tokens=30, output_tokens=12, provider="fake", model="m"),
+    )
+    HierarchicalReducer(
+        migrated_db,
+        data["book_id"],
+        summarizer=LLMSummarizer(fake, profile_id="p1"),
+    ).reduce()
+    from sqlalchemy import text
+
+    with migrated_db.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT book_id, stage, input_tokens, output_tokens"
+                " FROM token_ledger WHERE stage = 'summary'"
+            )
+        ).fetchall()
+    assert len(rows) == 2, "卷 + 全书两次调用都应入账"
+    for r in rows:
+        assert r[0] == data["book_id"]
+        assert r[1] == "summary"
+        assert r[2] == 30 and r[3] == 12
