@@ -37,6 +37,29 @@ class Validator:
             fk = conn.execute(text("PRAGMA foreign_key_check")).fetchall()
         if fk:
             issues.append(f"外键完整性检查失败：{len(fk)} 处")
+
+        # P1（十五轮）：激活前硬门禁——该 run 的每个 supported claim 必须有
+        # 至少一条当前验证版本的 evidence 且 primary_evidence_id 非空真实。
+        # 防止 Map checkpoint 复用带入的旧下游 claim（无新 align 证据）泄漏
+        # 进 active，违反「所有正式回答可追溯到 supported evidence」。
+        with self._engine.connect() as conn:
+            orphans = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM claims c"
+                    " JOIN claim_observations o ON o.claim_version_id = c.claim_version_id"
+                    " WHERE o.extraction_run_id = :r AND c.claim_status = 'supported'"
+                    " AND (c.primary_evidence_id IS NULL"
+                    "      OR NOT EXISTS (SELECT 1 FROM claim_evidence ce"
+                    "                     WHERE ce.claim_version_id = c.claim_version_id"
+                    "                       AND ce.evidence_id = c.primary_evidence_id))"
+                ),
+                {"r": run_id},
+            ).scalar()
+        if orphans:
+            issues.append(
+                f"supported 但无有效 primary evidence 的 claim：{orphans} 条"
+                f"（run {run_id}）——不得激活"
+            )
         return issues
 
 

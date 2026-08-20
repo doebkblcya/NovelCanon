@@ -818,3 +818,50 @@ def test_state_raw_value_hard_anchor_value_soft() -> None:
     assert not any(ver.verify(c) is not None for c in cands2), (
         "raw_value 改写句必须拒绝（硬锚缺失）"
     )
+
+
+def test_align_evidence_has_run_and_version(tmp_path, migrated_db: Engine) -> None:
+    """P1（十五轮）：align 生成的证据必须带 verification_run_id，且
+    primary_evidence_id 指向当前验证版本（v2）的 evidence——同一 claim/span
+    的 v1/v2 结果并存、历史 run 可审计。"""
+    book_id, chapter_id, chapter_text = _book_and_chapter(migrated_db, tmp_path)
+    run_id = RunManager(migrated_db).create(book_id, input_hash="evidence-v2")
+    draft = build_real_draft(chapter_id, chapter_text)
+    service = EvidenceService(migrated_db)
+    stats = service.align_chapter(run_id, book_id, draft, chapter_text, "draft_1")
+    assert stats.errors == []
+
+    with migrated_db.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT c.claim_version_id, c.primary_evidence_id, ce.evidence_id,"
+                " ce.verification_method, ce.verification_run_id"
+                " FROM claims c JOIN claim_evidence ce ON ce.claim_version_id = c.claim_version_id"
+                " WHERE c.created_by_run_id = :r ORDER BY c.rowid"
+            ),
+            {"r": run_id},
+        ).fetchall()
+    assert rows, "应有证据"
+    for _vid, primary, evid, method, vrun in rows:
+        assert "/v2" in method, f"证据应为当前验证版本 v2：{method}"
+        assert vrun == run_id, f"verification_run_id 应为 align 的 run：{vrun}"
+        assert primary == evid, f"primary 应指向当前版本证据：{primary} != {evid}"
+
+    # 同一 claim/span 在 v1 规则下应有不同 evidence_id（版本隔离，不覆盖）
+    with migrated_db.connect() as conn:
+        first = conn.execute(
+            text(
+                "SELECT claim_version_id, char_start, char_end, span_hash"
+                " FROM claim_evidence LIMIT 1"
+            )
+        ).fetchone()
+    from novelcanon.schemas.ids import evidence_id
+
+    vid, cs, ce, sh = first
+    id_v1 = evidence_id(vid, chapter_id, cs, ce, sh, verification_version="v1")
+    id_v2 = evidence_id(vid, chapter_id, cs, ce, sh, verification_version="v2")
+    id_v2_runB = evidence_id(
+        vid, chapter_id, cs, ce, sh, verification_version="v2", verification_run_id="run_B"
+    )
+    assert id_v1 != id_v2, "v1/v2 规则下 evidence_id 必须不同（并存不覆盖）"
+    assert id_v2 != id_v2_runB, "不同验证 run 的 evidence_id 必须不同（run 成员关系）"

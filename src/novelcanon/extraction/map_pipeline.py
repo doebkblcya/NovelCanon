@@ -219,7 +219,8 @@ def build_map_process_fn(
                 issues_by_seg: dict[str, list[str]] = {}
                 for issue in quote_issues:
                     for cid in claim_id_to_seg:
-                        if issue.message.startswith(f"claim {cid}"):
+                        # 精确匹配：`claim c1 `（带空格）避免 c1 误匹配 c10
+                        if issue.message.startswith(f"claim {cid} "):
                             issues_by_seg.setdefault(claim_id_to_seg[cid], []).append(issue.message)
                 affected_segs = set(issues_by_seg)
                 repair_segs = (
@@ -287,10 +288,17 @@ def build_map_process_fn(
                 merged = dict(merged)
                 merged["provisional_claims"] = kept
                 draft, issues = validator.validate(merged)
+                # 非阻塞（十五轮）：被剔除 claim 的 issue 不删除——改写为
+                # dropped 标记保留审计，避免候选分母/落库率被抬高而不自知。
                 quote_issues = [
-                    i
+                    Issue(
+                        "literal_quote_missing_dropped",
+                        f"{i.message}（claim 已从 draft 剔除，保持 unverified）",
+                    )
+                    if i.code == "literal_quote_missing"
+                    and any(i.message.startswith(f"claim {cid} ") for cid in missing_claim_ids)
+                    else i
                     for i in quote_issues
-                    if not any(i.message.startswith(f"claim {cid}") for cid in missing_claim_ids)
                 ]
                 if draft is None:
                     return ProcessResult(

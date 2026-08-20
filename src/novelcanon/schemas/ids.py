@@ -149,10 +149,26 @@ def evidence_id(
     char_start: int,
     char_end: int,
     span_hash: str,
+    verification_version: str = "v1",
+    verification_run_id: str = "",
 ) -> str:
-    """基于 claim version 与稳定 source span（§4.3）。"""
+    """基于 claim version 与稳定 source span（§4.3）。
+
+    verification_version / verification_run_id：证据验证成员关系（阶段 11
+    十五轮 P1）——同一 claim/span 在不同验证版本或不同验证 run 下产生
+    不同 evidence_id，从而**并存**（不覆盖、不删除式升级），历史 run 的
+    验证结果可审计。默认 v1/空保持既有调用兼容。
+    """
     digest = _digest(
-        [claim_version_id_value, chapter_id, str(char_start), str(char_end), span_hash]
+        [
+            claim_version_id_value,
+            chapter_id,
+            str(char_start),
+            str(char_end),
+            span_hash,
+            verification_version,
+            verification_run_id,
+        ]
     )
     return f"ev_{digest}"
 

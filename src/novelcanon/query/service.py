@@ -67,6 +67,28 @@ class QueryService:
     def __init__(self, engine: Engine, book_id: str) -> None:
         self._engine = engine
         self._book_id = book_id
+        self._active_run_cache: str | None | bool = None  # None=未查，False=无 active
+
+    def _active_run_id(self) -> str | None:
+        """当前 book 的 active run id（证据过滤用，P1 十五轮）。
+
+        0017 允许同 claim/span 多验证并存后，evidence 按 verification_run_id
+        隔离——查询只返回 active run 的验证结果（失败 run 写入的同 claim
+        证据不得改变旧 active 查询）。"""
+        if self._active_run_cache is None:
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT run_id FROM extraction_runs"
+                        " WHERE book_id = :b AND status = 'active'"
+                    ),
+                    {"b": self._book_id},
+                ).fetchone()
+            self._active_run_cache = str(row[0]) if row else False
+        cached: str | None | bool = self._active_run_cache
+        if isinstance(cached, str):
+            return cached
+        return None
 
     # ── canonical 展开（阶段 08：mention → canonical 投影解析）────
 
@@ -503,6 +525,26 @@ class QueryService:
 
     def chapter_citation(self, claim_version_id_value: str) -> dict | None:
         """回答附带的章节定位（chapter_id/ordinal/source span，05 验证项）。"""
+        active_run = self._active_run_id()
+        if active_run is None:
+            with self._engine.connect() as conn:
+                row = (
+                    conn.execute(
+                        text(
+                            "SELECT c.observed_chapter_id, c.observed_ordinal,"
+                            " e.chapter_id AS evidence_chapter, e.char_start, e.char_end,"
+                            " e.span_hash"
+                            " FROM claims c"
+                            " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
+                            " LEFT JOIN claim_evidence e ON e.claim_version_id = c.claim_version_id"
+                            " WHERE c.claim_version_id = :v AND ch.book_id = :book LIMIT 1"
+                        ),
+                        {"v": claim_version_id_value, "book": self._book_id},
+                    )
+                    .mappings()
+                    .fetchone()
+                )
+            return dict(row) if row else None
         with self._engine.connect() as conn:
             row = (
                 conn.execute(
@@ -512,24 +554,42 @@ class QueryService:
                         " FROM claims c"
                         " JOIN chapters ch ON c.observed_chapter_id = ch.chapter_id"
                         " LEFT JOIN claim_evidence e ON e.claim_version_id = c.claim_version_id"
+                        "   AND (e.verification_run_id IS NULL OR e.verification_run_id = :vr)"
                         " WHERE c.claim_version_id = :v AND ch.book_id = :book LIMIT 1"
                     ),
-                    {"v": claim_version_id_value, "book": self._book_id},
+                    {"v": claim_version_id_value, "book": self._book_id, "vr": active_run},
                 )
                 .mappings()
                 .fetchone()
             )
-            return dict(row) if row else None
+        return dict(row) if row else None
 
     def _evidence_for(self, claim_version_id_value: str) -> list[dict]:
+        active_run = self._active_run_id()
+        if active_run is None:
+            # 无 active run（测试/未激活场景）：返回全部证据（旧语义）
+            with self._engine.connect() as conn:
+                rows = (
+                    conn.execute(
+                        text(
+                            "SELECT evidence_id, evidence_stance, chapter_id, char_start,"
+                            " char_end, span_hash FROM claim_evidence WHERE claim_version_id = :v"
+                        ),
+                        {"v": claim_version_id_value},
+                    )
+                    .mappings()
+                    .fetchall()
+                )
+            return [dict(r) for r in rows]
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     text(
                         "SELECT evidence_id, evidence_stance, chapter_id, char_start, char_end,"
                         " span_hash FROM claim_evidence WHERE claim_version_id = :v"
+                        " AND (verification_run_id IS NULL OR verification_run_id = :r)"
                     ),
-                    {"v": claim_version_id_value},
+                    {"v": claim_version_id_value, "r": active_run},
                 )
                 .mappings()
                 .fetchall()

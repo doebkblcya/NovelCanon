@@ -95,6 +95,7 @@ async def _full_run(
     concurrency: int = 2,
     timeout_seconds: float = 1.0,
     threshold: float = 0.0,
+    reuse_materialized_products: bool = True,
 ) -> tuple[str, object, list[str] | None]:
     mgr = RunManager(engine)
     run_id = mgr.create(BOOK, input_hash="ih1")
@@ -105,6 +106,7 @@ async def _full_run(
         BOOK,
         concurrency=concurrency,
         retry_policy=RetryPolicy(max_attempts=3, base_delay=0.01),
+        reuse_materialized_products=reuse_materialized_products,
     )
     summary = await runner.run(tasks, process_fn, timeout_seconds=timeout_seconds)
     issues = finish_run(
@@ -223,6 +225,70 @@ def test_checkpoint_reuse_skips_provider(migrated_db: Engine) -> None:
         assert summary.reused == 2 and summary.completed == 2
         assert calls == ["ch1", "ch2"], "复用不得再次调用 provider"
         assert RunManager(migrated_db).get(run2)["status"] == RunStatus.ACTIVE.value
+
+    asyncio.run(main())
+
+
+def test_map_reuse_does_not_leak_downstream_claims(migrated_db: Engine) -> None:
+    """P1（十五轮）：Map checkpoint 复用只复制 draft，不关联来源 run 的已
+    物化 claims——否则证据版本升级后未通过新 align 的旧 claim 泄漏进
+    active（supported 无 evidence）。"""
+    _ensure_book(migrated_db)
+    tasks = [_task("ch1", "相同内容"), _task("ch2")]
+    calls: list[str] = []
+
+    async def main() -> None:
+        # run1：正常跑完并激活（有物化 claims 成员关系）
+        run1, _, issues1 = await _full_run(migrated_db, tasks, _make_provider(calls))
+        assert issues1 is None
+        # 模拟：给 run1 造一条 materialized claim（align 产物）
+        from novelcanon.storage.repository import now_iso
+
+        with migrated_db.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO claims (fact_id, claim_version_id, claim_type, operation,"
+                    " claim_status, observed_chapter_id, observed_ordinal, created_by_run_id,"
+                    " created_at) VALUES ('fact_x', 'ver_x', 'state', 'assert',"
+                    " 'supported', 'ch1', 1, :r, :ts)"
+                ),
+                {"r": run1, "ts": now_iso()},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO claim_observations (claim_version_id, extraction_run_id,"
+                    " observed_at) VALUES ('ver_x', :r, :ts)"
+                ),
+                {"r": run1, "ts": now_iso()},
+            )
+
+        # run2：同键复用 Map draft，但关闭 materialized products 复用
+        run2, s2, issues2 = await _full_run(
+            migrated_db,
+            tasks,
+            _make_provider(calls),
+            reuse_materialized_products=False,
+        )
+        assert issues2 is None
+        assert s2.reused == 2
+        # run2 不得看到 run1 的 materialized claim
+        with migrated_db.connect() as conn:
+            n = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM claim_observations o"
+                    " JOIN claims c ON c.claim_version_id = o.claim_version_id"
+                    " WHERE o.extraction_run_id = :r AND c.claim_version_id = 'ver_x'"
+                ),
+                {"r": run2},
+            ).scalar()
+        assert n == 0, f"Map 复用不得泄漏下游 claims：{n}"
+        # 对照：默认开启时（下游阶段复用）仍会关联——但激活硬门禁必须
+        # 拦截 supported 无 evidence 的 claim（P1：防旧 claim 泄漏进 active）
+        run3, _, issues3 = await _full_run(migrated_db, tasks, _make_provider(calls))
+        assert issues3 is not None, "复用开启时应被激活门禁拦截"
+        assert any("supported 但无有效 primary evidence" in i for i in issues3), issues3
+        # 门禁拦截后 run3 不激活
+        assert RunManager(migrated_db).get(run3)["status"] != RunStatus.ACTIVE.value
 
     asyncio.run(main())
 

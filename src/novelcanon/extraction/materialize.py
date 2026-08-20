@@ -326,10 +326,20 @@ def materialize_draft(
             etype = getattr(ev, "evidence_type", EvidenceType.DIRECT)
             rate = getattr(ev, "literal_match_rate", 1.0)
             method = getattr(ev, "verification_method", "hash-exact")
+            # P1（十五轮）：证据验证结果必须带 run/version 成员关系——
+            # verification_run_id 记录验证发生的 run，evidence_id 含验证版本，
+            # 使同一 claim/span 的 v1/v2 结果并存、历史 run 可审计。
+            verify_version = method.rsplit("/", 1)[-1] if "/" in method else "v1"
             evidences.append(
                 EvidenceRecord(
                     evidence_id=evidence_id(
-                        version_id, ev.chapter_id, ev.char_start, ev.char_end, sha256(span)
+                        version_id,
+                        ev.chapter_id,
+                        ev.char_start,
+                        ev.char_end,
+                        sha256(span),
+                        verification_version=verify_version,
+                        verification_run_id=run_id,
                     ),
                     claim_version_id=version_id,
                     evidence_stance=stance,
@@ -340,6 +350,7 @@ def materialize_draft(
                     span_hash=sha256(span),
                     literal_match_rate=rate,
                     verification_method=method,
+                    verification_run_id=run_id,
                 )
             )
 

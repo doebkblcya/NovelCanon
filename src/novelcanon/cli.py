@@ -305,6 +305,9 @@ def _run_extract(
         book_id,
         concurrency=concurrency,
         staging=MapStaging(),
+        # P1（十五轮）：Map 复用只复制 draft，不关联来源 run 的已物化 claims
+        # ——否则证据版本升级后旧 claim 泄漏进 active（supported 无 evidence）。
+        reuse_materialized_products=False,
     )
     summary = asyncio.run(
         runner.run(

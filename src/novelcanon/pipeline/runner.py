@@ -97,7 +97,17 @@ class PipelineRunner:
         checkpoint: CheckpointService | None = None,
         ledger: TokenLedger | None = None,
         staging: StagingWriter | None = None,
+        reuse_materialized_products: bool = True,
     ) -> None:
+        """reuse_materialized_products：checkpoint 复用是否把来源 run 的**已
+        物化下游产物**（claims/aliases/mentions 成员关系）关联到新 run。
+
+        阶段 11 十五轮 P1：Map 阶段（staging=MapStaging）必须关闭——Map
+        复用只应复制 draft；若连带关联来源 run 的 claims，证据版本升级
+        （v1→v2）后未通过新 align 的旧 claim 会继续进入 active（真实数据
+        出现 1 条 supported 无 evidence 的 state claim）。align/link 等
+        下游阶段可开启（其复用依赖成员关系）。
+        """
         self._engine = engine
         self._run_id = run_id
         self._book_id = book_id
@@ -110,6 +120,7 @@ class PipelineRunner:
         self._ledger = ledger or TokenLedger(engine)
         self._repo = Repository(engine)
         self._staging = staging
+        self._reuse_materialized_products = reuse_materialized_products
 
     async def run(
         self,
@@ -304,12 +315,15 @@ class PipelineRunner:
                         )
                         # 复用章节：仅把来源 run 明确拥有的产物关联到当前 run
                         # （成员关系按 source_run 复制，失败 run 的 staging 不泄漏）
-                        self._repo.associate_chapter_products(
-                            conn,
-                            self._run_id,
-                            source_run_id,
-                            str(task.checkpoint_fields["chapter_id"]),
-                        )
+                        # P1（十五轮）：Map 阶段关闭——复用只复制 draft，不关联
+                        # 已物化 claims（否则证据版本升级后旧 claim 泄漏进 active）。
+                        if self._reuse_materialized_products:
+                            self._repo.associate_chapter_products(
+                                conn,
+                                self._run_id,
+                                source_run_id,
+                                str(task.checkpoint_fields["chapter_id"]),
+                            )
                         if self._staging is not None:
                             self._staging.write(
                                 conn,
