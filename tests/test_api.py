@@ -601,3 +601,54 @@ def test_openai_embedder_close_lifecycle() -> None:
     injected.close()
     assert not external.is_closed, "外部注入的 client 不应被 adapter close"
     external.close()
+
+
+def test_process_exits_with_stuck_pool_task() -> None:
+    """复审 P1/P2：存在运行中卡死任务时，lifespan 关闭后进程仍可在限定
+    时间内退出。
+
+    CPython 3.13/3.14 ThreadPoolExecutor 的 worker 是**非 daemon**——
+    卡死任务会在解释器退出时被 join、阻止进程关闭。api 使用
+    _DaemonThreadPoolExecutor（worker daemon=True）后，运行中任务不再
+    阻塞退出。本测试在**子进程**中验证：提交永不结束的任务 → lifespan
+    关闭 → 进程在 30s 内正常退出（非 daemon 行为会在 timeout 处被杀）。
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent(
+        """
+        import asyncio
+        import time
+
+        from novelcanon.api import create_app
+
+        class Stuck:
+            def ask(self, *args, **kwargs):  # noqa: ANN002, ANN003
+                time.sleep(300)  # 卡死：永不返回（模拟下游彻底卡住）
+                raise AssertionError("不应到达这里")
+
+        app = create_app(None, request_timeout=0.1, executor_factory=lambda b: Stuck())
+
+        async def main() -> None:
+            ctx = app.router.lifespan_context(app)
+            await ctx.__aenter__()
+            pool = app.state.executor_pool
+            # 启动一个**运行中**的卡死任务（模拟超时后仍在后台跑的查询）
+            pool.submit(time.sleep, 300)
+            await asyncio.sleep(0.2)  # 确保任务已进入 worker 线程运行
+            await ctx.__aexit__(None, None, None)  # lifespan 关闭（不阻塞）
+            print("LIFESPAN_DONE")
+
+        asyncio.run(main())
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=30,  # 非 daemon 行为会因 join 卡死任务而在这里被杀
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "LIFESPAN_DONE" in proc.stdout, proc.stdout

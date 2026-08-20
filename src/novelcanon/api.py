@@ -32,10 +32,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import queue
+import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI, HTTPException, Request
@@ -66,6 +68,83 @@ _POOL_MAX_WORKERS = 4
 # 同步 executor 后台执行时的完成轮询间隔（秒）——轮询 future.done()
 # 不依赖事件循环线程调度通知；间隙让出事件循环，保证 /health 可响应。
 _POLL_INTERVAL = 0.05
+
+# 空闲 worker 的队列轮询间隔（秒）——shutdown 后 worker 在间隔内退出。
+_WORKER_IDLE_POLL = 1.0
+
+
+class _DaemonQueryPool:
+    """自管 daemon 工作线程池（复审 P1/P2）。
+
+    **不能用 ThreadPoolExecutor**：CPython 3.13/3.14 的 worker 非 daemon，
+    且 ``concurrent.futures.thread`` 注册了 atexit ``_python_exit``——无论
+    worker 是否 daemon，解释器退出时都会显式 join 所有线程；运行中的
+    卡死任务会**阻止进程关闭**（实测 daemon 化后子进程仍被 join 拖死）。
+
+    本池自管 daemon 线程（threading.Thread(daemon=True) + queue.Queue，
+    **不注册 concurrent.futures 的 atexit join**）：解释器退出时 daemon
+    线程被直接终止，卡死任务永不阻塞进程退出。对外仍返回
+    ``concurrent.futures.Future``（done()/result()/add_done_callback/
+    cancel 语义与 ThreadPoolExecutor 一致，轮询与 done callback 逻辑
+    不变）。
+
+    - 运行中任务无法强制中断：资源回收由**严格下游超时**保障
+      （embedding adapter / LLM client 均有有限超时，线程最终自然结束）；
+    - shutdown(wait=False, cancel_futures=True)：取消**排队未开始**的
+      任务，唤醒 worker 退出；运行中任务继续执行到下游超时为止。
+    """
+
+    def __init__(self, max_workers: int) -> None:
+        self._max_workers = max_workers
+        self._queue: queue.Queue[tuple[Future, Callable, tuple, dict] | None] = queue.Queue()
+        self._shutdown = False
+        self._threads: list[threading.Thread] = []
+        for _ in range(max_workers):
+            t = threading.Thread(target=self._run, name="dsh-query-worker", daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def submit(self, fn: Callable, /, *args: object, **kwargs: object) -> Future:
+        if self._shutdown:
+            raise RuntimeError("cannot schedule new futures after shutdown")
+        future: Future = Future()
+        self._queue.put((future, fn, args, kwargs))
+        return future
+
+    def _run(self) -> None:
+        while True:
+            try:
+                item = self._queue.get(timeout=_WORKER_IDLE_POLL)
+            except queue.Empty:
+                if self._shutdown:
+                    return
+                continue
+            if item is None:
+                return
+            future, fn, args, kwargs = item
+            if not future.set_running_or_notify_cancel():
+                continue  # 已被 cancel：不执行
+            try:
+                future.set_result(fn(*args, **kwargs))
+            except BaseException as exc:  # noqa: BLE001 —— Future 承载任务异常
+                future.set_exception(exc)
+
+    def shutdown(self, *, wait: bool = False, cancel_futures: bool = False) -> None:
+        """取消排队任务并唤醒 worker 退出；运行中任务继续（daemon，不
+        阻塞进程退出）。wait 参数保留以兼容 ThreadPoolExecutor 语义
+        （本池 daemon 线程无需 join）。"""
+        del wait
+        self._shutdown = True
+        if cancel_futures:
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not None:
+                    item[0].cancel()
+        for _ in range(self._max_workers):
+            self._queue.put(None)
 
 
 # ── 请求 / 响应模型 ───────────────────────────────────────────
@@ -171,9 +250,10 @@ def create_app(
     limiter = rate_limit or RateLimiter()
     _engine = engine
     # 同步 executor 的后台执行池（复审 P0：隔离事件循环 + 可超时；
-    # 复审 P1：有界准入 + lifespan 清理）。等待用轮询 future.done()，
-    # 不依赖 wrap_future 的完成通知。
-    _pool = ThreadPoolExecutor(max_workers=_POOL_MAX_WORKERS)
+    # 复审 P1：有界准入 + lifespan 清理；复审 P2：自管 daemon worker——
+    # 不注册 concurrent.futures atexit join，卡死任务不阻止进程退出）。
+    # 等待用轮询 future.done()，不依赖 wrap_future 的完成通知。
+    _pool = _DaemonQueryPool(max_workers=_POOL_MAX_WORKERS)
     # 正在执行的同步查询数（含超时后仍在后台运行的线程）——达到容量即
     # 饱和拒绝（503），防止卡住任务占满池后正常查询无限排队。
     _in_flight = 0
@@ -183,12 +263,14 @@ def create_app(
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
-        """FastAPI 生命周期：应用关闭时释放生产资源（复审 P1）。
+        """FastAPI 生命周期：应用关闭时释放生产资源（复审 P1/P2）。
 
         - 关闭 embedding 后端（adapter 实现 close → httpx.Client 关闭，
           连接/文件描述符不泄漏）；
-        - 关闭查询执行池（cancel_futures 取消排队任务；正在运行的线程
-          为 daemon，进程退出即回收，不阻塞关闭）。
+        - 关闭查询执行池：cancel_futures 取消排队任务；正在运行的任务
+          无法中断，但 (a) 下游调用携带严格超时（线程最终自然结束）且
+          (b) worker 已 daemon 化（_DaemonThreadPoolExecutor）——即使
+          极端卡死也不阻塞解释器退出（进程可正常关闭）。
         """
         try:
             yield

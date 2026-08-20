@@ -41,6 +41,7 @@ class OpenAICompatEmbedder:
         base_url: str,
         model: str = "",
         api_key: str = "",
+        timeout_seconds: float = 30.0,
         client: httpx.Client | None = None,
     ) -> None:
         if profile.vector_dimension < 1:
@@ -56,7 +57,12 @@ class OpenAICompatEmbedder:
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         self._owns_client = client is None
-        self._client = client or httpx.Client(headers=headers, timeout=httpx.Timeout(30.0))
+        # 严格下游超时（复审 P2）：embedding 调用必须携带有限超时——线程池
+        # 中运行的查询任务无法被强制中断，超时保障线程最终自然结束（配合
+        # daemon worker，进程关闭不被拖住）。外部注入 client 时由外部管理。
+        self._client = client or httpx.Client(
+            headers=headers, timeout=httpx.Timeout(timeout_seconds)
+        )
         self._url = f"{base_url.rstrip('/')}/embeddings"
 
     def close(self) -> None:
