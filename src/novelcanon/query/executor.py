@@ -330,14 +330,19 @@ class QueryExecutor:
                     )
                 )
         elif qtype == QueryType.RELATION_EVOLUTION:
-            # 版本时间序列（P0）：从 active 历史按实体枚举全部 relation
+            # 版本时间序列（P0/P1）：从 active 历史按实体枚举全部 relation
             # fact（含最新版本 retract 的已结束关系），逐 fact 输出
-            # assert/update/retract 的实际变化。
+            # assert/update/retract 的实际变化；world_at 参与版本过滤
+            # （双时间契约：不同世界时间返回不同可见时间线）。
             for fact_id in self._query.relation_facts_for_entity(
-                cid, knowledge_cutoff=knowledge_cutoff
+                cid,
+                knowledge_cutoff=knowledge_cutoff,
+                world_at=world_at,
             ):
                 versions = self._query.relation_evolution(
-                    fact_id, knowledge_cutoff=knowledge_cutoff
+                    fact_id,
+                    knowledge_cutoff=knowledge_cutoff,
+                    world_at=world_at,
                 )
                 for v in versions:
                     items.append(
@@ -360,6 +365,19 @@ class QueryExecutor:
                 )
                 for p in paths[:5]:
                     tgt = p.get("event") or {}
+                    # 正文 = 路径全部事件（P0：A → B → C，中间事件进入生成
+                    # 上下文，模型不会把间接链写成直接因果）
+                    chain_events = [
+                        e
+                        for e in (p.get("path_events") or [])
+                        if e and e.get("summary")
+                    ]
+                    if len(chain_events) >= 2:
+                        chain = " → ".join(e["summary"] for e in chain_events)
+                    else:
+                        chain = (
+                            f"{ev['summary']} → {tgt.get('summary', p['tgt'])}"
+                        )
                     # 来源 = 路径全部因果边（P0）：首条边作主定位，其余边
                     # 进 extra_evidence，AnswerSource 展开覆盖每条边的版本
                     # 与验证证据定位（多跳路径的后续边也有引用）。
@@ -379,8 +397,7 @@ class QueryExecutor:
                             char_start=primary.get("char_start") if primary else None,
                             char_end=primary.get("char_end") if primary else None,
                             content=(
-                                f"因果链(置信度{p['conf']:.2f})：{ev['summary']}"
-                                f" → {tgt.get('summary', p['tgt'])}"
+                                f"因果链(置信度{p['conf']:.2f})：{chain}"
                                 f"（{len(edges)} 条已验证因果边）"
                             ),
                             claim_status="supported",

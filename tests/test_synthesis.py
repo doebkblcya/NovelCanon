@@ -134,3 +134,40 @@ def test_context_id_changes_with_context(tmp_path: Path, migrated_db: Engine) ->
     assert r1.context_id != r2.context_id
     r3 = svc.answer("q", route="s", query_type="t", context=CTX)
     assert r1.context_id == r3.context_id  # 同上下文稳定
+
+
+def test_context_id_includes_extra_evidence(tmp_path: Path, migrated_db: Engine) -> None:
+    import dataclasses
+
+    """P1（四轮）：context_id 哈希包含 extra_evidence（多跳后续边变化即变）。"""
+    svc = SynthesisService(migrated_db, "book_x")
+    base = CTX[0]
+    c1 = ContextItem(
+        kind=base.kind,
+        claim_type=base.claim_type,
+        claim_version_id=base.claim_version_id,
+        chapter_id=base.chapter_id,
+        observed_ordinal=base.observed_ordinal,
+        char_start=base.char_start,
+        char_end=base.char_end,
+        content=base.content,
+    )
+    c2 = dataclasses.replace(
+        c1,
+        extra_evidence=[
+            {"claim_version_id": "ver_edge2", "chapter_id": "ch3", "observed_ordinal": 4}
+        ],
+    )
+    r1 = svc.answer("q", route="s", query_type="t", context=[c1])
+    r2 = svc.answer("q", route="s", query_type="t", context=[c2])
+    assert r1.context_id != r2.context_id, "extra_evidence 变化必须改变 context_id"
+    # span 变化也影响
+    c3 = dataclasses.replace(
+        c1,
+        extra_evidence=[
+            {"claim_version_id": "ver_edge2", "chapter_id": "ch3", "observed_ordinal": 4},
+            {"claim_version_id": "ver_edge3", "chapter_id": "ch5"},
+        ],
+    )
+    r3 = svc.answer("q", route="s", query_type="t", context=[c3])
+    assert r2.context_id != r3.context_id

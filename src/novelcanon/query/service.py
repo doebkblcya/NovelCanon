@@ -338,27 +338,33 @@ class QueryService:
         return [dict(r) for r in rows]
 
     def relation_evolution(
-        self, fact_id: str, *, knowledge_cutoff: int | None = None
+        self,
+        fact_id: str,
+        *,
+        knowledge_cutoff: int | None = None,
+        world_at: int | None = None,
     ) -> list[dict]:
         """关系版本时间序列（P0：claim 版本时间序列路线）。
 
         某 relation fact 的完整版本演进：按写入序返回每个版本的
         operation/claim_status/observed 章节/relation payload 与证据——
         关系演变回答逐版本呈现 assert/update/retract 的实际变化，而非
-        只显示版本计数。仅限 active run 观察过的版本，cutoff 截断披露。
+        只显示版本计数。仅限 active run 观察过的版本，cutoff 截断披露；
+        world_at（P1）：版本的世界有效区间须覆盖该世界时间点（双时间
+        契约——不同世界时间返回不同的可见时间线）。
         """
-        cutoff_sql = ""
+        cutoff_sql, cutoff_params = _cutoff_sql(knowledge_cutoff)
+        world_sql, world_params = _world_sql(world_at)
         params: dict[str, object] = {"f": fact_id, "book": self._book_id}
-        if knowledge_cutoff is not None:
-            cutoff_sql = " AND c.observed_ordinal <= :cutoff"
-            params["cutoff"] = knowledge_cutoff
+        params.update(cutoff_params)
+        params.update(world_params)
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     text(
                         "SELECT DISTINCT c.claim_version_id, c.operation,"
                         " c.supersedes_version_id, c.claim_status, c.observed_ordinal,"
-                        " c.observed_chapter_id, c.confidence,"
+                        " c.observed_chapter_id, c.confidence, c.world_valid_kind,"
                         " r.from_entity_id, r.to_entity_id, r.relation_type,"
                         " r.relation_raw"
                         " FROM claims c"
@@ -368,7 +374,7 @@ class QueryService:
                         " JOIN relation_claims r ON r.claim_version_id = c.claim_version_id"
                         " WHERE c.fact_id = :f AND ch.book_id = :book"
                         "   AND x.status = 'active'"
-                        f"{cutoff_sql} ORDER BY c.rowid"
+                        f"{cutoff_sql}{world_sql} ORDER BY c.rowid"
                     ),
                     params,
                 )
@@ -383,20 +389,25 @@ class QueryService:
         return out
 
     def relation_facts_for_entity(
-        self, canonical_id: str, *, knowledge_cutoff: int | None = None
+        self,
+        canonical_id: str,
+        *,
+        knowledge_cutoff: int | None = None,
+        world_at: int | None = None,
     ) -> list[str]:
         """实体参与的全部 relation fact_id（P0：含已结束关系）。
 
         从 active run 观察的**历史** relation 版本中按实体作用域枚举
         fact——不要求当前版本 supported/非 retract，因此「关系已结束
         （最新版本 retract）」的 fact 仍可进入关系演变查询，展示建立、
-        更新、结束的完整时间线。
+        更新、结束的完整时间线。world_at（P1）：枚举的 fact 版本须在
+        该世界时间点可见（双时间契约）。
         """
-        cutoff_sql = ""
+        cutoff_sql, cutoff_params = _cutoff_sql(knowledge_cutoff)
+        world_sql, world_params = _world_sql(world_at)
         params: dict[str, object] = {"book": self._book_id}
-        if knowledge_cutoff is not None:
-            cutoff_sql = " AND c.observed_ordinal <= :cutoff"
-            params["cutoff"] = knowledge_cutoff
+        params.update(cutoff_params)
+        params.update(world_params)
         scope_sql, scope_params = self._scope_sql(
             self.entity_scope(canonical_id), prefix="f"
         )
@@ -413,7 +424,7 @@ class QueryService:
                     " WHERE ch.book_id = :book AND x.status = 'active'"
                     "   AND (r.from_entity_id " + scope_sql
                     + "        OR r.to_entity_id " + scope_sql + ")"
-                    f"{cutoff_sql}"
+                    f"{cutoff_sql}{world_sql}"
                 ),
                 params,
             ).fetchall()
@@ -517,6 +528,9 @@ class QueryService:
                         "   AND v.extraction_run_id = r.run_id"
                         "  WHERE l.source_event_id = :start AND r.status = 'active'"
                         "    AND r.book_id = :book AND v.claim_status = 'supported'"
+                        # P0：只展开正向因果（causes/enables）——prevents
+                        # 是否定/阻止关系，不得被解释为「A 导致 B」
+                        "    AND l.relation_type IN ('causes','enables')"
                         f"    {cutoff_sql}{world_sql}"
                         "  UNION ALL"
                         "  SELECT c.src, l.target_event_id,"
@@ -534,6 +548,7 @@ class QueryService:
                         "   AND v.extraction_run_id = r.run_id"
                         "  WHERE r.status = 'active' AND r.book_id = :book"
                         "    AND v.claim_status = 'supported'"
+                        "    AND l.relation_type IN ('causes','enables')"
                         f"    {cutoff_sql}{world_sql}"
                         "    AND c.depth < :depth"
                         "    AND instr(c.visited, l.target_event_id) = 0"
@@ -554,6 +569,12 @@ class QueryService:
             # 验证证据的章节/span，不是起始事件或路径深度）
             edge_ids = [e for e in (d.get("edges") or "").split(",") if e]
             d["edge_evidence"] = self._link_evidence_map(edge_ids)
+            # 路径全部事件摘要（P0：多跳正文含中间事件，A → B → C，
+            # 模型看到的不是省略中间节点的直接因果）
+            event_ids = [e for e in (d.get("path") or "").split(">") if e]
+            d["path_events"] = [
+                self._event_summary(eid) for eid in event_ids if eid
+            ]
             out.append(d)
         return out
 
@@ -745,6 +766,10 @@ class QueryService:
             d["event"] = self._event_summary(d["src"])
             edge_ids = [e for e in (d.get("edges") or "").split(",") if e]
             d["edge_evidence"] = self._link_evidence_map(edge_ids)
+            event_ids = [e for e in (d.get("path") or "").split("<") if e]
+            d["path_events"] = [
+                self._event_summary(eid) for eid in event_ids if eid
+            ]
             out.append(d)
         return out
 

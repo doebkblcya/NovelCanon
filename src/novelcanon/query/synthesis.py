@@ -145,6 +145,9 @@ class SynthesisService:
                         "chapter_id": c.chapter_id,
                         "ordinal": c.observed_ordinal,
                         "content": c.content,
+                        # P1：附加证据（多跳后续边）也进入上下文 hash——
+                        # 边或 span 变化时 context_id 随之变化
+                        "extra_evidence": c.extra_evidence,
                     }
                     for c in context
                 ],

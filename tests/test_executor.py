@@ -490,3 +490,72 @@ def test_relation_evolution_includes_ended_relations(
     assert "[版本 retract]" in answer, (
         f"已结束的关系必须展示 retract 版本：{answer}"
     )
+
+
+def test_causal_chain_body_contains_middle_event(
+    tmp_path: Path, migrated_db: Engine
+) -> None:
+    """P0（四轮）：多跳因果正文含中间事件（A → B → C，非直接因果）。"""
+    from tests.test_events import (
+        _book_and_chapters,
+        _link_events,
+        _seed_events,
+    )
+
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
+    from novelcanon.schemas.ids import alias_fact_id
+    from novelcanon.schemas.memory import AliasClaim
+    from novelcanon.storage.repository import Repository
+
+    Repository(migrated_db).write_alias(
+        AliasClaim(
+            alias_fact_id=alias_fact_id("ent_luchen", "陆尘"),
+            claim_version_id="",
+            canonical_id="ent_luchen",
+            surface_name="陆尘",
+            observed_ordinal=0,
+            observed_chapter_id=ids[0],
+            created_by_run_id=run_id,
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+    )
+    _link_events(migrated_db, book_id, run_id)
+    from novelcanon.query import QueryExecutor, QueryService
+
+    # 找到中间事件：多跳路径（如 遇险→获救→立誓）的中间事件 summary
+    qs = QueryService(migrated_db, book_id)
+    middle_summary = None
+    for ev_id in version_ids:
+        for p in qs.causal_paths(ev_id):
+            evs = [e for e in (p.get("path_events") or []) if e and e.get("summary")]
+            if len(evs) >= 3:
+                middle_summary = evs[1]["summary"]
+                break
+        if middle_summary:
+            break
+    assert middle_summary, "测试数据应含 3 事件多跳路径"
+    executor = QueryExecutor(migrated_db, book_id)
+    r = executor.ask("陆尘为什么立誓报仇")
+    answer = r.answer["answer"]
+    assert middle_summary in answer, (
+        f"多跳正文必须含中间事件：{middle_summary!r} not in {answer[:200]}"
+    )
+    assert " → " in answer, "多跳正文应按 A → B → C 展示"
+
+
+def test_relation_evolution_honors_world_at(tmp_path: Path, migrated_db: Engine) -> None:
+    """P1（四轮）：关系演变按 world_at 过滤版本（双时间契约）。
+
+    师徒关系 ch2 建立（chapter_proxy from=1）。
+    """
+    data = seed_active_book(migrated_db, tmp_path)
+    executor = _executor(migrated_db, data)
+    # world_at=0：关系建立于 from=1 → 世界时间未覆盖 → 无版本
+    r0 = _ask(executor, "药老和萧炎的关系如何变化", world_at=0)
+    assert "师徒" not in r0.answer["answer"], (
+        f"world_at=0 不得返回 from=1 的关系版本：{r0.answer['answer']}"
+    )
+    # world_at=1：可见
+    r1 = _ask(executor, "药老和萧炎的关系如何变化", world_at=1)
+    assert "师徒" in r1.answer["answer"]

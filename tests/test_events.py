@@ -1278,3 +1278,82 @@ def test_causal_paths_carry_edge_evidence(tmp_path, migrated_db: Engine) -> None
         assert e0["span_text"], "边证据必须带原文 span"
         assert e0["stance"] == "supported"
         assert e0["observed_ordinal"] is not None, "边证据必须带章节 ordinal"
+
+
+def test_causal_paths_exclude_prevents(tmp_path, migrated_db: Engine) -> None:
+    """P0（四轮）：prevents 边不得进入正向因果链（causes/enables only）。"""
+    from novelcanon.config.hash import stable_config_hash
+    from novelcanon.schemas.ids import claim_version_id, event_link_fact_id
+    from novelcanon.schemas.types import EventLinkType
+
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
+    # 手工插入一条 supported 的 prevents 边：突破(1) prevents 遇险(2)
+    src, tgt = version_ids[1], version_ids[2]
+    fact = event_link_fact_id(src, EventLinkType.PREVENTS, tgt)
+    ver = claim_version_id(
+        fact, stable_config_hash({"op": "assert", "payload": {"t": "prevents"}})
+    )
+    import json as _json
+
+    evidence = _json.dumps(
+        {"chapter_id": ids[2], "char_start": 0, "char_end": 5, "span_text": "prev"}
+    )
+    with migrated_db.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO event_links (claim_version_id, fact_id, source_event_id,"
+                " target_event_id, relation_type, confidence, claim_status,"
+                " observed_chapter_id, observed_ordinal)"
+                " VALUES (:v, :f, :s, :t, 'prevents', 0.9, 'supported', :ch, :ord)"
+            ),
+            {"v": ver, "f": fact, "s": src, "t": tgt, "ch": ids[2], "ord": 2},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO event_link_observations (claim_version_id, extraction_run_id,"
+                " observed_at) VALUES (:v, :r, :ts)"
+            ),
+            {"v": ver, "r": run_id, "ts": "2026-01-01T00:00:00+00:00"},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO event_link_verifications (claim_version_id,"
+                " extraction_run_id, claim_status, verification_method,"
+                " verification_evidence, verified_at)"
+                " VALUES (:v, :r, 'supported', 'causal-connective', :ev, :ts)"
+            ),
+            {"v": ver, "r": run_id, "ev": evidence, "ts": "2026-01-01T00:00:00+00:00"},
+        )
+    _link_events(migrated_db, book_id, run_id)
+    q = QueryService(migrated_db, book_id)
+    # 从突破(1)出发：prevents 边不可达，遇险(2)绝不出现在任何路径
+    paths = q.causal_paths(src)
+    targets = {p["tgt"] for p in paths}
+    assert tgt not in targets, f"prevents 边不得被解释为正向因果：{targets}"
+    # 从拜师(0)出发的正向链也不经过 prevents
+    for p in q.causal_paths(version_ids[0]):
+        assert tgt not in (p.get("path") or ""), "正向链不得包含 prevents 目标"
+
+
+def test_causal_path_events_include_middle_nodes(tmp_path, migrated_db: Engine) -> None:
+    """P0（四轮）：多跳路径 path_events 含全部事件（含中间节点）。"""
+    book_id, ids, texts = _book_and_chapters(migrated_db, tmp_path)
+    run_id, version_ids = _seed_events(migrated_db, book_id, ids, texts)
+    _link_events(migrated_db, book_id, run_id)
+    q = QueryService(migrated_db, book_id)
+    multi = None
+    for ev_id in version_ids:
+        for p in q.causal_paths(ev_id):
+            if len(p.get("edge_evidence") or []) >= 2:
+                multi = p
+                break
+        if multi:
+            break
+    assert multi, "测试数据应含多跳路径"
+    events = [e for e in multi["path_events"] if e]
+    assert len(events) == len(multi["path_events"]), "path_events 不应含空项"
+    assert len(events) == len((multi["path"] or "").split(">")), (
+        f"path_events 应与路径事件数一致：{len(events)} vs {multi['path']}"
+    )
+    assert events[0]["summary"] and events[-1]["summary"]
