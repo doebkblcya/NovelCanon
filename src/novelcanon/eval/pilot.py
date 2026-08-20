@@ -47,7 +47,6 @@ from novelcanon.extraction.materialize import (
 )
 from novelcanon.pipeline.ledger import Usage
 from novelcanon.retrieval.service import RetrievalService
-from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
 from novelcanon.schemas.types import EntityTier, Operation
 
 # 压缩重抽取抽取器类型：LLM Map 抽取器返回 (specs, usage)（正式 P1/P2），
@@ -942,6 +941,7 @@ def run_pilot(
     抽取器测真实抽取 recall——由决策门 extraction_mode 硬前置把关）。
     """
     from novelcanon.query import QueryExecutor
+    from novelcanon.retrieval.factory import backend_for_active_index
 
     routes: dict[str, dict] = {}
     claims = _active_claims(engine, book_id, cutoff=cutoff)
@@ -970,12 +970,29 @@ def run_pilot(
         ),
     }
 
+    # 原文路线的运行时后端按 active index 统一创建（复审 D P1）：真实索引
+    # （text-embedding-v4）必须用真实 adapter——structured 的 raw-detail 与
+    # hybrid 必然访问向量索引，固定 fake-embed-v8 会 profile mismatch。
+    # 压缩路线的临时库主动建 fake 索引，仍用 FakeEmbedder（见
+    # run_compressed_route/_make_reingest）。
+    route_backend = None
+    if structured or hybrid:
+        try:
+            route_backend = backend_for_active_index(engine, book_id)
+        except ValueError:
+            # 无 active 索引：structured 纯结构化查询可跑（raw-detail 无向量）
+            from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
+
+            route_backend = (FakeEmbedder(dimension=8), BruteForceVectorStore(dimension=8))
+    route_embedder, route_store = route_backend or (None, None)
+
     if structured:
+        assert route_embedder is not None and route_store is not None
         executor = QueryExecutor(
             engine,
             book_id,
-            embedder=FakeEmbedder(dimension=8),
-            vector_store=BruteForceVectorStore(dimension=8),
+            embedder=route_embedder,
+            vector_store=route_store,
         )
         started = time.perf_counter()
         answers = run_structured_qa(executor, golden, cutoff=cutoff)
@@ -988,11 +1005,12 @@ def run_pilot(
             "answers": answers,
         }
     if hybrid:
+        assert route_embedder is not None and route_store is not None
         service = RetrievalService(
             engine,
             book_id,
-            embedder=FakeEmbedder(dimension=8),
-            vector_store=BruteForceVectorStore(dimension=8),
+            embedder=route_embedder,
+            vector_store=route_store,
         )
         started = time.perf_counter()
         answers = run_hybrid_qa(service, golden, cutoff=cutoff)
@@ -1041,4 +1059,9 @@ def run_pilot(
         "compression_retention": compressed_route.get("retention", 0.0),
         "structured_usage": structured_route.get("usage", {}),
     }
+    # 真实 adapter 的 httpx 连接池用完释放（fake 无 close，防御 hasattr）
+    if route_embedder is not None:
+        closer = getattr(route_embedder, "close", None)
+        if closer is not None:
+            closer()
     return PilotReport(book_id=book_id, routes=routes, summary=summary)

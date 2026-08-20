@@ -178,3 +178,71 @@ def test_index_uses_configured_embedding_profile(tmp_path, monkeypatch) -> None:
             engine.dispose()
     finally:
         unregister_backend("prod-embed-16")
+
+
+def test_query_consumes_active_index_backend(tmp_path, monkeypatch) -> None:
+    """复审 D P1：CLI query 按 active index 的 embedding profile 创建后端
+    ——真实 profile（非 fake-embed-v8）索引下查询不再 profile mismatch。
+
+    此前 _run_query 硬编码 FakeEmbedder(8)：active index 为
+    prod-embed-16 时 hybrid 直接抛「embedding profile 不匹配」。
+    """
+    import re
+
+    from sqlalchemy import text
+
+    from novelcanon.retrieval.factory import (
+        register_backend,
+        unregister_backend,
+    )
+    from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
+    from novelcanon.storage.engine import create_db_engine
+    from tests.helpers import FIXTURE_CHAPTERS, make_fixture_epub
+
+    db = tmp_path / "t.db"
+    env = {
+        "NOVELCANON_DB_PATH": str(db),
+        "NOVELCANON_EMBEDDING_PROFILE_ID": "prod-embed-16",
+        "NOVELCANON_EMBEDDING_DIMENSION": "16",
+        "NOVELCANON_EMBEDDING_BASE_URL": "http://127.0.0.1:9",
+        "NOVELCANON_EMBEDDING_MODEL": "test-model",
+    }
+    monkeypatch.setattr(
+        "novelcanon.retrieval.factory.register_configured_backends", lambda settings=None: []
+    )
+
+    def _prod_embedder() -> FakeEmbedder:
+        e = FakeEmbedder(dimension=16)
+        e.profile_id = "prod-embed-16"
+        return e
+
+    register_backend(
+        "prod-embed-16",
+        lambda: (_prod_embedder(), BruteForceVectorStore(dimension=16)),
+    )
+    try:
+        epub = tmp_path / "book.epub"
+        make_fixture_epub(epub, FIXTURE_CHAPTERS)
+        r = runner.invoke(app, ["import", str(epub)], env=env)
+        assert r.exit_code == 0, r.output
+        book_id = re.search(r"book=(book_[0-9a-f]+)", r.stdout).group(1)
+        r = runner.invoke(app, ["index", book_id], env=env)
+        assert r.exit_code == 0, r.output
+
+        # 查询：active index = prod-embed-16，必须经统一入口消费（不 mismatch）
+        r = runner.invoke(app, ["query", "青云宗的弟子是谁？", "--book-id", book_id], env=env)
+        assert r.exit_code == 0, r.output
+        assert "回答" in r.stdout, r.output
+        assert "profile 不匹配" not in r.output
+
+        # 无 active 索引时（新书）结构化查询仍可跑（fake 兜底）
+        engine = create_db_engine(db)
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE index_versions SET status='retired' WHERE book_id=:b"), {"b": book_id}
+            )
+        engine.dispose()
+        r = runner.invoke(app, ["query", "青云宗的弟子是谁？", "--book-id", book_id], env=env)
+        assert r.exit_code == 0, r.output
+    finally:
+        unregister_backend("prod-embed-16")

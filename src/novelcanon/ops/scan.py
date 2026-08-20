@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import Engine
 
 from novelcanon.query import QueryExecutor
-from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
+from novelcanon.retrieval.factory import backend_for_active_index
 from novelcanon.storage.backup import IntegrityReport, verify_integrity
 
 
@@ -57,38 +57,53 @@ def scan_cutoff_leakage(
     questions: list[str],
     cutoffs: list[int],
 ) -> CutoffScanResult:
-    """逐问题 × 逐 cutoff：来源章节不得超过 cutoff（结构化 + 混合）。"""
+    """逐问题 × 逐 cutoff：来源章节不得超过 cutoff（结构化 + 混合）。
+
+    运行时后端按 active index 统一创建（复审 D P1）：真实索引必须用真实
+    adapter，否则 profile mismatch；无 active 索引时结构化查询 fake 兜底。
+    """
+    try:
+        embedder, vector_store = backend_for_active_index(engine, book_id)
+    except ValueError:
+        from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
+
+        embedder, vector_store = FakeEmbedder(dimension=8), BruteForceVectorStore(dimension=8)
     executor = QueryExecutor(
         engine,
         book_id,
-        embedder=FakeEmbedder(dimension=8),
-        vector_store=BruteForceVectorStore(dimension=8),
+        embedder=embedder,
+        vector_store=vector_store,
         use_cache=False,
     )
-    findings: list[LeakageFinding] = []
-    checks = 0
-    for q in questions:
-        for cutoff in cutoffs:
-            checks += 1
-            answer = executor.ask(q, knowledge_cutoff=cutoff).answer
-            ordinals = sorted(
-                {
-                    s["observed_ordinal"]
-                    for s in (answer.get("sources") or [])
-                    if s.get("observed_ordinal") is not None
-                }
-            )
-            leaked = [o for o in ordinals if o > cutoff]
-            if leaked:
-                findings.append(
-                    LeakageFinding(
-                        question=q,
-                        cutoff=cutoff,
-                        route=answer.get("route", ""),
-                        leaked_ordinals=leaked,
-                        source_ordinals=ordinals,
-                    )
+    try:
+        findings: list[LeakageFinding] = []
+        checks = 0
+        for q in questions:
+            for cutoff in cutoffs:
+                checks += 1
+                answer = executor.ask(q, knowledge_cutoff=cutoff).answer
+                ordinals = sorted(
+                    {
+                        s["observed_ordinal"]
+                        for s in (answer.get("sources") or [])
+                        if s.get("observed_ordinal") is not None
+                    }
                 )
+                leaked = [o for o in ordinals if o > cutoff]
+                if leaked:
+                    findings.append(
+                        LeakageFinding(
+                            question=q,
+                            cutoff=cutoff,
+                            route=answer.get("route", ""),
+                            leaked_ordinals=leaked,
+                            source_ordinals=ordinals,
+                        )
+                    )
+    finally:
+        closer = getattr(embedder, "close", None)
+        if closer is not None:
+            closer()
     return CutoffScanResult(findings=findings, checks=checks)
 
 

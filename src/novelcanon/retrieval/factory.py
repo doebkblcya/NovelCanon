@@ -19,6 +19,8 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
+from sqlalchemy import Engine
+
 from novelcanon.retrieval.vectorstore import (
     BruteForceVectorStore,
     Embedder,
@@ -122,3 +124,30 @@ def create_backend(profile_id: str) -> tuple[Embedder, VectorStore]:
         " novelcanon.retrieval.factory.register_backend 注册生产 adapter"
         "（内置 fake-embed-v<N> 仅用于测试与 fixture Pilot）"
     )
+
+
+def backend_for_active_index(
+    engine: Engine,
+    book_id: str,
+    settings: object | None = None,
+) -> tuple[Embedder, VectorStore]:
+    """按 active index 声明的 embedding profile 创建运行时后端（统一入口）。
+
+    所有**消费真实索引**的模块共用（API / CLI query / Pilot / leakage
+    scanner）：查 active index → 真实 profile 未注册时先按应用配置注册
+    （NOVELCANON_EMBEDDING_*，幂等）→ create_backend(profile_id)。
+    杜绝各处硬编码 FakeEmbedder(8) 造成 profile mismatch（索引已是
+    text-embedding-v4 时 fake-embed-v8 查询直接失败）。
+
+    - 无 active 索引：ValueError（结构化查询可跑，由调用方决定 fallback）；
+    - 真实 profile 未配置：UnknownEmbeddingProfileError（服务端配置错误）。
+    """
+    from novelcanon.retrieval.indexer import get_active_index_version
+
+    index = get_active_index_version(engine, book_id)
+    if index is None:
+        raise ValueError(f"book={book_id} 没有 active 索引，请先 build_index")
+    profile_id = index.get("embedding_profile_id") or ""
+    if profile_id not in EMBEDDER_FACTORIES and not re.match(r"^fake-embed-v\d+$", profile_id):
+        register_configured_backends(settings)
+    return create_backend(profile_id)

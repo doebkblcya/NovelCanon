@@ -372,28 +372,31 @@ def create_app(
     def _runtime_backend(eng: Engine, book_id: str) -> tuple[Embedder, VectorStore]:
         """按 active index 的 embedding profile 创建运行时检索后端（P1）。
 
-        经 retrieval.factory 的可插拔工厂：profile 注册表内置
-        fake-embed-v<N>（测试/fixture），真实 profile 通过
-        register_backend 注册 adapter。不再硬编码 FakeEmbedder(8)——
-        profile 与索引不一致时检索层（_verify_profile）拒绝查询。
-        测试通过 executor_factory 注入 fake。
+        经统一入口 retrieval.factory.backend_for_active_index（API / CLI
+        query / Pilot / leakage scanner 共用）：profile 注册表内置
+        fake-embed-v<N>（测试/fixture），真实 profile 按应用配置注册
+        adapter。不再硬编码 FakeEmbedder(8)——profile 与索引不一致时
+        检索层（_verify_profile）拒绝查询。测试通过 executor_factory
+        注入 fake。
 
         复审 P1：backend 按 profile **缓存于应用级**（_backend_cache）——
         不随每次查询重新 create_backend（避免每个请求新建 httpx.Client
         连接池，泄漏连接/文件描述符且无法复用）；lifespan 关闭时统一
         close。
         """
-        from novelcanon.retrieval import create_backend
+        from novelcanon.retrieval.factory import backend_for_active_index
         from novelcanon.retrieval.indexer import get_active_index_version
 
-        index = get_active_index_version(eng, book_id)
-        profile = (index or {}).get("embedding_profile_id")
-        if not profile:
+        try:
+            backend = backend_for_active_index(eng, book_id)
+        except ValueError:
             # 无 active 索引：结构化查询可跑；raw-detail/hybrid 由检索层
             # 报「无 active 索引」（与 CLI 一致）
             return FakeEmbedder(dimension=8), BruteForceVectorStore(dimension=8)
+        index = get_active_index_version(eng, book_id)
+        profile = (index or {}).get("embedding_profile_id") or ""
         if profile not in _backend_cache:
-            _backend_cache[profile] = create_backend(profile)
+            _backend_cache[profile] = backend
         return _backend_cache[profile]
 
     def _executor(book_id: str) -> QueryExecutor:

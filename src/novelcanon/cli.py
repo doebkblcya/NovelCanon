@@ -629,7 +629,7 @@ def _run_query(
 ) -> None:
     """路由 → 执行 → 合成 → 输出（含 explain 与路线统计）。"""
     from novelcanon.query import QueryExecutor, route_question
-    from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
+    from novelcanon.retrieval.factory import backend_for_active_index
 
     decision = route_question(question)
     typer.echo(
@@ -638,14 +638,28 @@ def _run_query(
     )
     typer.echo(f"   {decision.explain}")
 
-    executor = QueryExecutor(
-        engine,
-        book_id,
-        embedder=FakeEmbedder(dimension=8),
-        vector_store=BruteForceVectorStore(dimension=8),
-        use_cache=not no_cache,
-    )
-    result = executor.ask(question, knowledge_cutoff=cutoff, world_at=world)
+    # 按 active index 的 embedding profile 创建运行时后端（阶段 11 复审 D
+    # 统一入口）：真实索引（text-embedding-v4）必须用真实 adapter，否则
+    # profile mismatch；无 active 索引时结构化查询仍可跑（fake 兜底）。
+    try:
+        embedder, vector_store = backend_for_active_index(engine, book_id)
+    except ValueError:
+        from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
+
+        embedder, vector_store = FakeEmbedder(dimension=8), BruteForceVectorStore(dimension=8)
+    try:
+        executor = QueryExecutor(
+            engine,
+            book_id,
+            embedder=embedder,
+            vector_store=vector_store,
+            use_cache=not no_cache,
+        )
+        result = executor.ask(question, knowledge_cutoff=cutoff, world_at=world)
+    finally:
+        closer = getattr(embedder, "close", None)
+        if closer is not None:
+            closer()
     payload = result.answer
     if result.cached:
         typer.echo("♻️  命中缓存（active run/index 签名一致）")

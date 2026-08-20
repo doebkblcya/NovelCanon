@@ -755,3 +755,40 @@ def test_build_map_extractor_uses_schema_prompts(monkeypatch: pytest.MonkeyPatch
     assert "surface_name" in prompts.schema_json, (
         "Schema 必须含 surface_name（LLM 输出 entity_name 会被 Draft 校验拒绝）"
     )
+
+
+def test_pilot_consumes_active_index_backend(tmp_path: Path, migrated_db: Engine) -> None:
+    """复审 D P1：正式 Pilot structured/hybrid 按 active index 创建后端——
+    真实 profile（非 fake-embed-v8）索引下不再 profile mismatch（此前两处
+    硬编码 FakeEmbedder(8) 在 prod-embed-16 active index 上直接失败）。"""
+    from novelcanon.retrieval.factory import register_backend, unregister_backend
+    from novelcanon.retrieval.indexer import build_index
+    from novelcanon.retrieval.tokenizer import FakeTokenizer
+    from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
+
+    book_id, chapter_ids, chapter_texts = _seed_golden_book(migrated_db, tmp_path)
+    golden = golden_set_from_chapters(book_id)
+
+    def _prod_embedder() -> FakeEmbedder:
+        e = FakeEmbedder(dimension=16)
+        e.profile_id = "prod-embed-16"
+        return e
+
+    register_backend(
+        "prod-embed-16",
+        lambda: (_prod_embedder(), BruteForceVectorStore(dimension=16)),
+    )
+    try:
+        build_index(
+            migrated_db,
+            book_id,
+            tokenizer=FakeTokenizer(),
+            embedder=_prod_embedder(),
+            vector_store=BruteForceVectorStore(dimension=16),
+        )
+        report = run_pilot(migrated_db, book_id, golden)
+        d = report.to_dict()
+        assert "structured" in d["routes"], "真实 profile 索引下 structured 必须可跑"
+        assert "hybrid" in d["routes"], "真实 profile 索引下 hybrid 必须可跑"
+    finally:
+        unregister_backend("prod-embed-16")
