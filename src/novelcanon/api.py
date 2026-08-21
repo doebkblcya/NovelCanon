@@ -223,6 +223,7 @@ ERR = {
     "timeout": "请求超时",
     "overloaded": "查询后端过载（执行池饱和），请稍后重试",
     "backend_not_configured": "embedding 后端未配置（服务端配置错误）",
+    "entity_not_found": "实体不存在",
     "internal": "内部错误",
 }
 
@@ -310,6 +311,19 @@ def create_app(
     # 应用级 embedding 后端缓存（复审 P1）：按 profile 复用 embedder/
     # client（httpx 连接池），不随每次查询重建；lifespan 关闭时统一释放。
     _backend_cache: dict[str, tuple[Embedder, VectorStore]] = {}
+    # 查询 LLM 合成 client（阶段二 04 接线）：惰性构造一次（按应用配置
+    # 生产 GenerationClient，JSON 输出 / profile=query-synth）；未配置
+    # LLM 时为 None → 确定性合成。lifespan 关闭时尝试释放（跨循环风险
+    # 静默容忍——失败不阻塞应用关闭）。
+    _synth_client = None
+
+    def _get_synth_client():
+        nonlocal _synth_client
+        if _synth_client is None:
+            from novelcanon.generation.factory import build_synthesis_client
+
+            _synth_client = build_synthesis_client()
+        return _synth_client
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
@@ -317,6 +331,9 @@ def create_app(
 
         - 关闭 embedding 后端（adapter 实现 close → httpx.Client 关闭，
           连接/文件描述符不泄漏）；
+        - 关闭查询合成 client（复审 P1：lifespan 已在事件循环内，直接
+          await aclose；只关闭**已构造**的 client——从未用过的惰性 client
+          不在此处新建）；
         - 关闭查询执行池：cancel_futures 取消排队任务；正在运行的任务
           无法中断，但 (a) 下游调用携带严格超时（线程最终自然结束）且
           (b) worker 已 daemon 化（_DaemonThreadPoolExecutor）——即使
@@ -330,6 +347,8 @@ def create_app(
                 if closer is not None:
                     closer()
             _backend_cache.clear()
+            if _synth_client is not None:  # 直接读闭包：不触发惰性构造
+                await _synth_client.aclose()
             _pool.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="NovelCanon 查询 API", version=API_VERSION, lifespan=_lifespan)
@@ -365,7 +384,7 @@ def create_app(
             book_id,
             embedder=embedder,
             vector_store=vector_store,
-            synthesis_client=synthesis_client,
+            synthesis_client=_get_synth_client() if synthesis_client is None else synthesis_client,
             profile_id=profile_id,
         )
 
@@ -603,6 +622,83 @@ def create_app(
             run_version=run_version,
             index_version=index_version,
             profile=payload.get("query_profile", ""),
+        )
+
+    def _require_book(eng: Engine, book_id: str) -> None:
+        """图谱/实体端点统一 book 存在性校验（404 book_not_found）。"""
+        if not book_id:
+            raise _error(400, "missing_book")
+        with eng.connect() as conn:
+            row = conn.execute(
+                text("SELECT book_id FROM books WHERE book_id = :b"), {"b": book_id}
+            ).fetchone()
+        if row is None:
+            raise _error(404, "book_not_found")
+
+    # ── 实体图谱（阶段二 03：实体图谱 API 与前端）─────────────────
+    # 只读端点，遵守 book_id + active run + cutoff + world_at 隔离
+    # （过滤逻辑在 novelcanon.graph.queries，复用查询层同源规则）。
+
+    @app.get("/entities")
+    async def entities(
+        book_id: str | None = FQuery(default=None, min_length=1),
+        knowledge_cutoff: int | None = FQuery(default=None, ge=0),
+        q: str = FQuery(default="", max_length=100),
+        limit: int = FQuery(default=50, ge=1, le=500),
+        offset: int = FQuery(default=0, ge=0),
+    ) -> dict:
+        """实体目录：active run 实体 + 别名/提及计数 + 名称搜索。"""
+        eng = _open_engine()
+        _require_book(eng, book_id or "")
+        from novelcanon.graph import entity_catalog
+
+        return entity_catalog(
+            eng, book_id or "", cutoff=knowledge_cutoff, q=q, limit=limit, offset=offset
+        )
+
+    @app.get("/entities/{canonical_id}")
+    async def entity_detail_endpoint(
+        canonical_id: str,
+        book_id: str | None = FQuery(default=None, min_length=1),
+        knowledge_cutoff: int | None = FQuery(default=None, ge=0),
+        world_at: int | None = FQuery(default=None, ge=0),
+    ) -> dict:
+        """实体详情：表面名 + 当前属性 + 一跳关系 + 参与事件（含证据）。"""
+        eng = _open_engine()
+        _require_book(eng, book_id or "")
+        from novelcanon.graph import entity_detail
+
+        detail = entity_detail(
+            eng,
+            book_id or "",
+            canonical_id,
+            cutoff=knowledge_cutoff,
+            world_at=world_at,
+        )
+        if detail is None:
+            raise _error(404, "entity_not_found")
+        return detail
+
+    @app.get("/graph")
+    async def graph(
+        book_id: str | None = FQuery(default=None, min_length=1),
+        knowledge_cutoff: int | None = FQuery(default=None, ge=0),
+        world_at: int | None = FQuery(default=None, ge=0),
+        limit: int = FQuery(default=80, ge=1, le=500),
+        min_importance: float = FQuery(default=0.0, ge=0.0),
+    ) -> dict:
+        """图谱数据：nodes（active 实体）+ edges（当前有效关系，双时间）。"""
+        eng = _open_engine()
+        _require_book(eng, book_id or "")
+        from novelcanon.graph import graph_data
+
+        return graph_data(
+            eng,
+            book_id or "",
+            cutoff=knowledge_cutoff,
+            world_at=world_at,
+            limit=limit,
+            min_importance=min_importance,
         )
 
     @app.post("/query", response_model=QueryResponse)

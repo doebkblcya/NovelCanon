@@ -54,3 +54,16 @@ def imported_book(migrated_db: Engine, epub_file: Path) -> tuple[Engine, str]:
 
     result = import_book(migrated_db, epub_file)
     return migrated_db, result.book_id
+
+
+@pytest.fixture(autouse=True)
+def _no_llm_in_tests(monkeypatch):
+    """测试会话强制无 LLM 配置（复审 P1：离线、确定性、不产生费用）。
+
+    真实 .env 可能配置了 NOVELCANON_LLM_*——若不禁用，create_app /
+    CLI 会构造生产合成 client 并真实调用模型（完整测试出现 408、依赖
+    外部服务）。空字符串覆盖 .env（BaseSettings 中 os.environ 优先）。
+    """
+    monkeypatch.setenv("NOVELCANON_LLM_MODEL", "")
+    monkeypatch.setenv("NOVELCANON_LLM_BASE_URL", "")
+    monkeypatch.setenv("NOVELCANON_LLM_API_KEY", "")

@@ -111,6 +111,23 @@ class GenerationClient:
             timeout=httpx.Timeout(profile.timeout_seconds)
         )
 
+    @property
+    def profile_id(self) -> str:
+        """公开生成 profile id（复审 P1：缓存键/审计用）。
+
+        查询合成接线的 SynthesisService.profile_id 从 client 取——
+        无此属性时缓存键的 synthesis_profile 落空字符串，模型配置变化
+        可能命中旧缓存。
+        """
+        return self._profile.profile_id
+
+    async def aclose(self) -> None:
+        """关闭内部 AsyncClient（查询合成接线：API lifespan / CLI 退出时调用）。"""
+        client = self._client
+        self._client = None  # type: ignore[assignment]  # 幂等：重复 close 为 no-op
+        if client is not None:
+            await client.aclose()
+
     async def complete(self, prompt: str) -> GenerationResult:
         """调用 provider 并解析原始输出 + usage。
 

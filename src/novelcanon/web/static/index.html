@@ -3,51 +3,91 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NovelCanon 查询</title>
+<title>NovelCanon</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <div class="app">
   <header class="topbar">
     <h1>NovelCanon</h1>
-    <span class="sub">结构化小说知识库查询</span>
+    <span class="sub">结构化小说知识库</span>
   </header>
 
-  <section class="controls">
-    <div class="row">
-      <label class="field book">
-        <span class="label">图书</span>
-        <select id="book-select">
-          <option value="">加载中…</option>
-        </select>
-      </label>
-      <label class="field cutoff">
-        <span class="label" title="只使用第 N 章及之前披露的事实">知识截止章 <code>cutoff</code></span>
-        <input id="cutoff" type="number" min="0" placeholder="全部">
-      </label>
-      <label class="field world">
-        <span class="label" title="世界时间点（章节序），只返回该时间点成立的事实">世界时间 <code>world_at</code></span>
-        <input id="world" type="number" min="0" placeholder="不限">
-      </label>
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="query">查询</button>
+    <button class="tab" data-tab="entities">实体</button>
+    <button class="tab" data-tab="graph">图谱</button>
+  </nav>
+
+  <!-- ── 查询 ── -->
+  <section id="tab-query" class="tabpane active">
+    <div class="controls">
+      <div class="row">
+        <label class="field book">
+          <span class="label">图书</span>
+          <select id="book-select">
+            <option value="">加载中…</option>
+          </select>
+        </label>
+        <label class="field cutoff">
+          <span class="label" title="只使用第 N 章及之前披露的事实">知识截止章 <code>cutoff</code></span>
+          <input id="cutoff" type="number" min="0" placeholder="全部">
+        </label>
+        <label class="field world">
+          <span class="label" title="世界时间点（章节序），只返回该时间点成立的事实">世界时间 <code>world_at</code></span>
+          <input id="world" type="number" min="0" placeholder="不限">
+        </label>
+      </div>
+      <div class="row qrow">
+        <input id="question" type="text" placeholder="例如：奥雷里亚诺·布恩迪亚上校是什么人物？" autocomplete="off">
+        <button id="ask-btn" disabled>查询</button>
+      </div>
+      <div id="status" class="status hidden"></div>
     </div>
-    <div class="row qrow">
-      <input id="question" type="text" placeholder="例如：奥雷里亚诺·布恩迪亚上校是什么人物？" autocomplete="off">
-      <button id="ask-btn" disabled>查询</button>
-    </div>
-    <div id="status" class="status hidden"></div>
+
+    <section id="result" class="result hidden">
+      <div class="meta">
+        <span id="route-badge" class="badge"></span>
+        <span id="confidence" class="muted"></span>
+        <span id="cannot" class="badge danger hidden"></span>
+        <span id="versions" class="muted small"></span>
+      </div>
+      <div id="caveats" class="caveats hidden"></div>
+      <div class="answer" id="answer"></div>
+      <h2 class="src-heading">证据来源 <span id="src-count" class="muted small"></span></h2>
+      <ul id="sources" class="sources"></ul>
+    </section>
   </section>
 
-  <section id="result" class="result hidden">
-    <div class="meta">
-      <span id="route-badge" class="badge"></span>
-      <span id="confidence" class="muted"></span>
-      <span id="cannot" class="badge danger hidden"></span>
-      <span id="versions" class="muted small"></span>
+  <!-- ── 实体 ── -->
+  <section id="tab-entities" class="tabpane">
+    <div class="controls">
+      <div class="row qrow">
+        <input id="entity-q" type="text" placeholder="搜索实体名称…" autocomplete="off">
+        <button id="entity-search-btn">搜索</button>
+      </div>
+      <div id="entity-status" class="status hidden"></div>
     </div>
-    <div id="caveats" class="caveats hidden"></div>
-    <div class="answer" id="answer"></div>
-    <h2 class="src-heading">证据来源 <span id="src-count" class="muted small"></span></h2>
-    <ul id="sources" class="sources"></ul>
+    <div class="split">
+      <ul id="entity-list" class="entity-list"></ul>
+      <div id="entity-detail" class="entity-detail"></div>
+    </div>
+  </section>
+
+  <!-- ── 图谱 ── -->
+  <section id="tab-graph" class="tabpane">
+    <div class="controls">
+      <div class="row">
+        <label class="field limit">
+          <span class="label">节点数</span>
+          <input id="graph-limit" type="number" min="10" max="200" value="60">
+        </label>
+        <button id="graph-load-btn">加载图谱</button>
+        <span id="graph-meta" class="muted small"></span>
+      </div>
+      <div id="graph-status" class="status hidden"></div>
+    </div>
+    <div id="graph-wrap" class="graph-wrap"></div>
   </section>
 </div>
 

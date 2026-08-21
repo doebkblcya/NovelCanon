@@ -649,12 +649,19 @@ def _run_query(
         from novelcanon.retrieval.vectorstore import BruteForceVectorStore, FakeEmbedder
 
         embedder, vector_store = FakeEmbedder(dimension=8), BruteForceVectorStore(dimension=8)
+    # 查询 LLM 合成（阶段二 04 接线）：配置了 LLM 时注入生产合成 client
+    # （JSON 输出、profile=query-synth，缓存键按 synthesis_profile 隔离）；
+    # 未配置 → None，走确定性合成，行为不变。
+    from novelcanon.generation.factory import build_synthesis_client
+
+    synthesis_client = build_synthesis_client()
     try:
         executor = QueryExecutor(
             engine,
             book_id,
             embedder=embedder,
             vector_store=vector_store,
+            synthesis_client=synthesis_client,
             use_cache=not no_cache,
         )
         result = executor.ask(question, knowledge_cutoff=cutoff, world_at=world)
@@ -662,6 +669,15 @@ def _run_query(
         closer = getattr(embedder, "close", None)
         if closer is not None:
             closer()
+        # 复审 P1：CLI 只关了 embedding client，合成 client 的 AsyncClient
+        # 未释放——退出前关闭（CLI 无运行中事件循环，asyncio.run 安全；
+        # 跨循环异常静默，不掩盖查询结果）。
+        if synthesis_client is not None:
+            import asyncio as _asyncio
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                _asyncio.run(synthesis_client.aclose())
     payload = result.answer
     if result.cached:
         typer.echo("♻️  命中缓存（active run/index 签名一致）")
@@ -1175,10 +1191,86 @@ def run_abandon(
 
 
 @app.command()
-def inspect() -> None:
-    """检查库内对象（book/run/chapter 等；阶段 02 起逐步实现）。"""
+def inspect(
+    book_id: Annotated[str | None, typer.Option(help="检查指定书；缺省列出全部书摘要")] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="机器可读 JSON 输出（供脚本/前端状态页复用）")
+    ] = False,
+) -> None:
+    """检查库内对象（book/run/index/知识类型计数/完整性异常）。"""
     _log_command_invoked("inspect")
-    typer.echo("尚未实现：inspect（阶段 02 数据契约与存储）")
+    import json as _json
+
+    from novelcanon.ops.inspect import inspect_all, inspect_book
+
+    engine = _open_db()
+    try:
+        if book_id is None:
+            report = inspect_all(engine)
+            if json_output:
+                typer.echo(_json.dumps(report, ensure_ascii=False, indent=2))
+                return
+            typer.echo(f"共 {report['book_count']} 本书：")
+            for b in report["books"]:
+                flags = []
+                if b["active_runs"]:
+                    flags.append("✓active")
+                if b["active_indexes"]:
+                    flags.append("✓index")
+                typer.echo(
+                    f"  {b['book_id']}  {b['title']}"
+                    f"  章节 {b['chapter_count']}  active claim {b['active_claims']}"
+                    f"  {' '.join(flags)}"
+                )
+            return
+        report = inspect_book(engine, book_id)
+        if "error" in report:
+            typer.echo(f"❌ {report['error']}: {book_id}", err=True)
+            raise typer.Exit(code=1)
+        if json_output:
+            typer.echo(_json.dumps(report, ensure_ascii=False, indent=2))
+            return
+        _echo_inspect(report)
+    finally:
+        engine.dispose()
+
+
+def _echo_inspect(r: dict) -> None:
+    typer.echo(f"图书：{r['title']}（{r['book_id']}）")
+    raw = r["raw_content_hash"]
+    raw_short = raw[:12] if raw else "（无）"
+    typer.echo(f"  章节数 {r['chapter_count']} · 输入 hash {raw_short}…")
+    runs = r["runs"]
+    typer.echo(f"  run 状态 {runs['by_status']} · active={runs['active_run_id'] or '（无）'}")
+    for f in runs["failed"]:
+        typer.echo(f"  ⚠️  {f['status']} run {f['run_id'][:12]}：{f['error'] or '无错误信息'}")
+    idx = r["index"]
+    if idx["index_version_id"]:
+        typer.echo(
+            f"  索引 {idx['index_version_id'][:12]}（{idx['status']}）"
+            f" profile={idx['embedding_profile_id']} 记录 {idx['record_count']}"
+        )
+    else:
+        typer.echo("  索引：无 active")
+    c = r["counts"]
+    a, h = c["active"], c["history"]
+    typer.echo(
+        f"  active 计数：claim {a['claims']} · evidence {a['evidence']}"
+        f" · 实体 {a['entities']} · 别名 {a['entity_aliases']}"
+        f" · 事件 {a['events']} · 链接 {a['event_links']}"
+        f"（supported {a['event_links_supported']}）"
+    )
+    typer.echo(
+        f"  历史全量（含 active）：claim {h['claims']} · evidence {h['evidence']}"
+        f" · 实体 {h['entities']} · 别名 {h['entity_aliases']} · mention {h['mentions']}"
+        f" · 事件 {h['events']} · 链接 {h['event_links']} · 摘要 {h['summaries']}"
+    )
+    if r["warnings"]:
+        typer.echo("  完整性警告：")
+        for w in r["warnings"]:
+            typer.echo(f"    ⚠️  {w}")
+    else:
+        typer.echo("  完整性：无警告 ✅")
 
 
 if __name__ == "__main__":

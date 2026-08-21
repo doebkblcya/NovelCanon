@@ -1,0 +1,12 @@
+{
+  "schema_version": "golden-v1",
+  "book_id": "book_cc",
+  "book_content_hash": "dcea09d9ebe0b4f2c50eaf6292c658328f1a07ee0f450f7ad89f46502b273bcc",
+  "qas": [],
+  "entity_merges": [],
+  "facts": [],
+  "causals": [],
+  "evidence_spans": [],
+  "core_canonicals": [],
+  "claims": []
+}

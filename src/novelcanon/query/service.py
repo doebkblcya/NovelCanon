@@ -135,6 +135,8 @@ class QueryService:
                     " JOIN alias_observations o ON o.claim_version_id = a.claim_version_id"
                     " JOIN extraction_runs r ON r.run_id = o.extraction_run_id"
                     " LEFT JOIN entity_resolutions er ON er.mention_id = a.canonical_id"
+                    "   AND er.run_id IN (SELECT run_id FROM extraction_runs"
+                    "     WHERE status = 'active' AND book_id = :book)"
                     " WHERE COALESCE(er.canonical_id, a.canonical_id) = :cid"
                     " AND r.status = 'active' AND r.book_id = :book"
                     f" {cutoff_sql}"

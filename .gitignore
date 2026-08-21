@@ -30,3 +30,6 @@ dist/
 .env
 .env.*
 !.env.example
+
+# 标注工作区（版权原文不入库：仅本地标注用，仓库只提交 hash/ordinal/短证据 span）
+data/annotations/

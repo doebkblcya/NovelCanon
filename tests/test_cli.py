@@ -20,11 +20,12 @@ def test_help_lists_all_commands() -> None:
         assert cmd in result.stdout
 
 
-def test_unimplemented_commands_are_explicit() -> None:
-    """阶段 10 后 import/index/extract/query/activate 已实现；inspect 仍显式「尚未实现」。"""
-    result = runner.invoke(app, ["inspect"])
-    assert result.exit_code == 0, f"inspect 失败: {result.output}"
-    assert "尚未实现" in result.stdout
+def test_inspect_is_implemented() -> None:
+    """阶段二 07：inspect 已实现，不再显式「尚未实现」（占位断言已移除）。"""
+    result = runner.invoke(app, ["inspect", "--help"])
+    assert result.exit_code == 0
+    assert "尚未实现" not in result.stdout
+    assert "--book-id" in result.stdout
 
 
 def test_activate_requires_book_argument() -> None:
